@@ -1,9 +1,9 @@
-# Broken implementation
+# Cách triển khai bị lỗi
 
-## Code gây race condition
+## Đoạn code gây điều kiện tranh chấp
 
-Đây là code một developer có thể viết khi muốn tái sử dụng sequence và dữ liệu
-gần nhất giữa các lời gọi:
+Đoạn code dưới đây mô phỏng một cách triển khai dễ gặp: developer giữ sequence
+và customer gần nhất trong field để dùng lại giữa các lời gọi.
 
 ```java
 package com.example.checkout;
@@ -82,26 +82,30 @@ public record CreateReceiptDraftRequest(String customerId) {
 }
 ```
 
-## Vì sao code trông có vẻ hợp lý
+## Vì sao đoạn code trông có vẻ hợp lý
 
 - Unit test gọi tuần tự luôn thấy sequence tăng.
-- Mỗi statement Java nhìn ngắn và không có collection phức tạp.
-- Spring khởi tạo singleton an toàn, dễ bị hiểu nhầm là mọi access sau đó cũng
-  thread-safe.
-- Field không phải database state nên developer có thể không nghĩ đến
-  transaction hay lock.
+- Mỗi câu lệnh Java đều ngắn nên khó nhận ra chúng tạo thành một chuỗi nhiều bước.
+- Spring khởi tạo singleton an toàn, nhưng điều này dễ bị hiểu nhầm thành mọi lần
+  truy cập sau đó cũng an toàn cho nhiều luồng.
+- State không nằm trong database nên developer có thể bỏ qua việc phân tích vùng
+  tranh chấp và cơ chế khóa.
 
-## Preconditions để lỗi xuất hiện
+## Điều kiện để lỗi xuất hiện
 
 1. Bean dùng singleton scope mặc định.
 2. Server có ít nhất hai request worker.
 3. Hai lời gọi `createDraft` bị xen kẽ.
 4. Không có cùng một monitor/lock bao quanh toàn bộ invariant.
 
-`nextSequence` và `lastCustomerId` đều là shared mutable state. Không operation
-nào tạo happens-before edge giữa hai request thread.
+`nextSequence` và `lastCustomerId` đều là trạng thái dùng chung có thể thay đổi.
+Không có cơ chế đồng bộ nào tạo quan hệ xảy ra-trước giữa hai luồng xử lý
+request.
 
-## Những “fix” chưa đủ
+> **Nói ngắn gọn:** cả hai request đang đọc và ghi cùng hai field mà không có
+> khóa hoặc thao tác nguyên tử bảo vệ toàn bộ quy tắc.
+
+## Các cách sửa tưởng đúng nhưng chưa đủ
 
 ### Chỉ thêm volatile
 
@@ -109,7 +113,8 @@ nào tạo happens-before edge giữa hai request thread.
 private volatile long nextSequence;
 ```
 
-`volatile` hỗ trợ visibility nhưng `++nextSequence` vẫn là:
+`volatile` giúp một luồng nhìn thấy giá trị mà luồng khác đã ghi, nhưng
+`++nextSequence` vẫn gồm ba bước:
 
 ```text
 read → add → write
@@ -123,8 +128,9 @@ Hai thread vẫn có thể cùng read `41` rồi cùng write `42`.
 private final AtomicLong nextSequence = new AtomicLong(41);
 ```
 
-`incrementAndGet()` sửa counter nhưng `lastCustomerId` vẫn bị request khác ghi
-đè. Thread-safe field riêng lẻ không bảo vệ invariant gồm nhiều field.
+`incrementAndGet()` sửa lỗi của counter, nhưng `lastCustomerId` vẫn có thể bị
+request khác ghi đè. Một field an toàn cho nhiều luồng không tự bảo vệ quy tắc
+bao gồm nhiều field.
 
 ### Chỉ thêm @Transactional
 
@@ -135,6 +141,5 @@ public ReceiptDraft createDraft(String customerId) {
 }
 ```
 
-Spring transaction gắn với thread/database connection; nó không serialize
-method calls và không lock Java heap field.
-
+Spring transaction gắn với một luồng và database connection. Nó không buộc các
+lời gọi method phải chạy lần lượt và không khóa field nằm trong Java heap.

@@ -7,7 +7,7 @@
 | Mode completed | Phase 1 — Design |
 | Root | `concurrency-cases/` |
 | Depth | Advanced |
-| Phase 2 prose language | Vietnamese; canonical technical terms remain English |
+| Phase 2 prose language | Vietnamese-first; canonical English terms are introduced on first use |
 | Default stack | Java 21, Spring Boot, Spring Data JPA, Hibernate, PostgreSQL |
 | Optional infrastructure | Redis and Kafka only in cases that require them |
 | Planned cases | 74 |

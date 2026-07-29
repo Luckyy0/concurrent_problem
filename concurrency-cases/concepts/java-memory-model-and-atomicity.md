@@ -1,42 +1,63 @@
-# Java Memory Model, atomicity và shared mutable state
+# Java Memory Model, tính nguyên tử và trạng thái dùng chung
 
 ## Mục đích
 
-Tài liệu này là nền tảng dùng chung cho các case có nhiều thread truy cập cùng
-một object trong một JVM. Nó phân biệt ba thuộc tính thường bị đánh đồng:
+Tài liệu này giải thích nền tảng cho các case có nhiều luồng cùng truy cập một
+object trong một JVM. Mục tiêu là phân biệt ba đặc tính thường bị nhầm lẫn:
 
-- **atomicity**: operation có bị xen kẽ giữa chừng hay không;
-- **visibility**: một thread có nhìn thấy write của thread khác hay không;
-- **ordering**: compiler, JVM và CPU được phép quan sát các operation theo thứ
-  tự nào.
+- **tính nguyên tử** (`atomicity`): thao tác có thể bị luồng khác chen vào giữa
+  chừng hay không;
+- **khả năng nhìn thấy thay đổi** (`visibility`): một luồng có nhìn thấy giá trị
+  mà luồng khác vừa ghi hay không;
+- **thứ tự quan sát** (`ordering`): compiler, JVM và CPU được phép sắp xếp hoặc
+  quan sát các thao tác theo thứ tự nào.
 
-Một chương trình có visibility đúng vẫn có thể sai atomicity. Ví dụ,
-`volatile long counter` làm write dễ quan sát hơn nhưng `counter++` vẫn là
-compound operation:
+Một chương trình có thể bảo đảm khả năng nhìn thấy nhưng vẫn sai về tính nguyên
+tử. Ví dụ, `volatile long counter` giúp các luồng nhìn thấy giá trị mới hơn,
+nhưng `counter++` vẫn gồm ba bước riêng:
 
 ```text
-read counter → add 1 → write counter
+đọc counter → cộng 1 → ghi counter
 ```
 
-## Java Memory Model và happens-before
+## Thuật ngữ chính
 
-Java Memory Model (JMM) định nghĩa các giá trị mà một read được phép quan sát và
-quan hệ **happens-before** giữa các action. Một số quan hệ quan trọng:
+| Thuật ngữ | Ý nghĩa trong tài liệu này |
+| --- | --- |
+| `Java Memory Model` | Bộ quy tắc xác định một luồng được phép nhìn thấy giá trị nào |
+| `atomicity` | Tính không thể bị chen ngang giữa chừng |
+| `visibility` | Khả năng một luồng nhìn thấy thay đổi của luồng khác |
+| `ordering` | Thứ tự mà các thao tác được phép quan sát |
+| `happens-before` | Quan hệ bảo đảm visibility và ordering giữa hai action |
+| `compound operation` | Thao tác logic được tạo từ nhiều bước nhỏ |
+| `safe publication` | Công bố object theo cách các luồng khác nhìn thấy state hoàn chỉnh |
+| `thread confinement` | Chỉ cho một luồng sở hữu và thay đổi state |
 
-- unlock một monitor happens-before lần lock tiếp theo trên cùng monitor;
-- write vào một `volatile` field happens-before read tiếp theo của field đó;
-- action trước khi gọi `Thread.start()` happens-before action trong thread mới;
-- mọi action của thread hoàn tất happens-before thread khác trở về từ
+## Java Memory Model và quan hệ xảy ra-trước
+
+Java Memory Model (JMM) xác định giá trị mà một thao tác đọc được phép quan sát.
+Nó dùng quan hệ **xảy ra-trước** (`happens-before`) để nối các action giữa nhiều
+luồng.
+
+Một số quan hệ quan trọng:
+
+- thao tác mở khóa một monitor xảy ra-trước lần khóa tiếp theo trên cùng monitor;
+- thao tác ghi vào field `volatile` xảy ra-trước lần đọc tiếp theo của field đó;
+- action trước `Thread.start()` xảy ra-trước action trong thread mới;
+- action của thread đã hoàn tất xảy ra-trước khi thread khác trở về từ
   `Thread.join()`;
-- action được nối theo program order trong cùng một thread.
+- các action trong cùng một thread tuân theo program order của thread đó.
 
-`happens-before` tạo visibility và ordering cần thiết. Nó không tự biến một
-chuỗi nhiều operation thành một atomic operation.
+Quan hệ xảy ra-trước giúp truyền giá trị và thứ tự quan sát giữa các luồng. Nó
+không tự biến một chuỗi nhiều bước thành một thao tác nguyên tử.
 
-## Atomic operation và compound invariant
+> **Nói ngắn gọn:** nhìn thấy đúng giá trị không đồng nghĩa với việc toàn bộ
+> chuỗi xử lý được thực hiện như một bước duy nhất.
 
-Read/write của một reference riêng lẻ có thể atomic nhưng invariant thường bao
-gồm nhiều bước hoặc nhiều field:
+## Thao tác nguyên tử và quy tắc gồm nhiều bước
+
+Một lần đọc hoặc ghi reference riêng lẻ có thể là nguyên tử, nhưng quy tắc cần
+bảo vệ thường gồm nhiều thao tác:
 
 ```java
 if (remaining > 0) {
@@ -44,47 +65,57 @@ if (remaining > 0) {
 }
 ```
 
-Invariant `remaining >= 0` trải qua `read → decide → write`. Muốn bảo vệ nó,
-toàn bộ chuỗi phải dùng cùng một coordination mechanism, chẳng hạn:
+Quy tắc `remaining >= 0` trải qua chuỗi đọc–quyết định–ghi. Muốn bảo vệ toàn bộ
+chuỗi, mọi actor phải dùng cùng một cơ chế phối hợp, chẳng hạn:
 
-- một monitor qua `synchronized`;
-- một `Lock` được mọi actor dùng nhất quán;
-- một atomic compare-and-set loop;
-- confinement: chỉ một thread sở hữu mutable state;
-- loại bỏ shared mutable state.
+- cùng một monitor qua `synchronized`;
+- cùng một `Lock`;
+- vòng lặp compare-and-set;
+- chỉ cho một luồng sở hữu state;
+- loại bỏ hoàn toàn trạng thái dùng chung có thể thay đổi.
 
-Một thread-safe field không làm cho invariant nhiều field trở thành thread-safe.
-Ví dụ `AtomicLong sequence` không bảo vệ cặp `(sequence, customerId)` nếu
-`customerId` vẫn là shared mutable field.
+Một field an toàn cho nhiều luồng không tự bảo vệ quy tắc gồm nhiều field. Ví dụ,
+`AtomicLong sequence` chỉ bảo vệ sequence; nó không bảo vệ cặp
+`(sequence, customerId)` nếu `customerId` vẫn là field dùng chung.
 
-## volatile, atomics và locks
+## volatile, biến atomic và khóa
 
-| Cơ chế | Bảo đảm chính | Không tự bảo đảm |
+| Cơ chế | Điều được bảo đảm | Điều không tự được bảo đảm |
 | --- | --- | --- |
-| `volatile` | visibility và ordering quanh một field | compound atomicity |
-| `AtomicLong` | atomic operation/CAS trên một value | invariant nhiều field |
-| `synchronized` | mutual exclusion và happens-before trên cùng monitor | coordination giữa nhiều JVM |
-| `ReentrantLock` | mutual exclusion cùng các policy như interrupt/timeout | correctness nếu actor dùng lock khác |
-| immutable object | state không đổi sau safe publication | atomicity của workflow bên ngoài object |
+| `volatile` | Visibility và ordering quanh một field | Tính nguyên tử của chuỗi nhiều bước |
+| `AtomicLong` | Thao tác atomic/CAS trên một value | Quy tắc gồm nhiều field |
+| `synchronized` | Mutual exclusion và happens-before trên cùng monitor | Phối hợp giữa nhiều JVM |
+| `ReentrantLock` | Mutual exclusion cùng timeout/interrupt policy | Correctness nếu actor dùng lock khác |
+| Immutable object | State không đổi sau safe publication | Tính nguyên tử của workflow bên ngoài object |
 
-Ưu tiên thiết kế **stateless** hoặc immutable trước khi thêm lock. Khi không còn
-shared mutable state, không còn critical section phải phối hợp.
+Các từ trong bảng được giữ bằng tiếng Anh khi chúng là tên API hoặc khái niệm
+cần tra cứu trực tiếp. Trong phần diễn giải, có thể hiểu:
 
-## Safe publication
+- `mutual exclusion`: tại một thời điểm chỉ một luồng được vào vùng bảo vệ;
+- `compare-and-set` (CAS): chỉ ghi giá trị mới nếu giá trị hiện tại vẫn đúng như
+  lúc đã quan sát;
+- immutable object: object không thay đổi state sau khi được tạo hoàn chỉnh.
 
-Object chỉ thực sự immutable khi:
+Ưu tiên thiết kế service không giữ trạng thái request hoặc dùng immutable object
+trước khi thêm lock. Không có trạng thái dùng chung thì cũng không còn vùng cần
+tranh chấp.
 
-1. state hoàn chỉnh được thiết lập trước khi publish;
-2. field phù hợp là `final`;
-3. reference không thoát khỏi constructor;
-4. publication đi qua một happens-before edge hợp lệ.
+## Công bố object an toàn
 
-Spring publish singleton bean an toàn sau khi khởi tạo, nhưng điều đó không làm
-các mutable field được cập nhật trong lúc xử lý request trở thành thread-safe.
+Một object chỉ thực sự immutable đối với các luồng khác khi:
 
-## Ranh giới JVM và distributed system
+1. state được thiết lập hoàn chỉnh trước khi công bố;
+2. các field phù hợp được khai báo `final`;
+3. reference `this` không thoát khỏi constructor;
+4. object được công bố qua một quan hệ xảy ra-trước hợp lệ.
 
-Mỗi application instance có heap, monitor và atomic variable riêng:
+Spring công bố singleton bean an toàn sau khi khởi tạo. Điều đó chỉ bảo đảm các
+luồng nhìn thấy bean đã được tạo hoàn chỉnh; nó không làm cho mutable field được
+cập nhật trong lúc xử lý request trở nên an toàn.
+
+## Ranh giới giữa một JVM và nhiều application instance
+
+Mỗi application instance có heap, monitor và biến atomic riêng:
 
 ```text
 Load Balancer
@@ -92,14 +123,22 @@ Load Balancer
     └── App B: counter = 42, lock B
 ```
 
-`synchronized`, `ReentrantLock` và `AtomicLong` ở App A không phối hợp với App
-B. Invariant dùng chung giữa các node phải được bảo vệ tại authoritative shared
-boundary, ví dụ database constraint, conditional SQL, row lock, durable
-idempotency record hoặc một protocol lease/fencing phù hợp.
+`AtomicLong`, `synchronized` hoặc `ReentrantLock` trong App A không phối hợp với
+App B. Nếu quy tắc nghiệp vụ dùng chung giữa nhiều node, nó phải được bảo vệ tại
+ranh giới authoritative dùng chung, ví dụ:
+
+- database constraint;
+- conditional SQL;
+- row lock;
+- durable idempotency record;
+- protocol lease/fencing phù hợp với failure model.
+
+> **Nói ngắn gọn:** khóa Java bảo vệ các luồng trong một tiến trình, không bảo vệ
+> toàn bộ cụm application.
 
 ## Liên kết
 
 - Case áp dụng trực tiếp: [JVM-001](../jvm/spring-singleton-mutable-state/README.md)
-- Kỹ thuật kiểm thử: [Concurrency testing](concurrency-testing.md)
-- Các case liên quan được lập kế hoạch trong
-  [catalog](../CONCURRENCY_CASE_LIBRARY.md): `JVM-005`, `JVM-006`, `DB-001`
+- Kỹ thuật kiểm thử: [Kiểm thử đồng thời](concurrency-testing.md)
+- Các case liên quan trong [catalog](../CONCURRENCY_CASE_LIBRARY.md):
+  `JVM-005`, `JVM-006`, `DB-001`

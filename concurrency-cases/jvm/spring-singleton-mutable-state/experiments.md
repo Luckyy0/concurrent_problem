@@ -1,20 +1,20 @@
-# Concurrency tests và production verification
+# Kiểm thử đồng thời và xác minh trong môi trường thực tế
 
-## Testing strategy
+## Chiến lược kiểm thử
 
 Case dùng hai tầng kiểm thử:
 
-1. deterministic test với `CyclicBarrier` để ép cả hai actor read cùng state
-   trước khi write;
-2. concurrent test trên fixed implementation với `CountDownLatch` để xác minh
-   uniqueness và request isolation trên nhiều invocation.
+1. test có kiểm soát dùng `CyclicBarrier` để buộc hai actor cùng đọc một state
+   trước khi được phép ghi;
+2. test nhiều luồng dùng `CountDownLatch` trên code đã sửa để kiểm tra ID không
+   trùng và dữ liệu của từng request không bị lẫn.
 
-Không cần Testcontainers vì case không phụ thuộc database semantics.
+Không cần Testcontainers vì case không phụ thuộc vào hành vi của database.
 
-## Deterministic reproduction
+## Tái hiện lỗi có kiểm soát
 
-Instrumented service dưới đây chỉ thuộc test. Barrier biểu diễn đúng
-read-modify-write của broken implementation và tạo interleaving ổn định:
+Service có điểm điều phối dưới đây chỉ được dùng trong test. Barrier dừng hai
+luồng sau bước đọc, nhờ đó tái hiện ổn định chuỗi đọc–sửa–ghi bị lỗi:
 
 ```java
 package com.example.checkout;
@@ -27,6 +27,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.Test;
 
 class BrokenReceiptDraftServiceConcurrencyTest {
@@ -60,8 +62,8 @@ class BrokenReceiptDraftServiceConcurrencyTest {
     }
 
     private static Draft get(Future<Draft> future)
-            throws InterruptedException, ExecutionException {
-        return future.get();
+            throws InterruptedException, ExecutionException, TimeoutException {
+        return future.get(5, TimeUnit.SECONDS);
     }
 
     private static final class InstrumentedBrokenService {
@@ -82,12 +84,14 @@ class BrokenReceiptDraftServiceConcurrencyTest {
 
         private static void await(CyclicBarrier barrier) {
             try {
-                barrier.await();
+                barrier.await(5, TimeUnit.SECONDS);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("test interrupted", exception);
             } catch (BrokenBarrierException exception) {
                 throw new IllegalStateException("barrier broken", exception);
+            } catch (TimeoutException exception) {
+                throw new IllegalStateException("barrier timed out", exception);
             }
         }
     }
@@ -97,13 +101,17 @@ class BrokenReceiptDraftServiceConcurrencyTest {
 }
 ```
 
-Barrier có memory-consistency effect: action trước `await()` của mỗi actor
-happens-before action sau barrier của actor khác. Vì vậy test không dựa vào
-`Thread.sleep`.
+`CyclicBarrier` tạo quan hệ xảy ra-trước giữa các thao tác trước và sau
+`await()`. Nhờ vậy, test kiểm soát thứ tự bằng cơ chế đồng bộ thay vì đoán thời
+điểm bằng `Thread.sleep`.
 
-## Regression test cho fixed implementation
+> **Nói ngắn gọn:** test chủ động đặt hai luồng đúng vào cửa sổ gây lỗi, nên kết
+> quả không phụ thuộc vào may rủi của scheduler.
 
-Test này bắt đầu 100 invocation cùng một thời điểm và assert business invariant:
+## Kiểm thử hồi quy cho code đã sửa
+
+Test này cho 100 lời gọi bắt đầu cùng thời điểm, sau đó kiểm tra các quy tắc bắt
+buộc: đủ kết quả, ID không trùng và customer không bị lẫn giữa các request.
 
 ```java
 package com.example.checkout;
@@ -192,7 +200,7 @@ class ReceiptDraftServiceConcurrencyTest {
 `ReceiptDraftService` và `DraftIdGenerator` ở test dùng đúng fixed code trong
 [solutions](solutions.md).
 
-## Stress test bổ sung
+## Kiểm thử tải đồng thời bổ sung
 
 Có thể chạy broken implementation thật với nhiều actor và nhiều vòng lặp rồi
 so sánh:
@@ -203,20 +211,20 @@ distinct sequences
 result.customerId == input customerId
 ```
 
-Stress test có thể không fail ở mọi máy/lần chạy; nó là diagnostic bổ sung,
-không thay deterministic regression test.
+Kiểm thử tải đồng thời có thể không phát hiện lỗi ở mọi máy hoặc mọi lần chạy.
+Nó chỉ là bằng chứng bổ sung và không thay thế test có thứ tự được kiểm soát.
 
-## Failure và progress assertions
+## Kiểm tra lỗi và khả năng tiến triển
 
 - Mọi latch/barrier wait phải có timeout.
-- `Future.get(timeout)` nên được dùng nếu task có thể deadlock.
-- Executor luôn được shutdown trong `finally`.
-- Test phải fail nếu thiếu result, không chỉ khi có duplicate.
-- Interrupt status phải được khôi phục.
+- Dùng `Future.get(timeout)` nếu task có thể bị deadlock.
+- Luôn đóng executor trong `finally`.
+- Test phải thất bại khi thiếu kết quả, không chỉ khi phát hiện ID trùng.
+- Phải khôi phục interrupt status khi bắt `InterruptedException`.
 
-## Production verification
+## Xác minh trong môi trường thực tế
 
-Theo dõi các signal:
+Theo dõi các tín hiệu sau:
 
 - duplicate business/correlation ID bị database constraint reject;
 - mismatch giữa authenticated customer và result owner;
@@ -224,14 +232,13 @@ Theo dõi các signal:
 - thread pool queueing và request latency;
 - restart/deployment có làm local sequence tái sử dụng hay không.
 
-Không log raw sensitive customer data chỉ để chẩn đoán race. Dùng request ID và
-structured audit field phù hợp.
+Không ghi trực tiếp dữ liệu customer nhạy cảm vào log chỉ để chẩn đoán tranh
+chấp. Dùng request ID và trường audit có cấu trúc phù hợp.
 
-## Quality gate của case
+## Checklist chất lượng của case
 
 - [x] Deterministic interleaving không dùng sleep.
 - [x] Fixed implementation được chạy với nhiều actor.
 - [x] Assert uniqueness và request isolation.
 - [x] Timeout/cleanup được khai báo.
 - [x] Không dùng H2/Testcontainers vì không có database behavior.
-

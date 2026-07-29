@@ -31,22 +31,30 @@ completed.
 
 ## 3. Language and terminology
 
-- All explanatory content in Phase 2 Markdown files must be written in Vietnamese.
-- Keep canonical technical terms in English, for example: `race condition`,
-  `lost update`, `write skew`, `optimistic locking`, `pessimistic locking`,
-  `idempotency`, `deadlock`, `livelock`, `starvation`, `fencing token`, and
-  `transactional outbox`.
-- Add a Vietnamese translation or short explanation in parentheses when it
-  materially improves comprehension, especially on the first occurrence. The
-  English term remains the canonical term used throughout the case.
+- Vietnamese is the primary language. Prose must read as natural Vietnamese,
+  not as English grammar with Vietnamese connector words.
+- Introduce an unfamiliar concept as **Vietnamese meaning**
+  (`canonical English term`), followed by a short plain-language explanation
+  when needed.
+- After the first introduction, prefer the Vietnamese name in prose. Repeat the
+  English term only when comparison, searchability, or ambiguity makes it
+  useful.
+- Each case `README.md` must contain a compact **Thuật ngữ cần biết** table for
+  the concepts needed in that case. Prefer 3–10 entries.
+- Shared concept files define important terms once. Case files link to them and
+  explain only the case-specific application.
 - Do not translate Java identifiers, annotations, exception names, API names,
-  SQL keywords, PostgreSQL concepts, Redis/Kafka commands, configuration keys,
+  SQL keywords, PostgreSQL/Redis/Kafka command names, configuration keys,
   filenames, folder names, or `CASE_ID` values.
-- Headings, prose, timelines, table commentary, test explanations, production
-  considerations, and trade-off analysis must be Vietnamese. Code and SQL
-  remain idiomatic and may use English identifiers.
-- Use one stable English term consistently; do not alternate between multiple
-  Vietnamese translations that could imply different concepts.
+- Headings, timelines, table commentary, test explanations, production notes,
+  and trade-off analysis must use clear Vietnamese. Code and SQL remain
+  idiomatic and may use English identifiers.
+- Avoid mixed-language sentences. Write a complete Vietnamese sentence, then
+  retain the English term in parentheses where it is introduced.
+- Add a short **Nói ngắn gọn** statement after a dense explanation when it
+  helps connect the technical mechanism to the business consequence.
+- Use one stable Vietnamese translation and one canonical English term for the
+  same concept throughout the library.
 
 ## 4. Standard case bundle
 

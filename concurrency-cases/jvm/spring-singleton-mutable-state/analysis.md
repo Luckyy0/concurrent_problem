@@ -1,6 +1,6 @@
-# Race timeline và root cause
+# Dòng thời gian tranh chấp và nguyên nhân gốc
 
-## Initial state
+## Trạng thái ban đầu
 
 ```text
 nextSequence  = 41
@@ -10,13 +10,13 @@ T1 input = "alice"
 T2 input = "bob"
 ```
 
-Expression `++nextSequence` được mô hình hóa thành ba bước:
+Biểu thức `++nextSequence` nhìn như một câu lệnh, nhưng thực tế gồm ba bước:
 
 ```text
 read nextSequence → add 1 → write nextSequence
 ```
 
-## Interleaving
+## Thứ tự thực thi xen kẽ
 
 ```text
 T1: alice                                  T2: bob
@@ -35,7 +35,7 @@ return ReceiptDraft(42, "bob")
                                              return ReceiptDraft(42, "bob")
 ```
 
-## Expected và actual
+## Kết quả mong đợi và kết quả thực tế
 
 ```text
 Expected:
@@ -49,23 +49,28 @@ Actual:
   unique sequences = 1
 ```
 
-Hai invariant cùng bị phá:
+Hai quy tắc bắt buộc cùng bị phá:
 
-- lost update làm sequence `42` được cấp hai lần;
+- sequence `42` được cấp hai lần vì một cập nhật đã bị ghi đè (`lost update`);
 - customer của T1 bị thay bằng dữ liệu của T2.
 
-## Root cause theo layer
+> **Nói ngắn gọn:** hai request cùng đọc sequence cũ, sau đó cùng ghi một giá
+> trị mới; đồng thời request B thay thế customer đang được request A sử dụng.
 
-### Spring bean lifecycle
+## Nguyên nhân theo từng lớp
+
+### Vòng đời Spring bean
 
 `@Service` mặc định có singleton scope trong một `ApplicationContext`. Spring
-không tạo service mới cho mỗi HTTP request và không serialize method call.
-Safe publication lúc bean khởi tạo không bảo vệ mutable writes trong lúc chạy.
+không tạo service mới cho từng HTTP request và cũng không buộc các lời gọi method
+phải chạy lần lượt. Việc bean được công bố an toàn sau khởi tạo không bảo vệ các
+field tiếp tục bị thay đổi trong lúc xử lý request.
 
 ### JVM và Java Memory Model
 
-Có data race vì hai thread access cùng field, ít nhất một access là write và
-không có synchronization/happens-before relationship.
+Có **tranh chấp dữ liệu** (`data race`) vì hai luồng cùng truy cập một field, ít
+nhất một luồng thực hiện ghi, nhưng không có cơ chế đồng bộ tạo quan hệ
+xảy ra-trước giữa chúng.
 
 Hai lỗi độc lập:
 
@@ -73,22 +78,23 @@ Hai lỗi độc lập:
 2. `lastCustomerId` là request data được lưu trong shared field rồi đọc lại sau
    một cửa sổ interleaving.
 
-Root cause chính xác là:
+Chuỗi thao tác gây lỗi chính xác là:
 
 ```text
 shared field write → interleaving → compound update/read shared field
 ```
 
-Không phải chỉ vì “có nhiều request cùng lúc”.
+Vì vậy, nguyên nhân không chỉ là “có nhiều request cùng lúc”, mà là các request
+cùng sửa state qua một chuỗi không nguyên tử.
 
 ### Spring transaction, Hibernate và database
 
-Case này không access database, không có persistence context, MVCC hay database
-lock. Ngay cả nếu method có `@Transactional`, mỗi request có transaction riêng
-nhưng cùng Java object. Database rollback cũng không rollback giá trị Java
-field.
+Case này không truy cập database nên không có persistence context, MVCC hoặc
+row lock. Ngay cả khi method có `@Transactional`, mỗi request vẫn chạy trong một
+transaction riêng nhưng cùng truy cập Java object. Database rollback cũng không
+khôi phục giá trị của field trong Java heap.
 
-## Commit, rollback, timeout và crash
+## Ảnh hưởng của commit, rollback, timeout và crash
 
 - **Commit/rollback:** không áp dụng cho local fields; không có transaction log
   phục hồi chúng.
@@ -101,7 +107,7 @@ field.
 
 Các đặc tính này cho thấy local counter không phù hợp làm durable business ID.
 
-## Multi-instance behavior
+## Khi có nhiều application instance
 
 Nếu production có hai application instance:
 
@@ -110,12 +116,14 @@ App A: nextSequence = 41, monitor/AtomicLong A
 App B: nextSequence = 41, monitor/AtomicLong B
 ```
 
-Ngay cả implementation dùng `synchronized` hoặc `AtomicLong`, hai node vẫn có
-thể cấp cùng sequence. Local coordination chỉ có hiệu lực trong JVM sở hữu nó.
+Ngay cả khi dùng `synchronized` hoặc `AtomicLong`, hai node vẫn có thể cấp cùng
+sequence. Cơ chế phối hợp cục bộ chỉ có hiệu lực trong JVM đang sở hữu nó.
 
-## Consequences
+> **Nói ngắn gọn:** khóa trong App A không khóa được code đang chạy ở App B.
 
-### Technical
+## Hậu quả
+
+### Hậu quả kỹ thuật
 
 - duplicate sequence và lost update;
 - cross-request data leakage;
@@ -123,7 +131,7 @@ thể cấp cùng sequence. Local coordination chỉ có hiệu lực trong JVM 
 - behavior thay đổi theo scheduler;
 - không có recovery contract sau crash.
 
-### Business
+### Hậu quả nghiệp vụ
 
 - customer nhận draft chứa identifier của customer khác;
 - downstream dedup/correlation có thể gộp nhầm operation;
@@ -132,12 +140,12 @@ thể cấp cùng sequence. Local coordination chỉ có hiệu lực trong JVM 
 
 ## Vì sao lỗi khó tái hiện bằng unit test thường
 
-Một unit test tuần tự tạo total order:
+Một unit test tuần tự luôn tạo ra thứ tự hoàn chỉnh:
 
 ```text
 call A hoàn tất → call B bắt đầu
 ```
 
-Nó không mở cửa sổ sau `read` và trước `write`. Regression test cần barrier/latch
-để điều phối interleaving; xem [experiments](experiments.md).
-
+Test như vậy không tạo được cửa sổ giữa bước đọc và bước ghi. Regression test
+cần barrier hoặc latch để chủ động điều phối thứ tự xen kẽ; xem
+[phần kiểm thử](experiments.md).

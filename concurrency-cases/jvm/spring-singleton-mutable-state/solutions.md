@@ -1,9 +1,9 @@
-# Solutions, fixed code và trade-offs
+# Giải pháp, code đã sửa và các đánh đổi
 
-## Giải pháp khuyến nghị: stateless singleton
+## Giải pháp khuyến nghị: singleton không giữ trạng thái request
 
-Request data chỉ tồn tại trong parameter/local variable. ID generation được
-tách thành dependency có contract thread-safe:
+Dữ liệu của request chỉ tồn tại trong parameter hoặc local variable. Việc tạo ID
+được tách thành một dependency có contract an toàn cho nhiều luồng:
 
 ```java
 package com.example.checkout;
@@ -74,18 +74,22 @@ public record ReceiptDraft(UUID id, String customerId) {
 }
 ```
 
-## Vì sao hoạt động
+## Tại sao giải pháp hoạt động
 
-- Service không còn mutable field thay đổi theo request.
-- `customerId` là local reference của invocation; request khác không thể thay
-  thế nó.
-- `ReceiptDraft` immutable và được tạo hoàn chỉnh trước khi trả về.
-- `UUID.randomUUID()` hỗ trợ concurrent invocation; mỗi lời gọi không phụ
-  thuộc read-modify-write trên state của service.
-- Không có loser phải block, fail hoặc retry vì không còn conflict trên shared
-  application state.
+- Service không còn field thay đổi theo từng request.
+- `customerId` là biến cục bộ của một lời gọi; request khác không thể thay thế
+  giá trị này.
+- `ReceiptDraft` không thay đổi sau khi được tạo và được hoàn thiện trước khi trả
+  về.
+- `UUID.randomUUID()` hỗ trợ nhiều lời gọi đồng thời; mỗi lời gọi không thực
+  hiện chuỗi đọc–sửa–ghi trên state của service.
+- Không còn actor thua phải chờ, thất bại hoặc thử lại vì không còn xung đột trên
+  state dùng chung.
 
-Đây là removal of contention thay vì chỉ bao contention bằng lock.
+Giải pháp loại bỏ điểm tranh chấp thay vì chỉ đặt khóa bao quanh nó.
+
+> **Nói ngắn gọn:** mỗi request chỉ làm việc với dữ liệu của chính nó nên request
+> khác không còn state để ghi đè.
 
 Nếu ID là durable business identity đòi hỏi uniqueness tuyệt đối, UUID tại
 application layer vẫn phải đi cùng database unique constraint. Nếu cần global
@@ -100,7 +104,7 @@ SELECT nextval('receipt_draft_seq');
 Database sequence xử lý concurrency giữa nhiều application instance, nhưng
 không cam kết gap-free sequence khi transaction rollback.
 
-## Alternative 1: AtomicLong cho local sequence
+## Phương án 1: AtomicLong cho sequence cục bộ
 
 ```java
 @Service
@@ -115,11 +119,12 @@ public final class LocalReceiptDraftService {
 }
 ```
 
-Điều này hoạt động nếu contract chỉ yêu cầu unique sequence trong vòng đời một
-JVM. `customerId` phải vẫn là local variable. Không dùng nó cho durable/global
-identity vì restart reset state và mỗi node có `AtomicLong` riêng.
+Cách này phù hợp khi contract chỉ yêu cầu sequence duy nhất trong vòng đời một
+JVM. `customerId` vẫn phải là local variable. Không dùng local counter cho định
+danh bền vững hoặc dùng chung toàn hệ thống, vì restart làm mất state và mỗi
+node có một `AtomicLong` riêng.
 
-## Alternative 2: synchronized critical section
+## Phương án 2: vùng bảo vệ bằng synchronized
 
 ```java
 public synchronized ReceiptDraft createDraft(String customerId) {
@@ -128,9 +133,10 @@ public synchronized ReceiptDraft createDraft(String customerId) {
 }
 ```
 
-Cùng monitor tạo mutual exclusion và happens-before. T2 block cho tới khi T1
-thoát method; không retry. Cách này đúng trong một JVM nhưng serialize mọi
-request, tăng queueing latency dưới contention và không bảo vệ App B.
+Cùng một monitor bảo đảm tại một thời điểm chỉ một luồng vào method và tạo quan
+hệ xảy ra-trước giữa hai lần gọi. T2 phải chờ đến khi T1 thoát method; application
+không cần retry. Cách này đúng trong một JVM nhưng buộc mọi request chạy lần
+lượt, làm tăng độ trễ khi mức tranh chấp cao và không bảo vệ App B.
 
 Nếu lock bao nhiều resource hoặc method gọi code có lock khác, deadlock risk có
 thể xuất hiện. Case hiện tại chỉ có một monitor nên risk thấp.
@@ -145,23 +151,24 @@ thể xuất hiện. Case hiện tại chỉ có một monitor nên risk thấp.
 - **distributed lock:** quá phức tạp cho việc có thể loại bỏ shared state hoặc
   dùng authoritative ID generator.
 
-## So sánh trade-offs
+## So sánh các đánh đổi
 
-| Solution | Correctness | Throughput/latency | Contention/retry | Deadlock risk | Operational complexity | Horizontal scalability |
+| Giải pháp | Mức bảo đảm | Thông lượng và độ trễ | Tranh chấp và retry | Nguy cơ deadlock | Độ phức tạp vận hành | Mở rộng nhiều node |
 | --- | --- | --- | --- | --- | --- | --- |
-| Stateless + UUID | Mạnh cho request isolation; DB constraint nếu cần absolute uniqueness | Cao, không queue trên service | Không shared contention; không retry do conflict | Không | Thấp | Tốt |
-| `AtomicLong` + local data | Mạnh chỉ trong một JVM/lifetime | Cao | CAS contention khi rất nóng; thường không application retry | Không | Thấp | Kém cho global identity |
-| `synchronized` | Mạnh trong một JVM nếu mọi access cùng monitor | Latency tăng do serialization | Thread thứ hai block; không retry | Thấp với một lock, tăng nếu nhiều lock | Thấp/trung bình | Không bảo vệ nhiều node |
-| Database sequence | Global sequence allocation giữa node | Thêm DB round trip | Database quản lý contention; application không retry thông thường | Rất thấp cho sequence call | Trung bình | Tốt, DB là shared boundary |
-| Distributed lock | Phụ thuộc TTL/ownership/fencing | Thêm network latency | Có lock wait/failure/retry | Có protocol/failure risks | Cao | Phức tạp, không cần cho case này |
+| Stateless + UUID | Cách ly request tốt; thêm DB constraint nếu cần uniqueness tuyệt đối | Cao, không có hàng chờ tại service | Không còn state dùng chung nên không cần retry do conflict | Không | Thấp | Tốt |
+| `AtomicLong` + dữ liệu cục bộ | Chỉ bảo đảm trong một JVM và một vòng đời process | Cao | CAS có thể tranh chấp khi rất nóng; thường không cần application retry | Không | Thấp | Không phù hợp cho global identity |
+| `synchronized` | Đúng trong một JVM nếu mọi access dùng cùng monitor | Độ trễ tăng vì các request chạy lần lượt | Luồng thứ hai phải chờ; không retry | Thấp với một lock, tăng khi có nhiều lock | Thấp/trung bình | Không bảo vệ nhiều node |
+| Database sequence | Cấp sequence dùng chung giữa các node | Thêm một DB round trip | Database quản lý tranh chấp; thường không cần application retry | Rất thấp cho một sequence call | Trung bình | Tốt khi database là ranh giới dùng chung |
+| Distributed lock | Phụ thuộc TTL, ownership và fencing | Thêm network latency | Có chờ khóa, lỗi và retry | Có rủi ro từ protocol và failure mode | Cao | Quá phức tạp cho case này |
 
-## Production considerations
+## Lưu ý khi áp dụng thực tế
 
 - Không lưu `HttpServletRequest`, authentication principal, customer data hoặc
   correlation ID trong singleton field.
 - Dùng parameter, immutable command hoặc logging MDC có lifecycle/cleanup đúng.
 - Metrics dùng Micrometer/thread-safe instrument thay vì counter tự viết.
-- Xác định rõ ID contract: local, global, durable, monotonic hay gap-free.
-- Idempotency của client retry là invariant khác với thread safety của service;
-  cần idempotency key/durable record nếu business yêu cầu.
-
+- Xác định rõ contract của ID: cục bộ hay toàn hệ thống, tạm thời hay bền vững,
+  có cần tăng dần hoặc không được có khoảng trống hay không.
+- Khả năng xử lý lặp an toàn (`idempotency`) khi client retry là một quy tắc khác
+  với thread safety của service. Nếu nghiệp vụ yêu cầu, cần idempotency key và
+  durable record riêng.
