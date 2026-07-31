@@ -1,72 +1,61 @@
-# Deadlock và retry an toàn
+# Bế tắc (Deadlock) và cách thử lại (Retry) an toàn
 
-## Mục đích
+## Mục tiêu
 
-Tài liệu này định nghĩa vocabulary chung cho JVM lock, database lock và
-coordination retry. Mỗi case vẫn phải giải thích detector, victim và transaction
-boundary của layer cụ thể.
+Tài liệu này sẽ giúp bạn hiểu rõ các từ vựng chung khi nói về cơ chế khóa (lock) trong Java, khóa trong cơ sở dữ liệu (Database) và cách để "thử lại" (retry) một cách an toàn khi có lỗi xảy ra. 
 
-## Thuật ngữ chính
+## Các thuật ngữ chính cần hiểu
 
-| Thuật ngữ | Ý nghĩa |
+| Thuật ngữ | Giải thích dễ hiểu |
 | --- | --- |
-| bế tắc (`deadlock`) | Một nhóm actor chờ lẫn nhau theo vòng kín nên không actor nào tiến tiếp |
-| đồ thị chờ (`wait-for graph`) | Đồ thị actor → resource/actor đang bị chờ |
-| chu trình chờ (`wait-for cycle`) | Một vòng trong wait-for graph, dấu hiệu cốt lõi của deadlock |
-| thứ tự khóa xác định (`deterministic lock ordering`) | Mọi actor acquire nhiều lock theo cùng một total order |
-| victim | Actor/transaction bị detector hủy để phá cycle |
-| bounded acquisition | Chờ lock có deadline/timeout thay vì vô hạn |
-| retry boundary | Phạm vi operation được phép chạy lại sau conflict |
+| Bế tắc (`deadlock`) | Tình trạng hai hay nhiều luồng (thread) hoặc giao dịch (transaction) đang ôm khư khư tài nguyên của mình và đứng chờ tài nguyên của đối phương. Kết quả là tạo thành một vòng luẩn quẩn không ai nhúc nhích được. |
+| Đồ thị chờ (`wait-for graph`) | Một sơ đồ để vẽ ra xem luồng nào đang chờ tài nguyên của luồng nào. |
+| Chu trình chờ (`wait-for cycle`) | Khi nhìn vào sơ đồ trên mà thấy một vòng tròn khép kín (A chờ B, B chờ C, C lại chờ A) thì đó chính là dấu hiệu chắc chắn của Deadlock. |
+| Thứ tự khóa thống nhất (`deterministic lock ordering`) | Một nguyên tắc vàng: Ép tất cả các luồng phải lấy khóa (lock) theo đúng một thứ tự giống hệt nhau (ví dụ: luôn khóa dòng có ID nhỏ trước, ID lớn sau). |
+| Nạn nhân (`victim`) | Luồng hoặc giao dịch bị hệ thống tự động "giết" (hủy bỏ) để phá vỡ vòng luẩn quẩn, cứu các luồng khác. |
+| Giới hạn thời gian chờ (`bounded acquisition`) | Đặt thời gian tối đa (timeout) khi đứng chờ khóa, thay vì chờ đợi vô tận. |
+| Phạm vi thử lại (`retry boundary`) | Xác định rõ đoạn code nào sẽ được phép chạy lại từ đầu nếu bị lỗi xung đột. |
 
-## Bốn điều kiện cần
+## Bốn yếu tố tạo nên Deadlock
 
-Deadlock cổ điển cần đồng thời: mutual exclusion, hold-and-wait, không thể cưỡng
-chế thu hồi resource (`no preemption`) và circular wait. Phá circular wait bằng
-một total lock order thường là giải pháp dễ chứng minh nhất.
+Để một deadlock kinh điển xảy ra, phải hội đủ 4 yếu tố:
+1. **Độc quyền:** Một tài nguyên chỉ cho một người dùng.
+2. **Giữ và chờ:** Đang cầm tài nguyên này nhưng lại đứng chờ tài nguyên khác.
+3. **Không thể tước đoạt:** Không ai có quyền giật tài nguyên khỏi tay người đang giữ nó.
+4. **Chờ đợi vòng tròn:** Tạo thành một vòng khép kín.
 
-Timeout không xóa nguyên nhân; nó chỉ giới hạn thời gian chờ và yêu cầu actor
-release những lock đã giữ. Retry không có ordering/backoff có thể biến deadlock
-thành livelock hoặc retry storm.
+**Cách giải quyết dễ nhất:** Phá vỡ yếu tố thứ 4 (chờ đợi vòng tròn) bằng cách bắt mọi người lấy khóa theo **cùng một thứ tự**.
+Lưu ý: Việc đặt thời gian chờ (timeout) không giải quyết tận gốc nguyên nhân gây deadlock. Nó chỉ giúp luồng không bị kẹt mãi mãi, nếu luồng bị timeout, nó phải chủ động nhả các khóa đang giữ ra. Nếu bạn code cho nó "thử lại" (retry) ngay lập tức mà không chịu nhường nhịn hay lùi thời gian lại (backoff), hệ thống của bạn có thể chuyển từ Deadlock sang Livelock (cứ liên tục đụng nhau rồi cùng lùi lại mãi mãi không thể hoàn thành).
 
-## JVM và PostgreSQL khác nhau
+## Điểm khác biệt giữa Java (JVM) và PostgreSQL
 
-JVM intrinsic lock không có cơ chế tự chọn victim cho application. Deadlocked
-platform thread thường đứng cho tới khi process restart; intrinsic monitor wait
-không interruptible. `ReentrantLock.lockInterruptibly`/`tryLock` cho phép code tự
-contain wait nếu cleanup đúng.
+- **Trong Java (JVM):** Nếu dùng từ khóa khóa cơ bản (`synchronized`), Java rất "ngốc". Nó không biết tự tìm "nạn nhân" để hủy. Nếu dính deadlock, các luồng đó sẽ đứng chết trân mãi mãi cho đến khi bạn khởi động lại (restart) ứng dụng. Bắt buộc phải dùng `ReentrantLock.tryLock()` để tự cài thời gian chờ (timeout) để tự thoát ra.
+- **Trong PostgreSQL:** Database rất thông minh. Nó có bộ phận dò tìm deadlock. Nếu thấy vòng luẩn quẩn, nó sẽ tự chọn một giao dịch làm "nạn nhân", hủy giao dịch đó (báo lỗi) để giải cứu các giao dịch còn lại. 
 
-PostgreSQL có deadlock detector, chọn một transaction làm victim và abort với lỗi.
-Application phải rollback transaction trước retry. Isolation, row-lock order và
-idempotency quyết định retry có an toàn hay không.
+> **Nói ngắn gọn:** Cả hai đều có thể bị vòng luẩn quẩn chờ đợi. Nhưng Java thì treo luôn không biết làm gì, còn Database thì sẽ báo lỗi và giết một luồng. Do đó, code Java của bạn phải hứng lỗi này, hoàn tác dữ liệu (rollback) và tự quyết định xem có nên thử lại (retry) hay không.
 
-> **Nói ngắn gọn:** cùng có wait-for cycle, nhưng JVM và database khác nhau ở
-> người phát hiện, cách phá vòng và state phải rollback.
+## 6 quy tắc vàng để phòng ngừa Deadlock
 
-## Cách phòng ngừa
+1. **Giữ ít khóa nhất có thể:** Càng ít khóa cùng lúc, càng ít nguy cơ dính chùm.
+2. **Khóa theo thứ tự:** Sắp xếp các khóa theo một thứ tự chuẩn (ví dụ: luôn khóa bảng User trước, rồi mới khóa bảng Order) và mọi luồng phải tuân theo thứ tự đó.
+3. **Làm nhanh rút gọn:** Khối code nằm trong vùng khóa phải chạy thật nhanh. Tuyệt đối tránh gọi API bên ngoài (remote I/O) khi đang giữ khóa nếu có thể.
+4. **Luôn có Timeout:** Dùng các loại khóa có hỗ trợ thời gian chờ (timeout/interruptible).
+5. **Mở khóa ngược chiều:** Khóa cái nào trước thì mở (release) cái đó sau cùng trong khối `finally`.
+6. **Không thử lại mù quáng:** Giới hạn số lần retry, có thời gian chờ (deadline), và mỗi lần thử lại nên trễ đi một chút ngẫu nhiên (jitter backoff).
 
-1. Giảm số lock cần giữ đồng thời.
-2. Định nghĩa total order trên stable key và acquire theo order đó.
-3. Giữ critical section ngắn; không gọi remote I/O khi đang giữ nhiều lock nếu
-   có thể tránh.
-4. Dùng bounded/interruptible acquisition khi latency contract yêu cầu.
-5. Release theo thứ tự ngược trong `finally`.
-6. Không retry vô hạn; dùng attempt limit, deadline và backoff có jitter.
+## Thử lại (Retry) an toàn là như thế nào?
 
-## Retry an toàn
+- Chỉ được thử lại sau khi đã đảm bảo mọi thứ (trạng thái code, giao dịch DB) của lần thử trước đã được dọn dẹp sạch sẽ (rollback hoàn toàn).
+- Nếu trong lúc xử lý bạn có gọi qua các hệ thống bên ngoài (ví dụ gửi Email, gọi API thanh toán), bạn phải có cơ chế kiểm tra chống trùng lặp (idempotency key) trước khi thử lại để tránh gửi Email 2 lần.
+- **Phân biệt rõ ràng:** Lỗi do tranh chấp, deadlock thì CÓ THỂ thử lại. Còn lỗi do logic nghiệp vụ (ví dụ: dữ liệu không hợp lệ) thì TUYỆT ĐỐI KHÔNG tự động thử lại.
 
-Chỉ retry sau khi mọi lock/transaction state của attempt cũ đã được cleanup.
-Operation có external side effect cần idempotency key hoặc reconciliation trước
-retry. Phân loại rõ deadlock/conflict có thể retry với validation/business failure
-không nên retry.
+## Dấu hiệu nhận biết và chẩn đoán (Monitoring)
 
-## Quan sát và chẩn đoán
+- **Trong Java:** Dùng lệnh lấy luồng (Thread dump), tìm kiếm bằng JMX `ThreadMXBean.findDeadlockedThreads`, xem ai đang giữ khóa nào và luồng đang chạy tới dòng code nào.
+- **Trong PostgreSQL:** Xem mã lỗi SQL (SQLSTATE), đọc log deadlock của database, xem mã tiến trình (PID) nào đang bị chặn.
+- **Chỉ số cần theo dõi (Metric):** Số lần bị timeout chờ khóa, số lần bị báo deadlock, số lần phải thử lại (retry attempt) và kết quả của những lần thử đó.
 
-- JVM: thread dump, `ThreadMXBean.findDeadlockedThreads`, lock owner và stack.
-- PostgreSQL: SQLSTATE, deadlock log, blocked/blocking PID, transaction age.
-- Metric: acquisition timeout, deadlock detection, retry attempt/outcome và
-  operation deadline.
-
-## Liên kết
+## Liên kết tài liệu tham khảo
 
 - [JVM-007 — Opposite Lock Ordering Deadlock](../jvm/opposite-lock-order-deadlock/README.md)
 - [DB-008 — PostgreSQL opposite row order deadlock](../postgresql/opposite-row-order-deadlock/README.md)

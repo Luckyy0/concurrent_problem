@@ -1,74 +1,62 @@
-# Pessimistic locking và `FOR UPDATE`
+# Khóa bi quan (Pessimistic locking) và `FOR UPDATE`
 
-## Mục đích
+## Mục tiêu
 
-Khóa bi quan (`pessimistic locking`) reserve database resource trước khi
-application đưa ra một quyết định phụ thuộc state. Tài liệu này định nghĩa cơ
-chế chung; mỗi case vẫn phải nêu row nào được khóa, invariant nào được bảo vệ và
-failure contract của waiter.
+Khóa bi quan (`pessimistic locking`) là chiến thuật: "Cẩn tắc vô áy náy" – xí chỗ và khóa cứng dữ liệu ở Database ngay từ lúc bắt đầu đọc, trước khi hệ thống kịp đưa ra bất kỳ quyết định tính toán nào. 
+Tài liệu này sẽ giải thích cơ chế hoạt động chung; tuy nhiên khi áp dụng thực tế, bạn vẫn phải trả lời rõ: bạn đang khóa dòng nào, bạn muốn bảo vệ quy tắc gì, và nếu phải đứng chờ thì bạn sẽ xử lý lỗi ra sao.
 
-## Thuật ngữ chính
+## Các thuật ngữ chính cần hiểu
 
-| Thuật ngữ | Ý nghĩa |
+| Thuật ngữ | Giải thích dễ hiểu |
 | --- | --- |
-| pessimistic lock | Lock được acquire trước mutation vì concurrent conflict được xem là có khả năng xảy ra |
-| locking read | Query vừa đọc vừa yêu cầu database lock |
-| `PESSIMISTIC_WRITE` | JPA lock mode cho explicit write-oriented lock |
-| `FOR UPDATE` | PostgreSQL row-locking clause mạnh cho selected rows |
-| holder | Transaction đang giữ lock |
-| waiter | Transaction đang chờ incompatible lock |
-| lock lifetime | Từ lock acquisition đến commit/rollback |
-| bounded wait | Chờ có timeout/deadline hữu hạn |
-| revalidation | Đánh giá lại state sau khi acquire lock |
-| lock order | Thứ tự nhất quán khi khóa nhiều resources |
+| Khóa bi quan (`pessimistic lock`) | Đòi khóa dữ liệu ngay lập tức vì luôn "bi quan" lo sợ rằng sẽ có luồng khác nhảy vào tranh giành. |
+| Đọc kèm khóa (`locking read`) | Một câu truy vấn (query) có tác dụng "2 trong 1": vừa đọc dữ liệu lên, vừa yêu cầu Database khóa dòng đó lại. |
+| `PESSIMISTIC_WRITE` | Một cấu hình trong code JPA/Hibernate báo hiệu muốn xin khóa để chuẩn bị ghi (sửa) dữ liệu. |
+| `FOR UPDATE` | Một câu lệnh quyền lực trong PostgreSQL, gắn vào cuối câu SELECT để khóa cứng các dòng vừa tìm được. |
+| Người giữ khóa (`holder`) | Giao dịch (Transaction) đang chạy nhanh chân chộp được khóa trước. |
+| Người chờ khóa (`waiter`) | Giao dịch đến sau, bị chặn lại và phải đứng xếp hàng chờ khóa. |
+| Vòng đời của khóa (`lock lifetime`) | Thời gian từ lúc xin được khóa cho tới khi giao dịch đó kết thúc (bằng lệnh commit hoặc rollback). |
+| Chờ có giới hạn (`bounded wait`) | Đứng chờ nhưng có hẹn giờ (timeout), quá giờ là bỏ cuộc chứ không chờ mù quáng. |
+| Kiểm định lại (`revalidation`) | Sau khi đứng chờ vã mồ hôi mới lấy được khóa, bạn phải đọc lại dữ liệu và kiểm tra lại từ đầu xem điều kiện nghiệp vụ còn đúng không. |
+| Thứ tự khóa (`lock order`) | Khi muốn xin khóa nhiều dòng cùng lúc, bạn phải tuân thủ một thứ tự nhất quán (ví dụ từ bé đến lớn) để tránh bị Bế tắc (Deadlock). |
 
-## Cơ chế cốt lõi
+## Cơ chế cốt lõi hoạt động ra sao?
 
 ```text
-BEGIN
-  locking SELECT
-  → acquire row lock
-  → read current state
-  → decide
-  → mutate
-COMMIT/ROLLBACK
-  → release lock
+BẮT ĐẦU GIAO DỊCH (BEGIN)
+  SELECT kèm lệnh khóa
+  → Đòi khóa dòng thành công
+  → Đọc trạng thái dữ liệu hiện tại
+  → Tính toán logic nghiệp vụ
+  → Cập nhật dữ liệu (UPDATE)
+KẾT THÚC GIAO DỊCH (COMMIT/ROLLBACK)
+  → Database tự động nhả khóa
 ```
 
-Một transaction khác yêu cầu incompatible lock trên cùng row sẽ block,
-fail-fast hoặc timeout. Sau khi holder kết thúc, waiter không được tiếp tục với
-state đã đọc trước đó; nó phải dùng state trả về từ locking read và revalidate
-business rule.
+Nếu có một giao dịch khác (người chờ) cũng muốn khóa đúng dòng dữ liệu đó, nó sẽ bị chặn lại (đứng chờ), hoặc báo lỗi ngay lập tức, hoặc bị văng lỗi timeout nếu chờ quá lâu.
+**Lưu ý cực kỳ quan trọng:** Sau khi người giữ khóa chạy xong và nhả khóa, người chờ tuyệt đối **không được** dùng cái dữ liệu cũ mèm mà nó lỡ đọc trước đó. Nó phải xài dữ liệu mới toanh vừa được trả về từ lệnh đọc-kèm-khóa và kiểm tra lại toàn bộ logic nghiệp vụ (revalidate).
 
-> **Nói ngắn gọn:** pessimistic lock đúng không chỉ “làm request thứ hai chờ”;
-> nó buộc request đó quyết định sau outcome của request thứ nhất.
+> **Nói ngắn gọn:** Khóa bi quan đúng nghĩa không chỉ làm cho "người đến sau phải đứng chờ"; mà nó ép người đến sau phải đưa ra quyết định dựa trên cái kết quả mà người đến trước vừa làm xong.
 
-## PostgreSQL `FOR UPDATE`
+## Lệnh `FOR UPDATE` trong PostgreSQL
 
 ```sql
-select *
-from show_seat
-where show_id = :showId
-  and seat_no = :seatNo
-for update;
+SELECT *
+FROM show_seat
+WHERE show_id = :showId
+  AND seat_no = :seatNo
+FOR UPDATE;
 ```
 
-`FOR UPDATE` lock selected rows như rows sắp được update. Competing `UPDATE`,
-`DELETE` và incompatible locking reads chờ transaction hiện tại kết thúc. Plain
-MVCC `SELECT` thường không bị row lock này chặn; nó đọc committed tuple version
-theo snapshot.
+Lệnh `FOR UPDATE` sẽ khóa chặt các dòng được chọn, hệt như thể bạn sắp sửa lệnh `UPDATE` trên chúng. Bất kỳ lệnh `UPDATE`, `DELETE` hay `SELECT FOR UPDATE` nào khác chạm vào dòng này đều phải đứng chờ giao dịch hiện tại chạy xong. 
+Tuy nhiên, lệnh `SELECT` bình thường (không có chữ FOR UPDATE) thì vẫn lấy được dữ liệu cũ ra xem một cách vô tư (nhờ cơ chế MVCC).
 
-Row locks tồn tại đến transaction end, không release khi repository method
-return. Một transaction giữ lock trong remote I/O vẫn giữ database connection
-và làm wait queue dài hơn.
+- **Khóa tồn tại bao lâu?** Nó sống đến tận lúc kết thúc giao dịch (transaction end), chứ không hề bị nhả ra khi hàm code Repository của bạn chạy xong. Nếu sau khi khóa, code của bạn lại đi gọi API bên ngoài (gửi Email, gọi thẻ tín dụng...), bạn sẽ ngâm cái kết nối Database đó rất lâu và làm cho hàng đợi những người đứng chờ dài dằng dặc.
+- **Chỉ khóa cái đang có thật:** Nếu câu SELECT không tìm thấy dòng nào, nó sẽ không khóa cái gì cả. Nó KHÔNG có khả năng chặn người khác thêm mới (insert) một dòng dữ liệu tương tự vào tương lai.
 
-`FOR UPDATE` chỉ lock rows thực sự được select. Query trả zero rows không tạo row
-lock trên một object còn thiếu và không khóa toàn bộ predicate chống future
-insert.
+## Khai báo trong JPA/Hibernate
 
-## JPA/Hibernate mapping
-
-Spring Data JPA cho phép gắn lock mode vào query:
+Trong Spring Data JPA, việc xin khóa cực kỳ đơn giản, chỉ cần thêm 1 dòng chữ:
 
 ```java
 public interface ShowSeatRepository
@@ -80,155 +68,125 @@ public interface ShowSeatRepository
 }
 ```
 
-Hibernate chuyển lock mode thành database locking syntax phù hợp với dialect.
-SQL clause cụ thể có thể phụ thuộc Hibernate version và query shape, nên
-integration test/log phải xác nhận behavior trên PostgreSQL thật.
+Hibernate sẽ tự động dịch `@Lock` này thành câu lệnh `FOR UPDATE` chuẩn xác nhất cho PostgreSQL. (Lưu ý: câu SQL thực tế có thể thay đổi tùy phiên bản Hibernate, nên hãy luôn kiểm tra log khi chạy thực tế).
 
-Query cần active transaction. Boundary đúng bao trùm:
-
+Phạm vi giao dịch (Transaction boundary) phải bao trùm toàn bộ:
 ```text
-locking query → revalidation → all database mutations → flush → commit
+Truy vấn xin khóa → Kiểm định lại (revalidate) → Mọi thao tác đổi dữ liệu → Flush (Đẩy xuống DB) → Commit (Chốt sổ)
 ```
+Việc thêm chữ `@Lock` sẽ trở nên vô dụng nếu bạn gọi hàm bị sai (lỗi tự gọi hàm - self-invocation), giao dịch được mở quá rộng, hoặc đối tượng đã lỡ bị tải lên bộ nhớ (cached) từ trước khi bạn gọi hàm xin khóa.
 
-Lock annotation không sửa self-invocation, transaction quá rộng hoặc object đã
-được load stale trước locking query.
+## Các chiến thuật khi phải đứng chờ (Wait policy)
 
-## Wait policy
+### Bounded wait (Chờ có hẹn giờ)
+Chấp nhận đứng chờ người trước một khoảng thời gian ngắn rồi mới kiểm tra lại. Rất phù hợp nếu các luồng làm việc rất nhanh.
+Trong PostgreSQL, bạn dùng `lock_timeout` để giới hạn thời gian chờ khóa. Đừng nhầm lẫn nó với:
+- `statement_timeout`: Giới hạn thời gian chạy của cả một câu SQL dài.
+- transaction/application deadline: Giới hạn của toàn bộ công việc (nhiều lệnh SQL).
+- connection acquisition timeout: Thời gian chờ xin một kết nối (connection) từ pool.
+- client timeout: Thời gian API chờ phản hồi.
+Các thông số này phải được lồng ghép hợp lý, nhớ chừa lại một ít thời gian để còn kịp rollback và báo lỗi cho người dùng.
 
-### Bounded wait
+### `NOWAIT` (Báo lỗi ngay)
+Báo lỗi ngay nếu thấy dòng đó đang bị khóa. Rất hợp lý nếu hệ thống của bạn muốn báo ngay chữ `BUSY` (Hệ thống đang bận) cho người dùng. Nhưng đừng dùng nếu người dùng hiểu nhầm lỗi này thành "Dữ liệu không tồn tại".
 
-Chờ holder trong thời gian ngắn rồi revalidate. Phù hợp interactive operation khi
-holder transaction được giữ ngắn.
+### `SKIP LOCKED` (Bỏ qua dòng bị khóa)
+Thay vì đứng chờ, cứ lấy đại dòng tiếp theo không bị khóa. Cái này cực kỳ lợi hại khi làm hệ thống hàng đợi công việc (work queue - nhiều người cùng chạy vào xí việc). Đừng dùng cái này nếu người dùng chỉ định đích danh muốn mua một chiếc ghế cụ thể.
 
-PostgreSQL `lock_timeout` giới hạn thời gian chờ acquire lock. Nó khác:
+## Timeout, Bế tắc (Deadlock) và Thử lại (Retry)
 
-- `statement_timeout`: toàn statement;
-- transaction/application deadline: toàn unit of work;
-- connection acquisition timeout: chờ pool;
-- client timeout: caller chờ response.
+Bị văng lỗi quá hạn (timeout) hoặc bế tắc (deadlock) đồng nghĩa với việc Giao dịch đã hỏng. Sau khi nhận lỗi SQL, hãy nhớ để cho giao dịch đó hoàn tác (rollback) sạch sẽ trước khi quyết định làm gì tiếp.
 
-Các giới hạn phải lồng nhau hợp lý và chừa thời gian rollback/response.
+Việc "Thử lại" (Retry) chỉ an toàn khi:
+- Lệnh gửi lên có khả năng chạy lại mà không bị trùng lặp (idempotency contract).
+- Lần thử mới dùng một kết nối và giao dịch HOÀN TOÀN MỚI.
+- Dữ liệu được đọc và kiểm tra lại từ đầu.
+- Có giới hạn số lần thử, thời gian thử và thời gian nghỉ (backoff) hợp lý.
 
-### `NOWAIT`
+**Không được mù quáng thử lại** nếu lỗi đó là lỗi nghiệp vụ (ví dụ: ghế đã có người mua thật rồi) hoặc bạn đang rải try-catch bắt bừa mọi lỗi `DataAccessException`.
 
-Fail ngay nếu row đang locked. Phù hợp khi product có outcome `BUSY` hoặc một
-fallback khác, không phù hợp nếu caller mặc định hiểu failure là resource không
-tồn tại.
+## Thứ tự khóa khi lấy nhiều dòng (Multi-row lock order)
 
-### `SKIP LOCKED`
+Khi một thao tác muốn khóa cùng lúc nhiều dòng:
+1. Xóa các ID bị trùng lặp.
+2. Chuẩn hóa bằng một khóa cố định.
+3. Luôn luôn xin khóa theo CÙNG MỘT THỨ TỰ (ví dụ ID từ nhỏ đến lớn) ở mọi nơi trong code.
+4. Đảm bảo khóa đủ số dòng mong muốn rồi mới đi cập nhật.
+5. Giữ thời gian chạy thật ngắn.
 
-Bỏ qua locked rows thay vì wait. Hữu ích cho work queue nơi worker có thể lấy
-item khác; không phải default cho exact resource do user chỉ định.
+Xin khóa lung tung không theo thứ tự sẽ dẫn đến Vòng luẩn quẩn (wait-for cycle). Khi đó hệ thống dò Deadlock của PostgreSQL sẽ phải giết một giao dịch làm "nạn nhân". Đừng ỷ lại vào Database, hãy thiết kế code chuẩn ngay từ đầu.
 
-## Timeout, deadlock và retry
-
-Lock timeout hoặc deadlock là transaction failure. Sau PostgreSQL statement
-error, để transaction rollback trước khi map outcome hoặc retry.
-
-Retry chỉ an toàn khi:
-
-- command có replay/idempotency contract;
-- attempt mới dùng transaction và persistence context mới;
-- state được reload/revalidated;
-- attempt cap, overall deadline và backoff đều bounded.
-
-Không retry business rejection như “seat đã held”. Không blanket-retry mọi
-`DataAccessException`.
-
-## Multi-row lock order
-
-Khi một operation khóa nhiều rows:
-
-1. deduplicate resource IDs;
-2. canonicalize bằng stable key;
-3. acquire theo cùng order ở mọi code path;
-4. validate đủ rows trước mutation;
-5. giữ transaction ngắn.
-
-Opposite order có thể tạo wait-for cycle. PostgreSQL deadlock detector abort một
-victim, nhưng detector không thay thế deterministic design.
-
-Một ordered SQL locking query thường dễ audit hơn loop phụ thuộc request order:
-
+Dùng SQL gom chung lại thường an toàn hơn là bạn viết vòng lặp phụ thuộc request xin từng cái:
 ```sql
-select *
-from show_seat
-where show_id = :showId
-  and seat_no = any(:seatNos)
-order by show_id, seat_no
-for update;
+SELECT *
+FROM show_seat
+WHERE show_id = :showId
+  AND seat_no = ANY(:seatNos)
+ORDER BY show_id, seat_no   -- Rất quan trọng để khóa theo đúng thứ tự!
+FOR UPDATE;
 ```
 
-## Known row và predicate-wide invariant
+## Khóa dòng đã biết và Quy tắc diện rộng
 
-Pessimistic row locking phù hợp khi resource row ổn định và biết trước: account,
-inventory item, seat, aggregate guard row.
+Khóa dòng bi quan (Row locking) cực kỳ hợp lý khi bạn biết chính xác mình đang thao tác trên dữ liệu cố định nào: Tài khoản ngân hàng, Hàng trong kho, Ghế xem phim, dòng guard row.
 
-Nó không tự bảo vệ:
+Nhưng nó **KHÔNG THỂ** tự bảo vệ bạn khỏi các trường hợp:
+- Dòng dữ liệu chưa tồn tại.
+- Lệnh yêu cầu "không có bản ghi nào thỏa mãn điều kiện".
+- Tính toán sức chứa từ một tập hợp dữ liệu (người khác lén Insert thêm dòng mới - phantom inserts).
+- Các quy tắc chạy ngang qua nhiều bảng không liên quan (không có giao thức khóa chung).
 
-- row chưa tồn tại;
-- “không có record nào thỏa predicate”;
-- capacity tính từ một tập rows có thể nhận phantom inserts;
-- invariant trải trên nhiều tables nhưng không có common lock protocol.
+Khi đó bạn có thể cần dùng các Ràng buộc (unique/check constraint), lệnh SQL có điều kiện, thêm các dòng bảo vệ nhân tạo (stable guard row) hoặc dùng mức cách ly cao nhất (`SERIALIZABLE`).
 
-Các trường hợp đó có thể cần unique/check/exclusion constraint, conditional
-mutation, stable guard row hoặc `SERIALIZABLE`.
+## Bảng xử lý sự cố (Commit, rollback và crash)
 
-## Commit, rollback và crash
-
-| Holder outcome | Waiter/recovery |
+| Người giữ khóa (Holder) bị gì? | Số phận của Người chờ khóa (Waiter/recovery) |
 | --- | --- |
-| Commit | Waiter acquire rồi đọc committed state mới |
-| Rollback | Waiter acquire rồi đọc state trước attempt |
-| Connection loss trước commit | PostgreSQL abort và release locks |
-| Response loss sau commit | State vẫn committed; phân giải bằng replay/idempotency |
+| Lưu thành công (Commit) | Người chờ sẽ được lấy khóa, và đọc được dữ liệu MỚI NHẤT do người giữ khóa vừa tạo ra. |
+| Bị lỗi và Hoàn tác (Rollback) | Người chờ sẽ được lấy khóa, và vẫn đọc được dữ liệu cũ rích như trước khi có sự cố. |
+| Rớt mạng (Connection loss) trước khi Commit | PostgreSQL sẽ tự động báo lỗi hủy giao dịch đó và nhả khóa ra cứu người chờ. |
+| Commit xong xuôi nhưng rớt mạng chưa kịp báo về (Response loss) | Dữ liệu dưới Database vẫn là bản mới đã commit. Phải xử lý phục hồi bằng cách dùng tính lũy đẳng (idempotency) hoặc phát lại kết quả cũ (replay). |
 
-Application-level unlock call thường không tồn tại cho row lock; transaction end
-là release boundary. Vì vậy connection leak/idle-in-transaction là operational
-risk nghiêm trọng.
+**Cảnh báo nghiêm trọng:** Cấp độ ứng dụng (Application) không có câu lệnh API nào để tự gọi hàm mở khóa (`unlock`) cho một dòng dữ liệu. Cách duy nhất để nhả khóa là Kết thúc giao dịch. Nếu code của bạn bị ngâm, treo máy, kết nối (connection leak) sẽ rò rỉ và đây là rủi ro vận hành vô cùng nghiêm trọng!
 
-## Multi-instance
+## Môi trường nhiều máy chủ (Multi-instance)
 
-Database row lock coordinate mọi application instance dùng cùng PostgreSQL
-primary. JVM-local lock không có thuộc tính này.
+Khóa dòng của Database là khóa tối thượng: Nó chặn (coordinate) được tất cả các luồng trên mọi máy chủ (App instance) dùng chung cái Database PostgreSQL đó. Các loại khóa nội bộ của Java (JVM-local) hoàn toàn không có khả năng này.
 
-Scale-out vẫn làm tăng:
+Tuy nhiên, thêm nhiều máy chủ (Scale-out) sẽ làm tình hình tồi tệ hơn vì:
+- Càng đông máy chủ nhảy vào tranh một dòng "điểm nóng" (hot row) thì lượng waiter đứng chờ càng dài.
+- Tổng số kết nối (connection) vô ích bị ngâm trong lúc đứng chờ sẽ tăng vọt.
+- Băng thông sẽ ngập lụt vì hàng loạt lệnh thông báo lỗi (timeout/cancellation traffic).
+- Bạn sẽ cần thêm cơ chế kiểm soát số lượng đầu vào (admission control) và theo dõi gắt gao.
 
-- số waiters trên hot row;
-- tổng connections có thể bị giữ trong lock wait;
-- timeout/cancellation traffic;
-- nhu cầu admission control và observability.
+Ghi nhớ: Code chạy đúng (Correctness) KHÔNG đồng nghĩa với việc Hệ thống chịu tải tốt (throughput tốt) khi bị tranh chấp liên tục cường độ cao!
 
-Correctness không đồng nghĩa throughput tốt dưới sustained high contention.
+## Theo dõi hệ thống (Quan sát)
 
-## Quan sát
+Khi có sự cố, hãy kết hợp các công cụ này để điều tra:
+- Dùng `pg_stat_activity.wait_event_type`, `wait_event`, `xact_start` để xem ai đang chờ.
+- Dùng hàm `pg_blocking_pids(pid)` để truy ra mặt mũi kẻ đang cầm khóa.
+- Dùng `pg_locks` để vẽ sơ đồ phân tích xem ai đang khóa ai (lock graph).
+- Theo dõi mã lỗi SQLSTATE `55P03` (không lấy được khóa/timeout).
+- Theo dõi mã lỗi SQLSTATE `40P01` (trở thành nạn nhân của Deadlock).
+- Theo dõi các thông số kết nối của Pool (active/pending/acquisition timeout).
+- Luôn gắn một mã theo dõi cấp độ ứng dụng (correlation ID) vào log kết hợp với kết quả lỗi để dễ dò đường.
 
-Kết hợp:
+Thông tin về khóa dòng không phải lúc nào cũng hiện nguyên hình dễ hiểu trong `pg_locks`; người đứng chờ (waiter) thường là đang đứng chờ cái ID giao dịch (transaction ID) của kẻ đang giữ khóa.
 
-- `pg_stat_activity.wait_event_type`, `wait_event`, `xact_start`;
-- `pg_blocking_pids(pid)` để nối waiter với holder;
-- `pg_locks` để phân tích lock graph;
-- SQLSTATE `55P03` cho lock-not-available/timeout;
-- SQLSTATE `40P01` cho deadlock victim;
-- pool active/pending/acquisition timeout;
-- application correlation ID và domain outcome.
+## Khi nào thì nên chọn Khóa bi quan?
 
-Row-level lock information không phải lúc nào cũng hiện thành một tuple-lock row
-dễ hiểu trong `pg_locks`; waiter thường chờ transaction ID của holder.
+**ƯU TIÊN DÙNG KHI:** Quy trình của bạn có nhiều bước phức tạp cần đọc trạng thái mới nhất, bạn đã biết chính xác dòng dữ liệu đích là dòng nào, tỷ lệ đụng độ (conflict) đủ dày đặc, và bạn hứa sẽ hoàn thành giao dịch (critical section) thật ngắn.
 
-## Chọn pessimistic lock khi nào?
+**HÃY SO SÁNH VỚI:**
+- Dùng lệnh SQL cập nhật có điều kiện trực tiếp (conditional atomic SQL) nếu bạn chỉ có đúng 1 thao tác duy nhất.
+- Dùng Khóa lạc quan (`@Version`) nếu lượng tranh chấp rất thấp.
+- Dùng Ràng buộc (Constraint) nếu quy tắc của bạn có thể diễn đạt trực tiếp bằng tính năng của Database.
+- Dùng Hàng đợi/Kiểm soát đầu vào (queue/admission control) nếu gặp các điểm nóng (hot key) bị nghẽn bền vững.
 
-Ưu tiên khi decision nhiều bước cần current state, target row đã biết, conflict
-đủ thường xuyên và critical section ngắn. So sánh với:
+**Lời khuyên:** Đừng vội chèn bừa công cụ vào code khi bạn chưa vẽ ra rõ ràng quy tắc bảo vệ (invariant) và số phận của kẻ thua cuộc (loser outcome)!
 
-- conditional atomic SQL cho invariant diễn đạt trong một mutation;
-- optimistic `@Version` cho contention thấp;
-- constraint cho invariant database biểu diễn trực tiếp;
-- queue/admission control cho hot key bền vững.
-
-Không chọn primitive trước khi viết invariant và loser outcome.
-
-## Liên kết
+## Liên kết tài liệu tham khảo
 
 - [LOCK-003 — Pessimistic write lock với FOR UPDATE](../locking/pessimistic-write-for-update/README.md)
 - [DB-007 — Row/table lock lifecycle](../postgresql/row-table-lock-lifecycle/README.md)

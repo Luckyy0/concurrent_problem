@@ -1,259 +1,203 @@
-# Phân tích — reserve trước khi quyết định
+# Giải phẫu: Xí Chỗ Trước Rồi Mới Suy Nghĩ (FOR UPDATE)
 
-## Initial state
+## 1. Mọi Thứ Bắt Đầu Thế Nào? (Initial state)
 
 ```text
-show_seat(42, "A-10")
-  state              = AVAILABLE
-  hold_id            = null
-  holder_customer_id = null
-  hold_until         = null
+Cái ghế số "A-10", Suất chiếu "42":
+  Trạng thái: AVAILABLE (Đang trống)
+  Ai đang giữ: Chả ai cả (null)
+  Người giữ đến khi nào: null
 
-seat_hold = []
+Sổ lịch sử (seat_hold): Trống trơn []
 ```
 
-Request A và B chạy trên hai Spring instances, dùng hai database connections và
-hai transaction độc lập. Cả hai muốn tạo ACTIVE hold cho cùng primary key.
+Giả sử hai máy chủ (App-1 và App-2) nhận lệnh từ hai khách hàng A và B gần như cùng một lúc. Cả hai luồng Giao Dịch đều thề sẽ đặt được cái ghế `A-10` này.
 
-## Timeline code hỏng
+## 2. Kịch Bản Ác Mộng (Timeline code hỏng)
 
-| Bước | Tx-A / App-1 | Tx-B / App-2 | PostgreSQL |
+Nếu bạn code ngây thơ bằng câu lệnh SELECT thường:
+
+| Bước | Máy chủ 1 (Khách A) | Máy chủ 2 (Khách B) | Dưới gầm Database |
 | --- | --- | --- | --- |
-| 1 | `BEGIN` | | A có statement snapshot |
-| 2 | plain SELECT → `AVAILABLE` | | Không acquire explicit row lock |
-| 3 | | `BEGIN` | B có statement snapshot |
-| 4 | | plain SELECT → `AVAILABLE` | Cùng committed tuple version |
-| 5 | quyết định ACCEPT A | quyết định ACCEPT B | Hai decisions đã tách khỏi write |
-| 6 | insert hold A, update seat | | UPDATE acquire row lock |
-| 7 | `COMMIT` | | Seat tạm thời trỏ A |
-| 8 | | insert hold B, update seat | B có thể overwrite sau khi wait |
-| 9 | | `COMMIT` | Seat trỏ B, hai ACTIVE holds |
+| 1 | Mở Giao Dịch | | |
+| 2 | Nhìn thấy ghế `AVAILABLE` | | Chả thèm khóa gì cả! |
+| 3 | | Mở Giao Dịch | |
+| 4 | | Cũng nhìn thấy ghế `AVAILABLE` | Hai thằng đều thấy giống nhau |
+| 5 | Gõ búa: CHẤP NHẬN A | Gõ búa: CHẤP NHẬN B | Hai ông nội tự quyết định ngầm với nhau |
+| 6 | Bắt đầu lưu cho A | | Bắt đầu tung Khóa Dòng (Row Lock) |
+| 7 | Chốt sổ xong (Commit) | | A đã ghi xong tên vào ghế |
+| 8 | | Bắt đầu lưu cho B | B chèn đè tên mình lên tên A! |
+| 9 | | Chốt sổ xong (Commit) | Xong phim! 1 ghế 2 chủ! |
 
-PostgreSQL serialize conflicting updates, nhưng không biết method
-`isAvailable()` là predicate cần chạy lại. Không có version predicate, conditional
-SQL hay unique ACTIVE-seat constraint để biến stale decision thành conflict.
+Database có cấp Khóa Dòng lúc chạy lệnh `UPDATE`, nhưng nó làm sao biết được cái hàm `isAvailable()` bằng Java của bạn nằm tít trên kia đã chạy và trả về `True` từ đời nào rồi? Code không sai Cú Pháp, nó sai Logic Kinh Doanh.
 
-## Expected và actual
+## 3. Đời Không Như Mơ (Expected và actual)
 
-| | Expected | Actual với plain SELECT |
+| Tiêu chí | Kỳ Vọng | Thực Tế (Khi xài SELECT chay) |
 | --- | --- | --- |
-| Số ACTIVE holds | 1 | 2 |
-| Seat projection | Trỏ unique ACTIVE hold | Chỉ trỏ writer cuối |
-| Request loser | `ALREADY_HELD` | Có thể nhận `HELD` |
-| Audit consistency | Một accepted decision | Hai accepted decisions |
+| Số lượng ĐANG GIỮ (ACTIVE holds) | 1 | 2 (Khóc thét) |
+| Liên kết dữ liệu Ghế | Trỏ đúng người đang giữ vé hợp lệ | Trỏ vào ông nào Ghi cuối cùng |
+| Báo cho kẻ thất bại | Lỗi `ALREADY_HELD` | Chúc mừng bạn đã mua thành công! (`HELD`) |
+| Lịch sử đối soát | 1 lệnh được duyệt | 2 lệnh được duyệt |
 
-## Timeline với `FOR UPDATE`
+## 4. Kịch Bản Cứu Thế (Timeline với `FOR UPDATE`)
 
-| Bước | Tx-A / App-1 | Tx-B / App-2 | PostgreSQL |
+Khi xài Khóa Bi Quan:
+
+| Bước | Máy chủ 1 (Khách A) | Máy chủ 2 (Khách B) | Dưới gầm Database |
 | --- | --- | --- | --- |
-| 1 | `BEGIN` | | |
-| 2 | SELECT A-10 `FOR UPDATE` | | A acquire row lock |
-| 3 | đọc `AVAILABLE`, tạo hold A | | Lock vẫn thuộc Tx-A |
-| 4 | | SELECT A-10 `FOR UPDATE` | B block trên incompatible lock |
-| 5 | flush update/insert | wait | |
-| 6 | `COMMIT` | wait | A changes visible, lock release |
-| 7 | | acquire rồi nhận row `HELD` | B tiếp tục với current row |
-| 8 | | revalidate → `ALREADY_HELD` | Không tạo hold B |
-| 9 | | `COMMIT` | Lock B release |
+| 1 | Mở Giao Dịch | | |
+| 2 | Lấy ghế và Hét lên: **KHÓA!** | | A chính thức cầm Chìa Khóa Dòng |
+| 3 | Đọc thấy ghế `AVAILABLE` -> Lưu A | | Khóa vẫn nằm trong tay A |
+| 4 | | Lấy ghế và CŨNG Hét: KHÓA! | Khóa bị A cầm rồi -> B BỊ BẮT XẾP HÀNG CHỜ |
+| 5 | Đẩy dữ liệu xuống (flush) | Ngáp ruồi đợi... | |
+| 6 | Chốt sổ (Commit) | Ngáp ruồi đợi... | Dữ liệu cập nhật xong, Khóa rớt ra |
+| 7 | | Lượm Khóa -> Thấy ghế đã HELD | B tỉnh giấc, cầm được Khóa, đọc lại dữ liệu mới nhất |
+| 8 | | Thẩm định lại -> Quăng lỗi `ALREADY_HELD` | B phải quay xe từ bỏ |
+| 9 | | Hủy Giao Dịch (Rollback) | Trả Khóa |
 
-Điểm tuyến tính hóa nghiệp vụ (`linearization point`) là lúc transaction acquire
-lock và đọc row dùng cho decision. Các actor cạnh tranh cùng row không còn đi qua
-decision đồng thời.
+Điểm mấu chốt: **B bắt buộc phải đọc lại dữ liệu mà A vừa ghi** (Chứ không được bám víu vào cái ảo ảnh lúc nãy nữa). Các tiến trình không còn được phép quyết định cùng lúc nữa.
 
-> **Nói ngắn gọn:** waiter không tiếp tục với quyết định cũ; nó chỉ được quyết
-> định sau khi thấy outcome đã commit hoặc rollback của holder.
+> **Nói ngắn gọn:** Kẻ đợi khóa không được quyền mang cái quyết định cũ ra dùng; nó chỉ được phép đưa ra phán quyết SAU KHI tận mắt nhìn thấy Kẻ trước mặt đã chốt sổ (commit) hay hủy kèo (rollback).
 
-## Snapshot tại `READ COMMITTED`
+## 5. Bóng Ma Dữ Liệu ở Chế độ `READ COMMITTED`
 
-Mỗi statement có snapshot riêng. Plain reader chỉ cần visible committed tuple
-version, nên không mặc định chờ `FOR UPDATE` holder.
+Với các câu lệnh đọc bình thường (plain reader), mỗi câu sẽ lấy một bản "Chụp màn hình" (Snapshot) dữ liệu đã được Chốt. Do đó nó mặc kệ cái Khóa `FOR UPDATE`, không ai cấm nó xem data cũ cả.
 
-Locking read thì khác:
+Nhưng khi xài `SELECT ... FOR UPDATE`, câu chuyện rẽ hướng khác:
+1. Nó tìm dòng theo Khóa Chính.
+2. Nếu có người đang giữ khóa (incompatible lock), nó phải đứng chờ.
+3. Kẻ kia buông khóa xong, PostgreSQL sẽ túm cái Khóa cho nó và tung cho nó dòng dữ liệu **ĐÃ CẬP NHẬT MỚI NHẤT**, (hoặc méo nhả ra dòng nào nếu bị kẻ kia xóa mất).
+4. Bạn ôm dòng dữ liệu mới tinh đó về App để tự chạy lại các bước kiểm định (`state`, `hold_until`).
 
-1. statement tìm row theo primary key;
-2. nếu row đang có incompatible lock, backend chờ;
-3. sau khi holder kết thúc, PostgreSQL lock và trả updated row, hoặc không trả
-   row nếu nó đã bị delete;
-4. application phải đánh giá `state`, `hold_until` và policy trên row đó.
+Bởi vì nó truy tìm theo Khóa chính nên lúc nào nó cũng chộp được dòng Dữ liệu (trừ khi dòng đó bị xóa), nhờ vậy mà B bóc trần được sự thật là ghế đã `HELD` sau khi A commit. Nếu A rollback, B sẽ vui vẻ nhận được `AVAILABLE`.
 
-Vì query theo primary key luôn còn qualify nếu row không bị delete, Tx-B nhận
-state `HELD` sau A commit. Nếu A rollback, B nhận `AVAILABLE`.
+(Nhiều người xúi chuyển sang mức độ cô lập `REPEATABLE READ` nhưng coi chừng! Nó sẽ ném cho bạn rổ lỗi Sập Giao Dịch - serialization failure, thay vì tạo ra cái quy trình "Chờ - và - Thẩm Định lại" đẹp đẽ như chúng ta đang xây dựng).
 
-`REPEATABLE READ` không phải thay thế mặc định cho workflow này. Snapshot và
-concurrent update behavior khác, có thể tạo serialization failure thay vì đúng
-wait-and-revalidate contract đang thiết kế.
+## 6. Khóa Nào Vừa Bị Giật Vậy?
 
-## Lock nào thực sự được lấy?
+Lệnh `SELECT ... FOR UPDATE` lấy một cái Khóa bảo kê Cả Bảng (để không ai vô xóa bảng lúc đang xài) và giật cái Khóa Dòng (row-level lock) cho đúng cái Dòng dữ liệu đó. Các giao dịch khác muốn `UPDATE`, `DELETE` hay cũng đòi Khóa Đọc trên Dòng đó đều phải nhăn nhó Đứng Chờ hoặc văng lỗi.
 
-`SELECT ... FOR UPDATE` lấy relation lock cần thiết cho statement và row-level
-lock trên selected tuple. Transaction khác muốn `UPDATE`, `DELETE` hoặc
-incompatible locking read trên cùng row phải wait/fail.
+Lưu ý: Khóa Dòng không có nghĩa là "Khóa Cả Bảng", và nó CHẢ THÈM CẢN mấy câu `SELECT` bình thường (người dùng xem Web vẫn load danh sách ghế ào ào). Nó cũng chả rảnh đi khóa những cái ghế Không Tồn Tại.
 
-Row lock không có nghĩa “khóa cả table” và không chặn plain SELECT thông thường.
-Nó cũng không reserve row không tồn tại hay toàn bộ search predicate.
+Khi gắn cờ `PESSIMISTIC_WRITE` trong Hibernate, hãy nhớ xuống tận nơi xem mã SQL mà Hibernate sinh ra là gì. Độ chính xác nằm ở câu SQL chứ đừng tin mù quáng vào mấy cái Annotation. Nhớ là Giao dịch DB phải ôm trọn toàn bộ quá trình Đọc và Ghi.
 
-Hibernate `PESSIMISTIC_WRITE` yêu cầu explicit database lock. Dialect và query
-shape quyết định locking clause chính xác; hãy kiểm tra emitted SQL thay vì suy
-luận từ annotation name. Correctness cần một active database transaction bao
-trùm cả query lẫn mutation.
+## 7. Tuổi Thọ Của Một Chiếc Khóa (Lock lifetime)
 
-## Lock lifetime
+Khóa sống bao lâu?
 
 ```text
-BEGIN
-  set local lock_timeout
-  SELECT ... FOR UPDATE  ← acquire
-  revalidate
-  insert/update/flush
-COMMIT or ROLLBACK        ← release
+MỞ GIAO DỊCH (BEGIN)
+  Cài đặt giờ nổ (lock_timeout)
+  SELECT ... FOR UPDATE  ← Bắt đầu Xin Khóa ở đây nè!
+  Thẩm định lại (revalidate)
+  Lưu / Cập nhật / Đẩy xuống DB
+CHỐT SỔ HOẶC HỦY KÈO (COMMIT/ROLLBACK) ← Khóa chết ở đây!
 ```
 
-Lock không release khi:
+Khóa **KHÔNG HỀ ĐƯỢC NHẢ RA** khi:
+- Bạn vừa chạy xong cái Hàm Repository.
+- Object Java bay ra khỏi 1 block code.
+- Bạn gọi một cái API gọi điện báo cho User.
+- Hibernate xả xong lệnh UPDATE xuống DB nhưng Giao dịch (Transaction) vẫn chưa Chốt.
 
-- repository method return;
-- entity rời một Java block;
-- application bắt đầu remote call;
-- Hibernate đã phát xong UPDATE nhưng transaction chưa end.
+Tóm lại: Khóa sẽ ôm chân Giao Dịch đến chết. Độ dài Giao dịch chính là giới hạn lý tưởng nhất cho Tuổi thọ của Khóa (không tính đoạn chờ ở cửa).
 
-Do đó transaction duration chính là upper bound lý tưởng của lock lifetime,
-trừ phần wait trước khi acquire.
+## 8. Cẩn thận Cái Bóng Của Spring Proxy và Flush
 
-## Spring proxy và Hibernate flush
-
-`@Lock` chỉ gắn lock mode lên repository query. Transaction boundary thường nằm
-ở public service method được gọi qua Spring proxy:
+Cái cờ `@Lock` chỉ là vẽ bùa lên hàm Repository. Cái ranh giới Giao Dịch lại do `@Transactional` quyết định, thường nằm ở cái Proxy đứng ngoài cùng:
 
 ```text
-caller
-  → transaction interceptor BEGIN
-  → repository locking query
-  → managed entity mutation
-  → Hibernate flush
-  → database COMMIT
-  → interceptor returns
+Thằng Caller gọi API
+  → Proxy mở Giao Dịch (BEGIN)
+  → Hàm Repository đòi Khóa Dòng
+  → Thay đổi dữ liệu Java
+  → Hibernate xả SQL (flush)
+  → Proxy chốt Giao Dịch dưới DB (COMMIT)
+  → Proxy trả kết quả
 ```
 
-Nếu self-invocation bỏ qua proxy hoặc outer method không có transaction, query
-có thể fail vì transaction-required hoặc lock release trước business mutation.
+Nếu bạn cố tình gọi tắt (self-invocation) né cái Proxy, lệnh khóa sẽ tạch ngay vì chả có Giao Dịch nào bảo kê.
+Cơ chế Dirty checking thường tự nhét lệnh UPDATE vào phút chót. Việc gọi thủ công `flush()` sẽ giúp dồn các lỗi xung đột văng ra ngay trong thân hàm để dễ bề đối phó, nhưng dữ liệu thì chỉ thực sự an bài sau khi Proxy gật đầu Commit.
 
-Dirty checking thường phát UPDATE lúc flush/commit. Gọi `flush()` giúp conflict
-hoặc constraint error xuất hiện bên trong attempt method, nhưng success chỉ chắc
-chắn sau khi proxy commit thành công.
+## 9. Phán Quyết Cuối Cùng: Kẻ Thắng và Người Thua
 
-## Holder commit và rollback
+### Kẻ giữ Khóa (Holder) Chốt sổ thành công (Commit)
+Dữ liệu của Khách A biến thành Sự thật rồi nhả Khóa. Khách B được đánh thức, cầm Khóa và nhìn thấy cái ghế đã `HELD`. B ngậm ngùi từ chối vì lỗi Logic. B không được quyền xài lại cái Snapshot ảo ảnh cũ nữa.
 
-### Holder commit
+### Kẻ giữ Khóa Hủy Giao Dịch (Rollback)
+Khách A hủy kèo. Dữ liệu chưa từng tồn tại, ghế vẫn `AVAILABLE`. Khách B tỉnh dậy, cầm Khóa, thấy ghế vẫn y nguyên liền chốt đơn và Commit. Chẳng cần ai đi dọn dẹp Khóa thừa cả.
 
-Tx-A changes trở nên visible rồi lock được release. Tx-B acquire lock và đọc
-`HELD`; kết quả đúng là domain rejection/no-op. Blocking không cho phép B dùng
-snapshot business cũ.
+### Mạng đứt, Rớt mạng, Máy chủ cháy
+Nếu máy của A đang cầm Khóa bỗng dưng bốc khói tắt nguồn, PostgreSQL thấy rớt mạng liền tự Hủy Giao Dịch của A và nhả Khóa cho B.
+Lưu ý quan trọng: Lỗi mất kết nối (Response mất) KHÔNG ĐỒNG NGHĨA với Giao dịch Hủy. Nếu DB đã Commit xong xuôi rồi đường truyền mới đứt, App phải dùng mã Command ID dò lại xem lệnh đó đã vô chưa, cấm được võ đoán!
 
-### Holder rollback
+## 10. Chờ Mòn Mỏi và Bom Hẹn Giờ (Timeout và aborted)
 
-Uncommitted hold A biến mất và row quay về committed state trước đó. Tx-B acquire
-lock, đọc `AVAILABLE`, tạo hold B và commit. Không cần cleanup lock riêng.
+Thông số `lock_timeout` quy định: "Tao chỉ cho mày đứng chờ xin Khóa chừng này giây thôi". Vượt quá giờ hạn định, DB quăng cục Lỗi `55P03` (`lock_not_available`). Framework sẽ tùy chỉnh tên Lỗi, nên hãy log nguyên cái SQLSTATE lại để biết đó là do Quá Giờ chứ không phải lỗi Logic.
 
-### Crash hoặc connection loss
-
-Khi backend session chấm dứt, PostgreSQL abort transaction và release locks.
-Application không được giả định response mất nghĩa là transaction chắc chắn
-rollback: nếu connection mất sau commit nhưng trước response, caller cần replay
-theo stable command ID để phân giải ambiguous outcome.
-
-## Timeout và transaction aborted state
-
-`lock_timeout` chỉ đo thời gian chờ acquire từng database lock. Khi vượt hạn,
-PostgreSQL phát SQLSTATE `55P03` (`lock_not_available`). Hibernate/Spring dịch
-exception theo provider và statement path; production classifier nên giữ
-SQLSTATE/cause để phân biệt timeout với lỗi business.
-
-Sau database statement error, transaction không còn là nơi an toàn để query
-fallback. Luồng đúng:
+Khi dính lỗi từ Câu SQL, Giao Dịch của bạn coi như BỎ ĐI, đừng hòng làm ăn gì tiếp trong đó:
 
 ```text
-locking statement fails
-→ exception leaves transactional method
-→ Spring marks/executes rollback
-→ outer coordinator maps to BUSY or starts a bounded fresh attempt
+Xin khóa quá lâu -> Đứt bóng
+→ Văng Lỗi bung ra khỏi hàm Giao dịch
+→ Spring cắm cờ Phá Sản (Rollback)
+→ Cấp trên hốt xác, báo lỗi BUSY cho khách hoặc khởi động lại 1 Giao dịch mới tinh.
 ```
 
-`statement_timeout`, Spring transaction timeout, client deadline và pool
-acquisition timeout có phạm vi khác. Lock wait budget phải nhỏ hơn overall
-request deadline và chừa thời gian rollback/response.
+Đừng nhầm lẫn giữa `lock_timeout` (Giờ chờ Khóa) với `statement_timeout` (Giờ chạy lệnh) hay Giờ Timeout của cả cái Server! Ngân sách Giờ Chờ Khóa phải luôn nhỏ hơn Tổng Giờ cho phép Request tồn tại.
 
-## Wait, `NOWAIT` hay `SKIP LOCKED`
+## 11. Chờ Đợi, Không Chờ, hay Bỏ Qua Luôn?
 
-| Policy | Hành vi | Phù hợp |
+| Chính sách | Cách nó chạy | Xài khi nào? |
 | --- | --- | --- |
-| Bounded wait | Chờ holder rồi revalidate | Interactive exact resource, short Tx |
-| `NOWAIT` | Fail ngay nếu resource bận | Caller có fallback rõ |
-| `SKIP LOCKED` | Bỏ qua locked rows | Worker chọn item thay thế được |
-| Unbounded wait | Tail latency phụ thuộc holder | Không nên là default API |
+| **Chờ có Hạn (Bounded wait)** | Đứng chờ rồi kiểm tra lại | Xài khi khách nhắm đích danh 1 tài nguyên, thời gian Giao Dịch cực ngắn |
+| **KHÔNG CHỜ (`NOWAIT`)** | Fail ngay nếu bận | Xài khi Caller có phương án Hứng Lỗi rõ ràng |
+| **BỎ QUA LUÔN (`SKIP LOCKED`)** | Ai rảnh chờ, lấy dòng khác! | Bọn Worker lấy đồ trong hàng đợi (Ai lấy đồ nào cũng được) |
+| **Chờ Tới Mùa Quýt (Unbounded wait)** | Hên xui phụ thuộc thằng cầm Khóa | **Đừng biến nó thành Cấu Hình Mặc Định API** |
 
-Với ghế `A-10` do user chọn, `SKIP LOCKED` làm mất khác biệt giữa “đang bận” và
-“không tồn tại”. Bounded wait hoặc `NOWAIT` tạo contract rõ hơn.
+Với trò chọn ghế `A-10`, xài `SKIP LOCKED` là bậy. Thằng bạn đang mua, nhẽ ra báo là Đang Có Người Giữ, bạn lại báo "Không Tìm Thấy Ghế Đó", làm khách chửi ầm lên. Xài Bounded Wait hoặc NOWAIT là rõ ràng nhất.
 
-## Multi-row operation và deadlock
+## 12. Khóa Nhiều Dòng Cùng Lúc và Kẹt Xe Kép (Deadlock)
 
-Giữ hai ghế liền nhau cần lock cùng order ở mọi code path:
+Nếu muốn khóa 2 ghế liền nhau, BẮT BUỘC phải khóa theo đúng 1 thứ tự vĩnh cửu:
 
 ```text
-sort by (show_id, seat_no)
-→ acquire all rows in that order
-→ validate all
-→ mutate all
+Sắp xếp (Ghế ID nhỏ đến lớn)
+→ Khóa từng dòng theo thứ tự đó
+→ Thẩm định lại toàn bộ
+→ Cập nhật toàn bộ
 ```
 
-Nếu Tx-X lock A-10 rồi A-11 trong khi Tx-Y làm ngược lại, có thể xuất hiện
-wait-for cycle. PostgreSQL deadlock detector chọn một victim với SQLSTATE
-`40P01`; victim rollback. Deterministic order giảm cycle nhưng không loại mọi
-nguồn deadlock trong hệ thống.
+Chứ để thằng X khóa `A-10` rồi xin `A-11`, thằng Y khóa `A-11` rồi xin `A-10`, thì hệ thống tạo ra Bẫy Chết (Deadlock). Thám Tử của PostgreSQL sẽ rút súng tỉa 1 thằng (Victim - SQLSTATE `40P01`) và bắt Rollback. Ép thứ tự không đảm bảo diệt 100% Deadlock nhưng nó giảm được rất nhiều.
 
-Retry deadlock chỉ hợp lệ khi:
+Chỉ được thử lại Deadlock khi: Giao dịch cũ đã dọn sạch, lệnh an toàn không sợ bị double, và phải quy định số lần/thời gian thử lại chặt chẽ. (Chi tiết xem `DB-008`).
 
-- attempt cũ đã rollback;
-- command idempotent/replayable;
-- transaction mới reload state;
-- attempt/deadline/backoff đều bounded.
+## 13. Lệnh Trùng Lặp Khác Tranh Giành
 
-Chi tiết detector/retry thuộc `DB-008` và shared deadlock concept.
+Cái cờ Unique trên cột `command_id` giúp cản vụ khách spam bấm nút 2 lần tạo ra 2 dòng lịch sử đè nhau.
+Khóa Dòng giúp cản hai ông A và B giành chung 1 cái ghế.
+Khóa Dòng không hề biết cái vụ ông A bấm gửi `command_id` cho một khách C khác. Hai vũ khí này giải quyết 2 bệnh lý hoàn toàn độc lập.
 
-## Duplicate command khác concurrent mutation
+## 14. Ảo Tưởng Của Việc Đa Máy Chủ (Multi-instance)
 
-Unique `seat_hold.command_id` ngăn cùng command tạo hai audit rows. Nó không
-ngăn `hold-a` và `hold-b` cùng chọn A-10.
+Vì chữ `FOR UPDATE` cắm rễ tận dưới PostgreSQL, nên dù bạn chạy App-1 và App-2 riêng rẽ, chúng vẫn xông vào cắn xé nhau tại cửa ngõ DB. Sự bá đạo của nó là dập tắt mấy trò khóa bằng mã Java (`synchronized`, `ReentrantLock`), vì mã Java làm sao ép máy chủ nhà hàng xóm nghe lời?
 
-Row lock serialize hai commands trên một seat. Nó không tự phát hiện cùng
-`command_id` được gửi cho seat/customer khác; replay handler vẫn cần so request
-fingerprint hoặc các trường identity.
+Chạy càng nhiều App, số thằng ngáp ruồi Đợi Khóa càng cao, Pool càng dễ kẹt.
 
-## Multi-instance
+## 15. Đoàn Tàu Kẹt Bến và Sự "Không Công Bằng"
 
-`FOR UPDATE` thuộc PostgreSQL transaction nên App-1 và App-2 cùng tranh chấp tại
-authoritative boundary. Đây là khác biệt cốt lõi với `synchronized` hoặc
-`ReentrantLock`, vốn chỉ có hiệu lực trong một JVM.
+Ông nào ôm Khóa lâu, sinh ra hàng chờ thê thảm tại cái ghế Hot. Bọn chầu chực sẽ hút cạn lượng Connection của Database. Hơn nữa, PostgreSQL không hề trao cúp công bằng "Ai Xếp Hàng Trước Được Phát Trước". Lỗi Timeout, bị hủy diệt hay lịch chạy của Hệ điều hành đều có thể đảo lộn thứ tự hàng chờ.
 
-Scale-out không phá correctness của row lock, nhưng tăng số potential waiters và
-tổng connection capacity. Admission control, pool sizing và lock timeout vẫn là
-vấn đề vận hành.
+Bắt buộc phải giám sát:
+- Tốc độ giật Khóa.
+- Số lượng văng Lỗi Giờ (`55P03`) và Lỗi Kẹt Chết (`40P01`).
+- Thời gian chạy sau khi đã giật được Khóa.
+- Cạn kiệt Connection Pool.
+- Ai dính `HELD`, ai dính `BUSY`.
+- Mấy ông mở Giao dịch xong đi ngủ (idle-in-transaction).
 
-## Lock convoy và fairness
-
-Một slow holder tạo queue trên hot seat. Waiters thường giữ connection trong lúc
-chờ. PostgreSQL không cung cấp business fairness guarantee như “request đến
-trước chắc chắn thắng”; timeout, cancellation và scheduler có thể thay đổi
-outcome.
-
-Metrics cần tách:
-
-- lock acquisition latency;
-- count/sum của SQLSTATE `55P03` và `40P01`;
-- transaction duration sau khi acquire;
-- pool active/pending/acquisition timeout;
-- `HELD`, `ALREADY_HELD`, `BUSY` theo seat hotness;
-- long/idle-in-transaction sessions.
-
-## Quan sát holder và waiter
+## 16. Lôi Đầu Lên Xem Đứa Nào Cầm Khóa
 
 ```sql
 select a.pid,
@@ -262,42 +206,29 @@ select a.pid,
        a.wait_event_type,
        a.wait_event,
        a.xact_start,
-       pg_blocking_pids(a.pid) as blocking_pids,
+       pg_blocking_pids(a.pid) as thang_nao_dang_chan_duong,
        a.query
 from pg_stat_activity a
 where a.datname = current_database()
   and a.application_name like 'lock003-%';
 ```
 
-Row-level waits thường hiện qua transaction ID lock; không kỳ vọng mỗi tuple
-luôn có một row dễ đọc trong `pg_locks`. Correlation/application name dành cho
-test và production diagnostics cần tránh chứa dữ liệu nhạy cảm.
+Bạn sẽ thấy chúng chờ nhau ở cái Transaction ID Lock. Bảng theo dõi này chỉ dùng để khám bệnh, đừng dại chèn Mật khẩu vô Log nhé.
 
-## Root cause theo layer
+## 17. Tra Hỏi Tội Lỗi Từng Tầng Lớp (Root cause)
 
-### Application
+### Lớp Application (Code Nghiệp Vụ)
+Chuỗi `Đọc -> Quyết định -> Ghi` bị đứt khúc. 2 ông hùa vào quyết định trên 1 đống data cũ mềm.
 
-Chuỗi `read → decide → write` không atomic. Hai distinct commands đều được
-accept trên cùng state cũ.
+### Lớp Spring
+Cắm cờ `@Transactional` sai chỗ hoặc cái hàm quá ngắn làm Khóa bị vứt đi trước khi thực sự cần.
 
-### Spring
+### Lớp Hibernate/JPA
+Đọc bình thường thì đâu ai nhét giùm chữ `PESSIMISTIC_WRITE`? Quá trình Ghi rà soát lại (dirty checking) lại diễn ra SAU KHI não bạn đã phán xét xong, Khóa tự động đến vào lúc sự đã rồi.
 
-`@Transactional` chỉ định transaction boundary; nó không tự chọn pessimistic
-lock. Proxy boundary sai có thể release lock quá sớm.
+### Lớp PostgreSQL
+Chế độ `READ COMMITTED` cho phép thoải mái "Nhìn Về Dĩ Vãng" (đọc data cũ). Lúc nhào vô `UPDATE` nó có Khóa đấy, nhưng Khóa lúc đó thì cái Code Java kia đã quyết cái rụp rồi.
 
-### Hibernate/JPA
+## 18. Ngoài Vùng Phủ Sóng
 
-Plain entity load không yêu cầu `PESSIMISTIC_WRITE`. Dirty checking flush xảy ra
-sau decision, nên automatic UPDATE lock đến quá muộn.
-
-### PostgreSQL
-
-`READ COMMITTED` cho phép hai plain SELECT đọc cùng committed version. Automatic
-row locking của UPDATE serialize statements nhưng không chạy lại Java predicate.
-
-## Scope boundary
-
-Known `show_seat` row là lock target ổn định. Nếu business rule là “tối đa 100
-holds thỏa một predicate” hoặc “không có row nào trong khoảng thời gian”, khóa
-một row trả về hiện tại không bảo vệ phantom/missing row. Khi đó cần constraint,
-stable guard row, atomic counter hoặc `SERIALIZABLE` tùy invariant.
+Trò này chỉ linh nghiệm khi **Bạn Khóa 1 Cái Dòng (Row) Đã Biết Rõ Và Đang Nằm Sờ Sờ Ra Đó**. Nếu yêu cầu của Sếp là "Đảm bảo cả ngày hôm nay không có ai đặt lịch trùng 8 giờ tối", thì bạn không thể Khóa cái dòng "Không có thật" (Phantom row). Lúc đó phải nâng cấp vũ khí lên xài Bảng Ràng Buộc, Khóa nhân tạo, hoặc `SERIALIZABLE`.

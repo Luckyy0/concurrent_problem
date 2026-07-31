@@ -1,20 +1,21 @@
-# Deterministic visibility experiments
+# Phòng Thí Nghiệm Đập Tan Ảo Tưởng (Deterministic visibility experiments)
 
-## Mục tiêu
+## 1. Mục tiêu tối thượng
 
-Tests phải chứng minh:
+Mấy bài Tests này được sinh ra để vả mặt những ai còn mù quáng tin vào Đọc Bẩn ở PostgreSQL. Chúng ta phải chứng minh được:
 
-1. writer đã execute/flush UPDATE nhưng chưa commit;
-2. RU-requested reader hoàn tất plain SELECT mà không block;
-3. reader thấy old committed value `20`, không thấy `80`;
-4. writer rollback giữ final `20`; writer commit làm later statement thấy `80`;
-5. isolation label không được dùng thay behavior assertion;
-6. committed heartbeat/state-machine alternatives visible đúng.
+1. Ông nhà văn (writer) đã gõ lệnh UPDATE và xả (flush) xuống DB, nhưng kiên quyết ôm Khóa không thèm chốt sổ.
+2. Thằng đọc (reader) dù xin xỏ Đọc Bẩn (RU) nhưng vẫn lướt qua cái Khóa đó mượt mà (không bị block) bằng lệnh Đọc Chay (plain SELECT).
+3. Đọc xong thì thằng reader CHỈ THẤY số `20` cũ rích, cấm tuyệt đối không lòi ra số `80`.
+4. Nếu writer Hủy Kèo (rollback), con số vĩnh viễn là `20`. Còn nếu writer Chốt Sổ (commit), thằng reader chạy lại từ đầu mới thấy được `80`.
+5. Cái Nhãn mức cô lập (isolation label) DB báo về chỉ để trưng cho vui, KHÔNG ĐƯỢC lấy nó làm bằng chứng "Đã Đọc Bẩn".
+6. Các giải pháp thay thế như Nhịp Tim (heartbeat) hay Máy Trạng Thái phải chứng minh được tính hiệu quả và đọc được Dữ Liệu Đã Chốt.
 
-> **Nói ngắn gọn:** giữ writer transaction mở bằng gate, đọc từ connection khác,
-> rồi quyết định commit hoặc rollback sau assertion.
+> **Nói ngắn gọn:** Cách bắt quả tang chuẩn nhất là nhốt thằng writer lại giữa chừng bằng một cái Cổng (gate), mở một Kết nối (connection) thứ 2 đi vào đọc, đọc xong mới mở cổng cho thằng writer chốt sổ hay tự tử (rollback) tùy thích.
 
-## PostgreSQL Testcontainers
+## 2. Dựng rạp xiếc với PostgreSQL Testcontainers
+
+Tuyệt đối cấm xài H2 để test trò này! Bắt buộc phải dựng một con PostgreSQL hàng real lên:
 
 ```java
 @Testcontainers
@@ -29,10 +30,9 @@ class DirtyReadExpectationIntegrationTest {
 }
 ```
 
-Test method không annotated `@Transactional`; writer, reader và inspector là
-Spring beans/proxies riêng.
+Nhớ kỹ: Hàm Test tuyệt đối KHÔNG ĐƯỢC gắn `@Transactional`. Ông Writer, ông Reader và ông Thanh Tra (Inspector) phải là 3 cục Bean độc lập để bắt 3 Kết nối (connections) riêng biệt.
 
-Schema:
+Cấu trúc Bảng:
 
 ```sql
 create table job_run (
@@ -46,6 +46,7 @@ create table job_run (
 );
 
 create table job_attempt_heartbeat (
+    -- Bảng riêng dùng để lưu Nhịp Tim tách biệt với Bảng Chính
     job_id uuid not null,
     generation bigint not null,
     owner_token uuid not null,
@@ -56,7 +57,7 @@ create table job_attempt_heartbeat (
 );
 ```
 
-Fixture setup commit:
+Bơm sẵn dữ liệu mồi:
 
 ```sql
 insert into job_run(
@@ -65,7 +66,9 @@ insert into job_run(
 values (:jobId, 'RUNNING', 20, 7);
 ```
 
-## Writer gate
+## 3. Lập rào chắn bắt quả tang (Writer gate)
+
+Dùng trò đếm ngược (CountDownLatch) của Java để bắt thằng Writer phải đứng im sau khi đã Xả dữ liệu:
 
 ```java
 final class WriterGate {
@@ -73,15 +76,18 @@ final class WriterGate {
     private final CountDownLatch allowCompletion =
         new CountDownLatch(1);
 
+    // Kêu thằng Writer xả xong đứng đây chờ
     void afterFlush() {
-        flushed.countDown();
-        awaitOrFail(allowCompletion, Duration.ofSeconds(5));
+        flushed.countDown(); // Báo hiệu: "Tao xả rồi nha!"
+        awaitOrFail(allowCompletion, Duration.ofSeconds(5)); // Đợi cấp lệnh mới được đi tiếp
     }
 
+    // Kẻ đứng ngoài (Test) canh me
     void awaitFlushed() {
         awaitOrFail(flushed, Duration.ofSeconds(5));
     }
 
+    // Mở cổng thả cho đi
     void release() {
         allowCompletion.countDown();
     }
@@ -102,10 +108,10 @@ final class WriterGate {
 }
 ```
 
-Writer calls `entityManager.flush()`/repository `flush()` before
-`gate.afterFlush()`. `finally` luôn release gate.
+Writer gọi `entityManager.flush()`/repository `flush()` trước
+khi gọi `gate.afterFlush()`. Khúc `finally` luôn nhớ gọi `release()` nếu không rác vương vãi Thread chạy mãi không tắt nhé.
 
-## Reader observation
+## 4. Con mắt của người phán xử (Reader observation)
 
 ```java
 public record ReadObservation(
@@ -121,14 +127,17 @@ public record ReadObservation(
     readOnly = true
 )
 public ReadObservation observe(UUID jobId) {
+    // 1. Hỏi coi JDBC mầy xin Mức độ nào?
     int jdbcIsolation = jdbc.execute(
         (ConnectionCallback<Integer>)
             Connection::getTransactionIsolation
     );
+    // 2. Hỏi coi Database mầy chém gió ra cái Nhãn gì?
     String reported = jdbc.queryForObject(
         "select current_setting('transaction_isolation')",
         String.class
     );
+    // 3. Và ĐÂY MỚI LÀ CHÂN LÝ: Đọc con số Tiền độ thật sự!
     int progress = jdbc.queryForObject(
         """
         select progress_percent
@@ -146,10 +155,9 @@ public ReadObservation observe(UUID jobId) {
 }
 ```
 
-Driver/server version có thể expose requested/alias label khác nhau. Test record cả
-hai nhưng correctness assertion là `progress`.
+Phiên bản DB có thể phịa ra cái Nhãn khác nhau (read committed hay uncommitted), cứ Log hết ra mà xem. Nhưng để kết luận đúng sai (correctness) thì CHỈ ĐƯỢC tin vào con số `progress` móc lên thôi.
 
-## Experiment 1 — RU reader không thấy uncommitted UPDATE
+## 5. Thí nghiệm 1 — Mặc áo Đọc Bẩn vẫn không húp được đồ bẩn
 
 ```java
 @Test
@@ -159,20 +167,25 @@ void readUncommittedRequestStillCannotSeeDirtyRow()
     ExecutorService actor = Executors.newSingleThreadExecutor();
 
     try {
+        // 1. Nhốt thằng A vào 1 Thread riêng, kêu làm việc rồi tự sát (rollback)
         Future<Throwable> writerOutcome = actor.submit(() ->
             catchThrowable(() ->
                 processor.processCurrentUnit(
                     JOB_ID,
-                    true // throw after gate -> rollback
+                    true // failAfterFlush = true
                 )
             )
         );
 
+        // 2. Đợi nó kêu Xả xong
         gate.awaitFlushed();
 
+        // 3. Cho B nhào vô đọc thử
         ReadObservation observed = watchdog.observe(JOB_ID);
 
+        // KẾT QUẢ ĐÂY: Dù B xin Đọc Bẩn, nhưng vẫn lãnh số 20 cũ mèm!
         assertThat(observed.progress()).isEqualTo(20);
+        // Cười mỉa mai cái Nhãn DB trả về:
         assertThat(observed.reportedIsolation())
             .isIn("read uncommitted", "read committed");
         assertThat(observed.jdbcIsolation()).isIn(
@@ -180,12 +193,14 @@ void readUncommittedRequestStillCannotSeeDirtyRow()
             Connection.TRANSACTION_READ_COMMITTED
         );
 
+        // 4. Mở cổng cho thằng A tự sát
         gate.release();
         Throwable failure =
             writerOutcome.get(5, TimeUnit.SECONDS);
         assertThat(failure)
             .isInstanceOf(ProcessingFailedException.class);
 
+        // Cuối cùng: Chốt sổ vẫn là 20.
         assertThat(inspector.progress(JOB_ID)).isEqualTo(20);
     } finally {
         gate.release();
@@ -196,10 +211,11 @@ void readUncommittedRequestStillCannotSeeDirtyRow()
 }
 ```
 
-Watchdog call return trong khi writer gate vẫn closed, chứng minh plain SELECT
-không chờ writer completion và đọc old committed version.
+Ông Watchdog về nhà ngủ trong khi Cổng của thằng Writer vẫn đang Đóng Kín, chứng minh rõ ràng Lệnh Đọc Chay không thèm đợi Writer nhả Khóa mà nhảy thẳng vào lấy kết quả cũ.
 
-## Experiment 2 — Before commit old, after commit new
+## 6. Thí nghiệm 2 — Phải đợi Cơm Chín mới được ăn (Before commit old, after commit new)
+
+Nếu ông A không chết mà sống nhăn nhở Chốt Sổ (commit) thì sao?
 
 ```java
 @Test
@@ -232,12 +248,11 @@ void laterStatementSeesValueOnlyAfterWriterCommits()
 }
 ```
 
-Second watchdog invocation tạo transaction/statement snapshot mới sau commit. Đây
-không phải dirty read; nó là normal committed visibility.
+Phát gọi thứ 2 của Watchdog tạo một Bức Ảnh Chụp (Snapshot) hoàn toàn Mới sau khi ông A chốt. Trò này chứng minh luân thường đạo lý (normal committed visibility), chả dính dáng gì tới "Đọc bẩn".
 
-## Experiment 3 — Uncommitted INSERT cũng invisible
+## 7. Thí nghiệm 3 — Đồ nặn ra (INSERT) cũng tàng hình nốt
 
-Writer transaction:
+Đừng nghĩ Đọc Bẩn chỉ áp dụng cho UPDATE. Kênh của ông A:
 
 ```sql
 insert into job_run(
@@ -247,18 +262,17 @@ values (:newJob, 'RUNNING', 1, 1);
 -- flush, no commit
 ```
 
-RU reader:
+Thì thằng Reader xin Đọc Bẩn cũng mù dở:
 
 ```java
 assertThat(watchdog.find(NEW_JOB_ID)).isEmpty();
 ```
 
-Sau rollback vẫn empty; sau commit và new reader transaction thì present. Test
-ngăn implementation chỉ đúng cho UPDATE example nhưng sai assumption với inserts.
+Thí nghiệm này nhằm bắt bài mấy ông ngây thơ code logic bắt Lỗi "Đọc Bẩn Dòng Cũ" nhưng lại lơ đẹp "Đọc Bẩn Dòng Mới". Chỉ khi A Chốt xong và B chạy lại lệnh mới thì mới thấy dòng đó xuất hiện.
 
-## Experiment 4 — Locking reader waits, không dirty-read
+## 8. Thí nghiệm 4 — Đọc ép Khóa (FOR UPDATE) thì Đứng Đợi
 
-Reader bean:
+Thay vì Đọc chay, ông B dùng hàm:
 
 ```java
 @Transactional
@@ -269,8 +283,7 @@ public JobSnapshot lockAndRead(UUID jobId) {
 }
 ```
 
-Giữ writer ở gate, start locking reader future. Dùng direct admin connection và
-bounded Awaitility:
+Nhốt thằng A ở Cổng, chọt Query thẳng xuống hệ thống Postgres xem có án mạng không:
 
 ```sql
 select count(*)
@@ -279,19 +292,13 @@ where datname = current_database()
   and wait_event_type = 'Lock';
 ```
 
-Assert waiter count >= 1. Sau:
+KẾT QUẢ: Ít nhất 1 thằng đứng ngáp ruồi! (waiter count >= 1). 
+Ông B bị kẹt cứng ngắc cho đến khi A chốt/hủy. Xong xuôi, B lượm được cái kết quả cuối cùng (outcome).
+Khẳng định lại: Đọc lấy Khóa là "Đợi kết quả cuối", chứ KHÔNG phơi ra đồ Đang làm dở (dirty visibility). Trò ép Khóa này không được đem ra để chạy làm Polling trên Dashboard đâu nha!
 
-- writer commit -> locking reader returns progress 80;
-- writer rollback -> locking reader returns progress 20.
+## 9. Thí nghiệm 5 — Nhịp tim riêng lẻ (Independent heartbeat visible)
 
-Mọi future có timeout và holder release trong `finally`. Locking behavior không
-được dùng cho dashboard polling; experiment chỉ phân biệt wait-for-outcome với
-dirty visibility.
-
-## Experiment 5 — Independent heartbeat visible, main Tx vẫn open
-
-Processor main transaction update job row `80` và dừng ở gate. Một separate bean
-publishes heartbeat ở bảng riêng:
+Ông A đang ôm cái Transaction bự chảng, nhưng lâu lâu lén thả "Nhịp Tim" (heartbeat) ra ngoài bằng cái lệnh `REQUIRES_NEW`:
 
 ```java
 heartbeatPublisher.publish(new Heartbeat(
@@ -303,15 +310,17 @@ heartbeatPublisher.publish(new Heartbeat(
 ));
 ```
 
-Publisher dùng `REQUIRES_NEW`, commit trước return. Assertions khi main Tx còn open:
+Cái này vứt vào cái Bảng Mới rồi tự chốt trước khi quay về. Kết quả là trong lúc Giao dịch chính của A còn đang ngâm tôm:
 
 ```java
+// Bảng chính vẫn lỳ lợm số 20
 assertThat(watchdog.observe(JOB_ID).progress()).isEqualTo(20);
+// Nhịp tim bên Bảng phụ đã nảy lên số 80
 assertThat(heartbeatReader.read(JOB_ID, 7).progressPercent())
     .isEqualTo(80);
 ```
 
-Sau main rollback:
+Sau khi Giao dịch chính nổ (Rollback):
 
 ```java
 assertThat(inspector.progress(JOB_ID)).isEqualTo(20);
@@ -319,26 +328,24 @@ assertThat(heartbeatReader.read(JOB_ID, 7).progressPercent())
     .isEqualTo(80);
 ```
 
-Test chứng minh contract: heartbeat là committed attempt state, không phải final
-job progress. Bảng riêng tránh inner transaction chờ row bị outer transaction lock.
+Bài học: Nhịp tim báo cáo Trạng thái "Đang ráng chạy" là hoàn toàn hợp pháp, nhưng phải vứt nó ra một mảnh đất riêng, chốt sổ nhanh gọn.
 
-## Experiment 6 — Same-row `REQUIRES_NEW` là anti-pattern
+## 10. Thí nghiệm 6 — Mở REQUIRES_NEW chọt vô cùng 1 Dòng là NGU Y HỆT NHAU
 
-Outer Tx lock/update `job_run`, rồi synchronous inner NEW cố update same row. Dùng
-bounded `lock_timeout` trong test và assert inner fails/rolls back thay vì treo.
+Đang ôm Transaction ngoài (Outer), khóa cái Dòng Job đó lại. Xong ngứa tay mở thêm cái Transaction nhỏ ở trong (`REQUIRES_NEW`), và đòi chọt vô cùng Dòng đó! 
+Kết quả:
 
 ```text
-outer owns row lock
-outer waits inner return
-inner waits outer row lock
+Thằng Cha ôm Khóa Dòng
+Thằng Cha đứng ngó Thằng Con trả kết quả
+Thằng Con đứng mỏi giò đợi Thằng Cha nhả Khóa Dòng
 ```
 
-Không cần wait-for cycle giữa PostgreSQL sessions để application tự chặn theo call
-dependency. Heartbeat resource/boundary phải được thiết kế tách biệt.
+Cắn Đuôi (Deadlock) nổ tung đầu! Không cần cái Server khác can thiệp, Code của bạn tự bóp dái nó luôn. Nhịp tim phải vứt ra Bảng Riêng là vì vậy!
 
-## Experiment 7 — Atomic recovery claim có đúng một winner
+## 11. Thí nghiệm 7 — Cuộc chiến Tranh Giành (Atomic recovery claim)
 
-Expire committed lease, start hai watchdog actors qua gate, rồi cùng chạy:
+Chờ hết giờ Thuê, lùa 2 ông Watchdog chạy thẳng vào một cửa ải duy nhất để đua:
 
 ```sql
 update job_run
@@ -348,25 +355,25 @@ set generation = generation + 1,
 where job_id = :jobId
   and generation = 7
   and status = 'RUNNING'
-  and lease_until < :databaseNow
+  and lease_until < :databaseNow -- Hết hạn Thuê rồi!
 returning generation, owner_token;
 ```
 
-Test:
+Kết quả:
 
 ```java
-assertThat(results.successCount()).isEqualTo(1);
-assertThat(results.noOpCount()).isEqualTo(1);
+assertThat(results.successCount()).isEqualTo(1); // 1 thằng Thắng
+assertThat(results.noOpCount()).isEqualTo(1); // 1 thằng Khóc
 assertThat(inspector.generation(JOB_ID)).isEqualTo(8);
 assertThat(inspector.ownerToken(JOB_ID))
     .isEqualTo(results.winnerToken());
 ```
 
-Dirty-read expectation không xuất hiện; atomic write chọn recovery owner.
+Không cần mơ mộng Đọc Bẩn, cứ nhào vô Ghi Tranh Giành (atomic write) là giải quyết êm đẹp ai là người Giải Cứu.
 
-## Experiment 8 — Label test không thay behavior test
+## 12. Thí nghiệm 8 — Đừng tin lời đồn (Label test không thay behavior test)
 
-Log/record:
+Chỉ dùng bộ Log ghi lại cái Nhãn Cô Lập (Isolation label):
 
 ```text
 PostgreSQL server version
@@ -377,17 +384,16 @@ current_setting('transaction_isolation')
 observed progress during uncommitted writer
 ```
 
-Test suite chỉ fail correctness khi dirty value visible hoặc committed invariant
-sai. Label thay đổi giữa driver/server profiles được review như compatibility
-signal, không tự động kết luận visibility regression.
+Test chạy sai hay đúng là phải dựa vào con số Tiến độ Thật Sự Húp Được (visibility correctness). Mấy cái Label thay đổi chóng mặt tùy theo máy chủ chỉ dùng để làm cảnh tra cứu tương thích, tuyệt đối không được xài làm bằng chứng!
 
-## Inspector
+## 13. Con mắt Thanh Tra (Inspector)
 
 ```java
 @Service
 class CommittedJobInspector {
     private final JdbcTemplate jdbc;
 
+    // Đẩy xa bụi trần bằng REQUIRES_NEW
     @Transactional(
         propagation = Propagation.REQUIRES_NEW,
         readOnly = true
@@ -406,43 +412,37 @@ class CommittedJobInspector {
 }
 ```
 
-Inspector chạy sau writer future completion cho final state assertions.
+Đây là hàm dành riêng cho cuối giờ để chốt sổ, mở Transaction Độc Lập hoàn toàn để săm soi kết quả cuối.
 
-## Coverage matrix
+## 14. Bảng Chân Lý Trọn Vẹn (Coverage matrix)
 
-| Scenario | Reader timing | Visible progress |
+| Chuyện gì xảy ra? | Thời điểm ông Đọc nhào vô | Số Tiến Độ Thấy Được |
 | --- | --- | --- |
-| RU plain SELECT, writer open | Before completion | 20 |
-| RU plain SELECT, writer rollback | After rollback | 20 |
-| RU plain SELECT, writer commit | New statement after commit | 80 |
-| RU uncommitted INSERT | Before completion | No row |
-| `FOR UPDATE`, writer commit | After wait | 80 |
-| `FOR UPDATE`, writer rollback | After wait | 20 |
-| Separate heartbeat commit | Main Tx open | Heartbeat 80, job 20 |
+| Xin RU (Đọc Bẩn) Đọc Chay, A Đang mở | Khi A chưa làm xong | 20 (Cũ rích) |
+| Xin RU (Đọc Bẩn) Đọc Chay, A Hủy Kèo | Sau khi A Hủy | 20 (Y nguyên) |
+| Xin RU (Đọc Bẩn) Đọc Chay, A Chốt sổ | Bắt đầu Lệnh Đọc SAU KHI A Chốt | 80 (Thơm bơ) |
+| Đọc Chay trò nặn đồ mới (INSERT) | Khi A chưa làm xong | Trắng xóa (Không có dòng nào) |
+| Đọc ép Khóa `FOR UPDATE`, A Chốt | Đợi mòn mỏi xong | 80 |
+| Đọc ép Khóa `FOR UPDATE`, A Hủy | Đợi mòn mỏi xong | 20 |
+| Nhịp tim chốt riêng lẻ | A đang ngâm tôm Bảng chính | Nhịp tim 80, Bảng chính 20 |
 
-## Chống flaky
+## 15. Bí kíp chống Flaky (Code chạy hên xui)
 
-- Writer flush gate tạo order trước reader.
-- Mọi latch, future, Awaitility wait và executor termination có timeout.
-- `finally` release gate trước shutdown.
-- Test class chạy `SAME_THREAD`; probes là single-scenario.
-- Test methods không có outer transaction.
-- Reader/writer/inspector là proxied beans với connections riêng.
-- Không dùng H2 cho PostgreSQL visibility evidence.
-- Assert row behavior, không chỉ isolation label.
-- Lock tests có bounded timeout/admin diagnostics.
+- Cổng rào (Writer flush gate) ép tụi nó chạy đúng thứ tự.
+- Chơi Latch hay Future là phải có Hẹn Giờ Bom Nổ (timeout).
+- Lệnh `finally` bắt buộc mở cổng thả chó, không là cháy máy.
+- Bỏ H2 đi, Test trò Tầm Nhìn Dữ Liệu là phải xài đồ real.
+- Luôn kiểm tra Dữ Liệu Dòng (Row behavior), không phải cái Label mõm.
+- Thí nghiệm Lấy Khóa bắt buộc phải có timeout và rình ở Admin Diagnostics (pg_stat_activity).
 
-## Production verification
+## 16. Lên Production soi gì? (Production verification)
 
-Theo dõi:
+Ra trận thì phải dán mắt vào mấy cái đồ thị này:
 
-- long-running processor transaction age;
-- committed checkpoint/heartbeat age;
-- requested/reported isolation label theo database profile;
-- recovery claims: winner/no-op;
-- generation/fencing rejection;
-- duplicate processors;
-- main commit/rollback và independent heartbeat commits.
+- Tuổi thọ của Transaction (Ai mở qua 5 giây thì chửi).
+- Dấu Nhịp Tim cuối là mấy giờ.
+- Số thằng thắng / thua trong cuộc chiến Đòi Quyền (recovery claims).
+- Dấu hiệu từ chối nhịp tim cũ (generation rejection).
+- Ghi nhận những ông Chốt Sổ Thành Công / Những ông Rollback xối xả.
 
-Không giải thích committed-old read là cache bug trước khi xác nhận transaction
-boundary/MVCC timing. Đây là expected PostgreSQL behavior.
+Thằng nào cãi chày cãi cối "Sao tôi chỉ đọc được đồ cũ?" thì đập vô mặt nó tài liệu này. Đó là Lẽ Thường Của MVCC, không phải Bug Cache hay Trễ Mạng (Replication lag)!

@@ -1,6 +1,6 @@
-# Broken JPA read-modify-write
+# Đoạn Code Thảm Họa: Đọc-Sửa-Ghi Bằng JPA (Broken JPA read-modify-write)
 
-## Entity không có conflict detector
+## 1. Thực Thể (Entity) Không Biết Tự Vệ
 
 ```java
 @Entity
@@ -26,7 +26,7 @@ public class JobProgress {
                 "Completed units exceed total units"
             );
         }
-        completedUnits += delta;
+        completedUnits += delta; // Lỗi tiềm ẩn nằm đây! Cộng trên biến Java!
     }
 
     public int getCompletedUnits() {
@@ -35,18 +35,18 @@ public class JobProgress {
 }
 ```
 
-Entity không có `@Version`. Validation chạy trên value entity đã load, không phải
-current value tại write time.
+Thực thể này KHÔNG HỀ có vòng bảo vệ `@Version`. Cái logic kiểm tra lỗi (Validation) nó chạy trơn tru trên cái con số Cũ Rích vừa tải lên, chứ KHÔNG PHẢI là con số Mới Nhất Dưới DB ngay lúc lưu.
 
-## Repository
+## 2. Tầng Kho Lưu Trữ (Repository)
 
 ```java
 public interface JobProgressRepository
         extends JpaRepository<JobProgress, UUID> {
+    // Để trống thế này là đủ chết rồi.
 }
 ```
 
-## Broken service
+## 3. Tầng Dịch Vụ Cùi Bắp (Broken service)
 
 ```java
 @Service
@@ -62,12 +62,16 @@ public class JobProgressService {
         UUID jobId,
         int delta
     ) {
+        // BƯỚC 1: ĐỌC
         JobProgress job = progress.findById(jobId)
             .orElseThrow();
 
         int before = job.getCompletedUnits();
+        
+        // BƯỚC 2: TÍNH TOÁN TRONG RAM
         job.addCompletedUnits(delta);
 
+        // BƯỚC 3: GHI LẠI (Ảo tưởng là an toàn nhờ @Transactional)
         return new ProgressResult(
             jobId,
             before,
@@ -77,16 +81,15 @@ public class JobProgressService {
 }
 ```
 
-Method gọi qua Spring proxy đúng và mỗi request có transaction riêng. Bug không
-phải self-invocation; bug là compound operation qua database boundary:
+Method này chạy qua Proxy của Spring rất chuẩn, mỗi request đẻ ra một Transaction riêng. Lỗi KHÔNG nằm ở cái proxy. Lỗi là do bạn gom 3 bước rời rạc qua lại giữa App và DB vào chung 1 quy trình:
 
 ```text
-read -> calculate in JVM -> absolute write
+Đọc lên -> Tính toán trong App (JVM) -> Ép Ghi Đè số tuyệt đối
 ```
 
-## SQL Hibernate thực hiện
+## 4. SQL Thằng Hibernate Sinh Ra (SQL Hibernate thực hiện)
 
-SELECT:
+Khúc ĐỌC (SELECT):
 
 ```sql
 select job_id, completed_units, total_units
@@ -94,79 +97,74 @@ from job_progress
 where job_id = ?;
 ```
 
-Dirty checking tại flush/commit tạo UPDATE tương đương:
+Lúc Chốt Sổ/Xả hàng (flush/commit), thằng Hibernate tự soi lỗi và quăng ra cái lệnh GHI ĐÈ ngây ngô:
 
 ```sql
 update job_progress
-set completed_units = ?,
+set completed_units = ?, -- Điền số 13, hoặc 14 tuyệt đối vào đây
     total_units = ?
-where job_id = ?;
+where job_id = ?;      -- Điểm mù chết chóc!
 ```
 
-Tùy mapping/dynamic-update configuration, Hibernate có thể update ít hoặc nhiều
-columns. Điểm quyết định là predicate chỉ có primary key:
+Mặc kệ bạn cấu hình động đậy (`@DynamicUpdate`) kiểu gì, cốt lõi là điều kiện lọc (predicate) chỉ dựa vào đúng cái Khóa Chính:
 
 ```text
 WHERE job_id = ?
 ```
 
-Không có:
+VÀ HOÀN TOÀN THIẾU VẮNG:
 
 ```text
-AND version = ?
-AND completed_units = old_value
+AND version = ? -- (Không có Khóa Lạc Quan)
+AND completed_units = old_value -- (Không so sánh giá trị cũ)
 ```
 
-Cả A và B UPDATE đều affected rows `1`, nên Hibernate không có conflict signal.
+Nên cả lệnh của ông A và lệnh của ông B chọt xuống đều thấy cập nhật thành công (affected rows = 1). Thằng Hibernate chẳng nhận được tín hiệu cầu cứu nào (conflict signal) để mà báo lỗi.
 
-> **Nói ngắn gọn:** transaction đảm bảo mỗi UPDATE atomic, nhưng không biến ba bước
-> read/calculate/write thành một atomic business operation.
+> **Nói ngắn gọn:** Cái `@Transactional` nó chỉ đảm bảo cái Lệnh UPDATE là Nguyên tử, chứ nó KHÔNG BIẾN 3 BƯỚC Đọc-Tính-Ghi dài dòng của bạn thành 1 Nghiệp vụ Nguyên tử được!
 
-## Concrete broken interleaving
+## 5. Hiện Trường Gây Án Cụ Thể (Concrete broken interleaving)
 
 ```text
-row initial = 10
+Ban đầu = 10
 
-Tx-A SELECT -> 10
-Tx-B SELECT -> 10
+Ông A gọi SELECT -> Thấy 10
+Ông B gọi SELECT -> Cùng Thấy 10
 
-Tx-A Java calculation -> 13
-Tx-B Java calculation -> 14
+App của ông A nhẩm tính -> Thành 13
+App của ông B nhẩm tính -> Thành 14
 
-Tx-A UPDATE SET completed_units = 13 WHERE job_id = ...
-Tx-A COMMIT
+Giao dịch A phang lệnh: UPDATE SET completed_units = 13 WHERE ...
+Giao dịch A CHỐT (COMMIT)
 
-Tx-B UPDATE SET completed_units = 14 WHERE job_id = ...
-Tx-B COMMIT
+Giao dịch B nhào tới phang: UPDATE SET completed_units = 14 WHERE ...
+Giao dịch B CHỐT (COMMIT)
 
-final = 14, expected = 17
+Thực tế = 14, Trong khi Đúng Ra phải là = 17. Mất mẹ nó 3 cái!
 ```
 
-Nếu B UPDATE bắt đầu trước A commit, nó có thể wait row lock. Sau A commit, B vẫn
-ghi parameter `14` đã tính từ stale value `10`.
+Dù ông B có vấp phải cái Khóa Dòng (row lock) và phải đứng Đợi ông A chốt xong, thì sau đó B vẫn thản nhiên ốp con số `14` (đã lỡ tính từ lúc đầu) đè lên mọi thứ.
 
-## `save()` không sửa lost update
+## 6. Biện Hộ: Xài `save()` Có Sửa Được Không? (Không!)
 
-Explicit save:
+Nếu bạn ép lưu rõ ràng:
 
 ```java
 job.addCompletedUnits(delta);
 progress.save(job);
 ```
 
-vẫn merge/dirty-check cùng absolute state và cùng predicate không version. Thời
-điểm repository method được gọi không thêm atomicity.
+Vẫn y chang! Nó vẫn ôm cái số liệu tính sẵn (absolute state) rớt xuống DB mà không hề có Version. Hàm `save()` không mang lại phép thuật Nguyên Tử nào hết.
 
-## `saveAndFlush()` chỉ làm conflict sớm hơn nếu có detector
+## 7. Biện Hộ: Xài `saveAndFlush()` Chắc Ăn Hơn? (Cũng Không!)
 
 ```java
 progress.saveAndFlush(job);
 ```
 
-Không có `@Version`, flush chỉ gửi stale UPDATE sớm hơn. Row count vẫn `1`; không
-có exception để retry.
+Thiếu `@Version` thì việc Flush này chỉ đẩy cái lệnh Ghi Đè Lỗi sớm hơn một chút thôi. Số dòng thay đổi vẫn là 1; Chả có Exception nào văng ra để bạn tự bắt mà Thử lại (retry).
 
-## `synchronized` chỉ bảo vệ một object/JVM
+## 8. Biện Hộ: Dùng Khóa Cục Bộ `synchronized` Trong Java? (Trẻ con!)
 
 ```java
 public synchronized ProgressResult addCompletedUnits(...) {
@@ -174,50 +172,46 @@ public synchronized ProgressResult addCompletedUnits(...) {
 }
 ```
 
-Spring singleton lock có thể serialize calls trên một instance nhưng:
+Trò này chỉ cấm được các luồng (threads) tranh nhau trên Cùng 1 cái Máy Chủ (JVM). NHƯNG:
+- Máy chủ số 2 (Node 2) chạy App của bạn nó xài cái Khóa khác.
+- Lỡ ai đó viết 1 Service khác cũng lưu chọt vô cái JobProgress này thì bó tay.
+- Mấy cái Job chạy nền chọc thẳng vào SQL cũng không quan tâm Khóa Java.
+- Lỡ sập máy khởi động lại là mất hết phối hợp.
 
-- App node 2 có singleton/monitor khác;
-- multiple service objects/tests có lock khác;
-- direct SQL/job worker không tham gia JVM lock;
-- process restart không tạo durable coordination.
+Túm lại, Sổ Sách Xịn nằm ở PostgreSQL, thì Luật Chống Sửa Bậy phải được bảo vệ ở cấp độ Database/Transaction.
 
-Authoritative row nằm ở PostgreSQL, nên invariant phải được bảo vệ tại database
-write/transaction boundary.
+## 9. Cú Lừa Khi Tự Soi Lỗi Bằng Code (Validation cũng bị stale)
 
-## Validation cũng bị stale
-
-Initial:
-
+Giả sử ban đầu:
 ```text
 completed = 95
 total = 100
-A delta = 3
-B delta = 4
+Ông A muốn cộng = 3
+Ông B muốn cộng = 4
 ```
 
-Cả actors validate `95 + delta <= 100` và pass. Absolute writes cuối có thể là
-`98` hoặc `99`, che việc accepted total deltas lẽ ra thành `102`. Lost update làm
-counter trông hợp lệ nhưng accepted-work invariant đã bị phá.
+Cả 2 ông lấy 95 ra test: `95 + 3 <= 100` (OK!). `95 + 4 <= 100` (OK!). Cả 2 Đều Xanh (pass validation)!
+Kết cục Ghi Đè bậy bạ sẽ ra `98` hoặc `99`. Bạn nhìn vào thấy Số Hoàn Thành vẫn Nhỏ Hơn Tổng, ồ tuyệt vời không có lỗi gì hết!
+NHƯNG THỰC TẾ, Tổng sức của cả 2 ông dồn vào là `102` (vượt trần). Lỗi Mất Dữ Liệu đã âm thầm giấu nhẹm đi cái sai phạm to đùng, làm Sổ Sách thì đẹp nhưng Thực Tế Đã Nát (accepted-work invariant bị phá).
 
-Database constraint `completed_units <= total_units` cần thiết nhưng không đủ để
-phát hiện delta biến mất.
+Bạn thấy đấy, Database Check kiểu `completed_units <= total_units` là cần thiết, nhưng chưa đủ đô để bắt quả tang cái lượng Delta bị đánh cắp.
 
-## Preconditions tái hiện
+## 10. Điều Kiện Để Thảm Họa Trổ Bông (Preconditions tái hiện)
 
-- Hai physical transactions ở effective `READ COMMITTED`.
-- Plain SELECTs hoàn tất trước first commit.
-- Không row lock trên read.
-- Entity không có `@Version`.
-- Update predicate không chứa old value/version.
-- Cả methods return success.
-- Second absolute UPDATE commit sau first.
+- Dùng 2 Giao dịch vật lý riêng biệt với mức `READ COMMITTED`.
+- Lệnh Đọc (SELECT) của cả 2 chạy xong trước khi có người chốt sổ đầu tiên.
+- Đọc chay mà không ép xin Khóa (Không row lock trên read).
+- Không thèm xài bùa `@Version`.
+- Điều kiện Cập Nhật (WHERE) không hỏi thăm giá trị cũ/phiên bản cũ.
+- Code luôn chạy nuột và trả về Success.
+- Đứa nào ghi Đè tuyệt đối sau cùng, đứa đó Thắng.
 
-## Những cách sửa chưa đủ
+## 11. Các Giải Pháp Chữa Cháy Nửa Mùa Đừng Dùng (Những cách sửa chưa đủ)
 
-- Chỉ thêm `@Transactional`.
-- Chỉ gọi `save()`/`saveAndFlush()`.
-- Chỉ thêm in-memory lock.
-- Chỉ kiểm tra `completed <= total` trong Java.
-- Chỉ tăng isolation annotation nhưng không xử lý serialization failure.
-- Retry mà vẫn reuse stale entity/transaction.
-- Assume MVCC tự merge concurrent deltas.
+- CHỈ gắn thêm `@Transactional`.
+- CHỈ cố đổi gọi hàm `save()` hoặc `saveAndFlush()`.
+- CHỈ nhét cái Khóa `synchronized` vô dụng trong RAM.
+- CHỈ check lệnh IF `completed <= total` bằng Code Java.
+- CHỈ Tăng cấp Cô lập (Isolation level) nhưng làm lơ lỗi bị đạp ra khỏi hàng (serialization failure).
+- Cố Thử Lại (Retry) nhưng vẫn nhắm mắt xài lại cái Đối Tượng rác và Giao dịch nát từ trước.
+- Sống trong Ảo Tưởng rằng MVCC thần thánh sẽ tự động hợp nhất (merge) dữ liệu giùm bạn. Đừng Mơ!

@@ -1,324 +1,227 @@
-# Phân tích — predicate và mutation phải là một operation
+# Phân tích chuyên sâu — Tại sao Kiểm tra (Predicate) và Ghi dữ liệu (Mutation) phải gộp làm một?
 
-## Initial state
+## Trạng thái ban đầu
 
+Giả sử trong Database ta có:
 ```text
-inventory_item(product_id=77)
-  on_hand_quantity   = 5
-  available_quantity = 5
-  reserved_quantity  = 0
-  revision           = 10
+Sản phẩm số 77:
+  Tổng trong kho (on_hand_quantity)   = 5
+  Đang có sẵn (available_quantity) = 5
+  Đã giữ chỗ (reserved_quantity)  = 0
+  Phiên bản (revision)           = 10
 
-inventory_reservation = []
+Danh sách đơn đã giữ chỗ (inventory_reservation) = Rỗng
 ```
 
-Command A và B là hai orders hợp lệ, mỗi command giữ `4`. Chúng chạy trên hai
-application instances, connections và transactions độc lập.
+Lệnh A và Lệnh B là hai đơn hàng hoàn toàn hợp lệ, mỗi đơn đều muốn mua `4` chiếc. Chúng chạy trên hai máy chủ (application instances) khác nhau, với kết nối và giao dịch hoàn toàn độc lập.
 
-## Timeline read–check–write
+## Kịch bản thảm họa: Đọc-Kiểm tra-Ghi (read–check–write)
 
-| Bước | Tx-A / App-1 | Tx-B / App-2 | PostgreSQL |
+| Bước | Giao dịch A (Máy chủ 1) | Giao dịch B (Máy chủ 2) | Dưới Database PostgreSQL |
 | --- | --- | --- | --- |
-| 1 | plain SELECT → `5/0` | | Statement snapshot A |
-| 2 | | plain SELECT → `5/0` | Statement snapshot B |
-| 3 | Java check pass | Java check pass | Database chưa thấy business guard |
-| 4 | tính absolute `1/4` | tính absolute `1/4` | |
-| 5 | insert reservation A | insert reservation B | Distinct command IDs |
-| 6 | UPDATE row → `1/4` | | A giữ row lock |
-| 7 | commit | UPDATE waits rồi ghi `1/4` | B predicate chỉ là primary key |
-| 8 | | commit | Cả UPDATEs affected rows `1` |
+| 1 | `SELECT` bình thường → Thấy `5` sẵn / `0` giữ | | Database lấy Ảnh chụp A |
+| 2 | | `SELECT` bình thường → Thấy `5` sẵn / `0` giữ | Database lấy Ảnh chụp B |
+| 3 | Code Java: `5 >= 4` → Cho qua | Code Java: `5 >= 4` → Cho qua | DB không hề biết ứng dụng đang làm gì |
+| 4 | Code tự trừ: Còn `1` sẵn / `4` giữ | Code tự trừ: Còn `1` sẵn / `4` giữ | |
+| 5 | Insert lịch sử đơn A | Insert lịch sử đơn B | Mã đơn khác nhau nên insert trót lọt |
+| 6 | `UPDATE` thành `1` sẵn / `4` giữ | | A đang giữ khóa của dòng này |
+| 7 | Chốt sổ (commit) | `UPDATE` đứng chờ A xong rồi ghi đè số `1/4` | Câu lệnh của B không có điều kiện `WHERE` gắt gao |
+| 8 | | Chốt sổ (commit) | Báo cả 2 luồng đều sửa thành công (affected rows = 1) |
 
-Final row vẫn thỏa constraints, nhưng hai durable reservations tổng `8`. Đây vừa
-là lost update trên counter, vừa là accepted-decision inconsistency.
+Đến cuối cùng, dữ liệu tồn kho nhìn thì vẫn hợp lệ (không bị âm), nhưng thực tế chúng ta đã nhận 2 đơn với tổng cộng `8` chiếc. Đây chính là thảm họa "ghi đè mất dữ liệu" (lost update) trên con số đếm, dẫn đến quyết định bán hàng sai lầm bét nhè.
 
-## Expected và actual
+## Bảng đối chiếu: Mong đợi vs Thực tế
 
-| | Expected | Actual |
+| | Chuyện đáng lẽ phải xảy ra (Expected) | Chuyện tồi tệ đã xảy ra (Actual) |
 | --- | --- | --- |
-| Accepted commands | 1 | 2 |
-| Reserved audit sum | 4 | 8 |
-| `reserved_quantity` | 4 | 4 |
-| `available_quantity` | 1 | 1 |
-| Reconciliation | Khớp | Lệch `4` |
-| Loser outcome | `OUT_OF_STOCK` | `RESERVED` |
+| Số đơn được duyệt | 1 đơn | 2 đơn |
+| Tổng số lượng ghi trong lịch sử | 4 chiếc | 8 chiếc (Bán âm kho!) |
+| Số lượng `reserved_quantity` | 4 chiếc | 4 chiếc |
+| Số lượng `available_quantity` | 1 chiếc | 1 chiếc |
+| Khớp sổ (Reconciliation) | Khớp hoàn toàn | Lệch mất `4` chiếc |
+| Số phận của người đến sau | Báo Hết hàng (`OUT_OF_STOCK`) | Vẫn báo Thành công (`RESERVED`) |
 
-## Atomic statement
+## Cứu cánh: Câu lệnh Nguyên tử (Atomic statement)
+
+Hãy dồn hết logic vào 1 câu SQL duy nhất:
 
 ```sql
-update inventory_item
-set available_quantity = available_quantity - :quantity,
+UPDATE inventory_item
+SET available_quantity = available_quantity - :quantity,
     reserved_quantity = reserved_quantity + :quantity,
     revision = revision + 1
-where product_id = :productId
-  and :quantity > 0
-  and available_quantity >= :quantity
-returning available_quantity, reserved_quantity, revision;
+WHERE product_id = :productId
+  AND :quantity > 0
+  AND available_quantity >= :quantity
+RETURNING available_quantity, reserved_quantity, revision;
 ```
 
-`WHERE` là business guard; `SET` là business intent. Cả hai được PostgreSQL xử lý
-như một updating command trên current row version.
+Phần `WHERE` chính là "bảo vệ nghiệp vụ"; phần `SET` là "ý định sửa đổi". Cả hai sẽ được PostgreSQL gói gọn thành một khối duy nhất (atomic) và chạy trên dữ liệu TƯƠI MỚI NHẤT.
 
-## Timeline conditional UPDATE
+## Kịch bản thành công: Cập nhật có điều kiện (conditional UPDATE)
 
-| Bước | Tx-A | Tx-B | PostgreSQL |
+| Bước | Giao dịch A | Giao dịch B | Dưới Database PostgreSQL |
 | --- | --- | --- | --- |
-| 1 | UPDATE quantity `4` | | Predicate `5 >= 4`, A update → `1/4` |
-| 2 | giữ transaction mở | UPDATE quantity `4` | B wait trên row |
-| 3 | commit | wait | A release lock |
-| 4 | | predicate recheck | Current row có available `1` |
-| 5 | | zero returned rows | `1 >= 4` false |
-| 6 | | lưu `OUT_OF_STOCK`, commit | Không counter mutation B |
+| 1 | `UPDATE` mua `4` chiếc | | Kiểm tra `5 >= 4` → Đúng, A đổi thành `1` sẵn / `4` giữ |
+| 2 | A đang chạy, chưa chốt | `UPDATE` mua `4` chiếc | B bị chặn lại, đứng chờ |
+| 3 | Chốt sổ (commit) | Vẫn đang chờ | A nhả khóa ra |
+| 4 | | B tự động đánh giá lại (recheck) | Dữ liệu lúc này chỉ còn `1` chiếc sẵn |
+| 5 | | Trả về 0 dòng được sửa | Kiểm tra `1 >= 4` → Sai |
+| 6 | | Lưu lịch sử `OUT_OF_STOCK`, chốt sổ | Không có dòng nào bị luồng B ghi đè |
 
-> **Nói ngắn gọn:** actor B không thất bại vì application “đọc lại”; chính
-> updating statement đánh giá guard trên row đã được A commit.
+> **Nói ngắn gọn:** Luồng B thất bại không phải do code Java rảnh rỗi "đọc lại", mà vì chính câu lệnh SQL đã khôn ngoan kiểm tra lại điều kiện trên chính kết quả mà luồng A vừa chốt xong.
 
-## `READ COMMITTED` và predicate recheck
+## Mức cách ly `READ COMMITTED` và Đánh giá lại điều kiện (predicate recheck)
 
-PostgreSQL tìm candidate row theo statement snapshot. Nếu một concurrent
-transaction đã update/lock row đó, updating command chờ holder commit/rollback.
+Khi dùng mức cách ly mặc định `READ COMMITTED`, PostgreSQL tìm dòng cần sửa bằng Ảnh chụp ban đầu. Nhưng nếu dòng đó đang bị luồng khác khóa, nó sẽ ngoan ngoãn đứng chờ cho đến khi luồng kia chạy xong (commit hoặc rollback).
 
-### Holder commit
+### Nếu luồng trước chốt sổ (Holder commit)
+PostgreSQL sẽ lấy dữ liệu mới cứng vừa được sửa, và ĐÁNH GIÁ LẠI cụm `WHERE`.
+Nếu điều kiện vẫn đúng, luồng B được đi tiếp. Nếu điều kiện sai (như trong ví dụ trên), luồng B sẽ âm thầm bỏ qua và trả về số dòng bị ảnh hưởng là `0`.
 
-PostgreSQL thử áp operation lên updated row version và đánh giá lại `WHERE`.
-Nếu predicate còn đúng, B update current values. Nếu predicate sai, B bỏ qua row
-và affected-row count là `0`.
+### Nếu luồng trước bị hủy (Holder rollback)
+Thì coi như luồng A chưa từng tồn tại. Luồng B sẽ lấy dữ liệu gốc (5 chiếc) để tính toán, điều kiện đúng, và B sẽ là người chiến thắng (sửa 1 dòng).
 
-### Holder rollback
+Tuy nhiên, thủ thuật đánh giá lại này chỉ chạy đúng với những điều kiện đơn giản trên một dòng cụ thể. Đừng dại dột dùng cho các cụm `WHERE` chứa JOIN hay truy vấn chéo nhiều bảng!
 
-A effects bị hủy. B xử lý originally found row với available `5`; predicate pass,
-B update `1/4` và affected rows `1`.
+## Khóa dòng (Row lock) vẫn luôn rình rập
 
-Điều này phù hợp cho simple condition trên một predetermined row. Không suy rộng
-sang complex predicate/join nhiều rows: một statement ở `READ COMMITTED` có thể
-thấy concurrent effects trên target row mà không thấy một snapshot đồng nhất của
-mọi row khác.
+Code ứng dụng không gọi hàm "lock" không có nghĩa là Database không có khóa. Bản chất câu lệnh `UPDATE` sẽ giật lấy khóa dòng ngay khi nó tìm thấy dòng tương ứng. Kẻ đến sau có thể bị:
+- Phải chờ rồi tự đánh giá lại.
+- Chờ quá lâu vượt mức `lock_timeout` và văng lỗi `55P03`.
+- Bị dính vào vòng luẩn quẩn (deadlock) và văng lỗi `40P01`.
 
-## Row lock vẫn tồn tại
+Dù không khóa dòng thủ công bằng `SELECT ... FOR UPDATE`, thì lệnh `UPDATE` này vẫn giữ khóa cho tới tận khi giao dịch kết thúc (commit/rollback). Nhớ kỹ: Đừng chèn các hàm gọi API ra mạng (remote I/O) vào sau câu `UPDATE` nếu bạn không muốn cả hệ thống phải xếp hàng dài.
 
-“Lock-free application code” không có nghĩa database không lock. `UPDATE` acquire
-row-level lock khi target row match. Competitor có thể:
+## Số dòng bị ảnh hưởng chính là một Giao thức (Protocol)
 
-- wait rồi re-evaluate predicate;
-- vượt `lock_timeout` và fail SQLSTATE `55P03`;
-- tham gia wait-for cycle và thành deadlock victim `40P01`.
-
-Khác với pre-read `FOR UPDATE`, conditional statement chỉ acquire row lock trong
-mutation round trip. Lock vẫn được giữ đến transaction commit/rollback, nên
-remote I/O sau UPDATE vẫn kéo dài contention.
-
-## Affected-row count là protocol
-
-PostgreSQL command tag `UPDATE n` và Spring Data modifying return value không chỉ
-là metric:
+Con số `n` trả về từ SQL (hoặc từ Spring Data) không chỉ để in log cho vui, nó là kết quả của trận chiến đa luồng:
 
 ```text
-n = 1 → exactly one known product row passed guard and was mutated
-n = 0 → no row was mutated; map theo documented domain contract
-n > 1 → query/cardinality bug với single-product command
+n = 1 → Tuyệt vời! Đúng 1 dòng lọt qua khe cửa hẹp và được sửa thành công.
+n = 0 → Đơn hàng rớt đài. Không có dòng nào được sửa (Hãy báo Hết hàng).
+n > 1 → Chúc mừng, code của bạn có bug (sửa 1 sản phẩm mà ảnh hưởng nhiều dòng)!
 ```
 
-`0` không phải exception. Caller phải branch trước khi tạo accepted reservation
-hoặc outbox.
+`0` không phải là Exception văng ra màn hình. Lập trình viên phải tự viết lệnh `if (n == 0)` để xử lý luồng đi rẽ nhánh cho đúng trước khi tạo đơn.
 
-Trigger có thể thay đổi affected-row behavior, và một broad predicate có thể
-match nhiều rows. Production schema/query review phải giữ single-row cardinality
-assumption rõ ràng.
+## `RETURNING` giúp tránh việc Đọc-sau-khi-Ghi ngớ ngẩn
 
-## `RETURNING` tránh read-after-write ambiguity
-
-`UPDATE ... RETURNING` trả new values của chính rows được update:
-
+Câu lệnh `UPDATE ... RETURNING` vừa sửa vừa trả về ngay kết quả mới nhất:
 ```text
-one returned row → RESERVED cùng remaining quantities
-zero returned rows → no mutation
+Trả về 1 dòng → Giữ chỗ thành công (kèm số lượng tồn kho còn lại).
+Trả về 0 dòng → Chẳng có gì thay đổi.
 ```
+Nếu bạn tách ra làm 2 câu lệnh: `UPDATE` xong rồi `SELECT` lên lại, bạn có thể vô tình đọc nhầm kết quả của một luồng khác vừa nhảy vào sửa. Hãy dùng `RETURNING` để lấy chính xác thành quả của người chiến thắng.
 
-Một SELECT riêng sau UPDATE có statement snapshot mới và có thể thấy changes
-khác. Dùng `RETURNING` khi response cần exact post-mutation state của winner.
+## Số 0 dòng không phải lúc nào cũng là `OUT_OF_STOCK` (Hết hàng)
 
-JPA bulk-update API thường phù hợp với affected count. Với PostgreSQL
-`RETURNING`, custom JDBC/native DAO cho result mapping rõ hơn.
+Cùng là `0` nhưng có thể do:
+- Sản phẩm bị xóa mất tiêu.
+- Truyền số lượng mua bị âm.
+- Đang bị sai thông tin khách hàng (tenant mismatch).
+- Hoặc đơn giản là không đủ số lượng (Hết hàng).
 
-## Zero row không luôn là `OUT_OF_STOCK`
+Trong bài toán cụ thể này, vì chúng ta đã kiểm tra dữ liệu đầu vào kỹ, nên `0` chắc chắn là Hết hàng. Nhưng nếu hệ thống phức tạp, bạn phải thiết kế sao cho biết chính xác nguyên nhân (dùng Stored Procedure, hoặc chấp nhận gom chung thành lỗi `NOT_AVAILABLE`).
 
-Cùng `0` có thể đại diện:
+## Cẩn thận với Bộ đệm (Persistence context) của Hibernate
 
-- product missing;
-- invalid quantity;
-- product disabled/tenant mismatch;
-- insufficient available;
-- optimistic token mismatch.
+Nếu bạn gọi SQL thẳng xuống DB (Bulk DML) thì sẽ lách qua mặt Hibernate. Nếu bộ đệm JPA đang nhớ sản phẩm `77` có `5` chiếc:
+- Đối tượng (object) trên RAM vẫn chứa con số cũ kỹ.
+- Trả object này về cho API sẽ bị sai (stale).
+- Đáng sợ nhất: Nếu sau đó bộ đệm lại lưu (flush) một thứ khác, nó có thể vô tình ghi đè lại con số cũ kỹ lên DB, phá nát kết quả của câu lệnh UPDATE nguyên tử vừa rồi.
 
-Case validate `quantity > 0` trước SQL và command được tạo từ product row ổn
-định. Vì vậy zero row được map `OUT_OF_STOCK`. Nếu product có thể bị delete hoặc
-API phải phân biệt, cần thêm outcome design:
+**3 cách phòng thủ:**
+1. Code sửa dữ liệu đừng bắt JPA load thực thể (entity) đó lên RAM.
+2. Ép (flush) hết dữ liệu cũ xuống trước, gọi SQL Bulk DML, rồi dọn dẹp sạch sẽ bộ đệm (clear).
+3. Nếu vẫn cần dùng tiếp, hãy ép JPA tải lại từ DB (refresh).
+Chú ý: Đừng lạm dụng cờ `clearAutomatically=true` một cách máy móc, vì nó sẽ hất đổ mọi thay đổi chưa kịp lưu khác của bạn.
 
-- foreign key/lifecycle bảo đảm target tồn tại;
-- separate read chỉ để phân loại sau no-op, không để quyết định mutation;
-- stored procedure/function trả typed outcome;
-- hoặc chấp nhận một combined `NOT_AVAILABLE` contract.
+## Cấu trúc chuẩn của một Giao dịch (Transaction composition)
 
-Không thêm `exists → update` rồi dùng exists làm correctness guard.
-
-## Persistence context của Hibernate
-
-Native/JPQL bulk DML chạy trực tiếp ở database, không đi qua managed entity dirty
-checking. Nếu persistence context đã chứa `InventoryItem(77)`:
-
-- object vẫn có old counters;
-- response đọc object có thể stale;
-- later dirty flush/merge có thể overwrite, tùy dirty fields/mapping;
-- entity callbacks không tự chạy như entity-state transition.
-
-Ba thiết kế an toàn:
-
-1. primary mutation DAO không load inventory entity trong transaction;
-2. flush pending changes trước bulk DML rồi clear persistence context sau đó;
-3. refresh exact entity nếu thật sự cần dùng tiếp.
-
-`clearAutomatically=true` có thể detach mọi managed entities và làm mất pending
-changes nếu chưa flush. Vì vậy không bật flag máy móc; transaction/service design
-phải sở hữu persistence-context lifecycle.
-
-## Transaction composition
-
-Correctness không dừng ở counter:
-
+Đúng đắn không chỉ nằm ở câu SQL đếm số:
 ```text
-BEGIN
-  claim command ID
-  conditional stock UPDATE
-  write RESERVED/OUT_OF_STOCK outcome
-  write outbox only for RESERVED
-COMMIT
+BẮT ĐẦU GIAO DỊCH
+  Đăng ký mã chống trùng (command ID)
+  Sửa tồn kho có điều kiện (conditional UPDATE)
+  Lưu lịch sử: THÀNH CÔNG hoặc HẾT HÀNG
+  Lưu hộp thư đi (outbox) NẾU thành công
+CHỐT SỔ GIAO DỊCH
 ```
+Nếu bước Lưu hộp thư (outbox) bị lỗi, giao dịch phải HỦY (rollback) sạch sẽ để trả lại số tồn kho. Đừng bao giờ dại dột bọc `try-catch` lờ đi lỗi database để rồi giao dịch chạy lửng lơ. Luôn lưu Hộp thư (outbox) chung một giao dịch với lệnh sửa kho để đảm bảo "dữ liệu đi đôi với sự kiện".
 
-Nếu reservation/outbox insert fail sau UPDATE, transaction rollback hoàn nguyên
-counter. Nếu code catch database error rồi tiếp tục cùng aborted transaction,
-atomic composition bị hiểu sai.
+## Trùng mã lệnh (Duplicate command)
 
-Publish external message trước commit tạo dual-write gap. Outbox row trong cùng
-transaction giữ database state và publication intent nhất quán.
-
-## Duplicate command
-
-Conditional stock predicate ngăn oversell giữa distinct orders nhưng không ngăn
-same request decrement hai lần khi stock vẫn đủ.
-
-Durable command claim dùng unique `command_id`:
+Cập nhật nguyên tử chỉ chống bán lố hàng, chứ không ngăn được chuyện khách hàng bấm nút 2 lần và bị trừ hàng 2 lần (nếu kho vẫn đủ)!
+Ta phải dùng khóa `command_id` để chống trùng lặp (idempotency):
 
 ```sql
-insert into inventory_reservation (...)
-values (...)
-on conflict (command_id) do nothing
-returning command_id;
+INSERT INTO inventory_reservation (...)
+VALUES (...)
+ON CONFLICT (command_id) DO NOTHING
+RETURNING command_id;
 ```
 
-Concurrent duplicate insert được unique index arbitrate. Same fingerprint replay
-stored outcome; different fingerprint reject. Claim và final outcome nằm trong
-cùng transaction để không commit permanent `PROCESSING` row.
+Gửi mã trùng thì Database sẽ chặn lại. Lệnh chống trùng lặp và lệnh sửa tồn kho phải đi đôi với nhau trong cùng một Giao dịch.
 
-Idempotency và mutation safety bổ sung nhau, không thay thế nhau.
+## Chốt sổ, Hoàn tác và Mớ bòng bong mất phản hồi
 
-## Commit, rollback và ambiguous response
-
-| Failure point | Database outcome | Caller recovery |
+| Thời điểm đứt cáp / lỗi | Kết quả dưới Database | Cách ứng dụng dọn dẹp (Recovery) |
 | --- | --- | --- |
-| Trước UPDATE | Không stock change | Có thể fresh attempt |
-| Sau UPDATE, trước commit | Rollback counter/claim/outbox | Replay stable command |
-| Commit thành công, response mất | Reservation vẫn durable | Replay stored outcome |
-| Affected rows `0` | Rejection row có thể commit | Replay `OUT_OF_STOCK` |
-| Lock timeout/deadlock | Transaction rollback | Fresh bounded retry nếu policy cho phép |
+| Trước khi UPDATE | Kho chưa suy suyển | Thử chạy lại (Fresh attempt) |
+| Sau UPDATE, trước khi Chốt | Tự rollback mọi thứ | Chạy lại lệnh cũ (vì mã lệnh ổn định) |
+| Chốt THÀNH CÔNG, nhưng rớt mạng chưa kịp báo về Client | Đã giữ chỗ chắc nịch | Gửi lại mã lệnh, Server trả về trạng thái cũ đã lưu |
+| Trả về `0` dòng (Affected rows = 0) | Có thể vẫn ghi lịch sử bị Từ chối | Báo lại trạng thái `OUT_OF_STOCK` |
+| Hết giờ chờ khóa / Kẹt xe (Deadlock) | Giao dịch tự hủy (Rollback) | Tự động thử lại lệnh mới nếu luật cho phép |
 
-Không thể suy ra “response mất = rollback”. Stable command ID phân giải outcome
-sau crash/network failure.
+Không bao giờ được tự suy diễn: "Không nhận được phản hồi nghĩa là thất bại". Chỉ có Mã lệnh (Stable Command ID) mới là chân lý giúp phục hồi dữ liệu khi mạng chập chờn.
 
-## Isolation khác
+## Các Mức cách ly (Isolation) khác
 
-Primary contract dùng PostgreSQL `READ COMMITTED`. Ở `REPEATABLE READ`, concurrent
-target-row update có thể tạo serialization failure `40001` thay vì wait rồi
-affected rows `0`. Nếu application đổi isolation, test/outcome/retry contract
-phải đổi theo.
+Bài này viết dựa trên mức mặc định `READ COMMITTED`. 
+Nếu nâng lên `REPEATABLE READ`, những kẻ đụng độ nhau thay vì trả về `0` dòng thì sẽ văng thẳng mặt lỗi sập tuần tự hóa `40001`. Khi đó, code xử lý lỗi và test của bạn cũng phải sửa lại cho phù hợp.
+Tuyệt đối không tăng mức cách ly (Isolation) một cách mù quáng chỉ để thay cho một cái mệnh đề `WHERE` có thể viết rõ ràng trong câu SQL!
 
-`SERIALIZABLE` giải quyết lớp anomaly rộng hơn nhưng vẫn yêu cầu xử lý `40001`.
-Không tăng isolation chỉ để thay một predicate có thể viết rõ trong UPDATE.
-
-## Constraint là lớp phòng thủ
+## Rào chắn (Constraint) chỉ là phòng thủ vòng ngoài
 
 ```sql
-check (available_quantity >= 0)
-check (reserved_quantity >= 0)
-check (available_quantity + reserved_quantity = on_hand_quantity)
+CHECK (available_quantity >= 0)
+CHECK (reserved_quantity >= 0)
+CHECK (available_quantity + reserved_quantity = on_hand_quantity)
 ```
+Các rào chắn (Constraints) này giúp Database không nhận những con số âm lố bịch từ bất kỳ đâu gởi tới. Nhưng nó KHÔNG hề biết đối chiếu (cross-table) tổng số tồn kho với các dòng lịch sử bên bảng khác.
+Do đó, bạn vẫn phải có các công việc Đối soát (Reconciliation job) định kỳ để chạy lệnh SUM() so sánh xem tổng các đơn trong kho có bị vênh với con số đếm hay không.
 
-Constraints chặn invalid row states từ mọi write path. Chúng không tự reconcile
-counter với reservation rows ở table khác; PostgreSQL `CHECK` không phải
-cross-table assertion.
+## Môi trường nhiều Máy chủ (Multi-instance)
 
-Reconciliation job vẫn cần so:
+Cho dù có 100 máy chủ (Scale-out) bắn SQL vào chung 1 Database, thì Database vẫn là "cảnh sát" kiểm duyệt mọi thứ bằng Khóa dòng và Kiểm tra điều kiện. Dữ liệu KHÔNG BAO GIỜ bị sai!
+Tuy nhiên, nếu quá đông máy chủ cùng húc vào 1 sản phẩm hot, hệ thống sẽ bị xếp hàng dài cổ (waiters tăng), gây nghẽn Connection pool và hết hạn chờ (lock wait).
 
-```sql
-select i.product_id,
-       i.reserved_quantity,
-       coalesce(sum(r.quantity) filter (where r.outcome = 'RESERVED'), 0)
-from inventory_item i
-left join inventory_reservation r using (product_id)
-group by i.product_id, i.reserved_quantity
-having i.reserved_quantity
-       <> coalesce(sum(r.quantity) filter (where r.outcome = 'RESERVED'), 0);
-```
+## Bắt bệnh theo từng Tầng (Root cause theo layer)
 
-## Multi-instance
+### Tầng Ứng dụng (Application)
+Tách rời việc "Đọc lên kiểm tra" và "Ghi xuống" thành 2 bước rời rạc. Dùng con số "thiu" để tính toán logic.
 
-Cả App-1 và App-2 gửi statement tới cùng PostgreSQL primary. Row lock, current
-version, predicate và affected count nằm ở authoritative boundary, nên không phụ
-thuộc JVM nào xử lý request.
+### Tầng Spring
+Lầm tưởng chữ `@Transactional` có phép thuật tự động gộp 2 câu lệnh SQL lại thành 1 cục (atomic). Quên kiểm tra kết quả trả về từ SQL.
 
-Scale-out có thể tăng waiters trên hot product. Correctness vẫn giữ nhưng
-throughput/tail latency có thể giảm; connection pool, lock wait và no-op rate cần
-được đo.
+### Tầng Hibernate/JPA
+Bộ đệm (Cache) tự động sinh SQL ghi đè làm hỏng kết quả. Trộn lẫn code Bulk DML và code gọi thực thể (entity) mà không lo dọn dẹp.
 
-## Root cause theo layer
+### Tầng PostgreSQL
+Hiểu nhầm mức `READ COMMITTED` tự động bảo vệ dữ liệu, mà không biết rằng chỉ có lệnh `UPDATE` kèm ĐIỀU KIỆN (Guarded UPDATE) mới kích hoạt cơ chế "đánh giá lại" (recheck) xịn sò của nó.
 
-### Application
+## Cần theo dõi gì trên hệ thống (Observability)?
 
-Business guard và mutation bị tách bởi race window; absolute state được tính từ
-stale read.
+Giám sát các chỉ số sinh tồn:
+- Số lần bắn UPDATE thành công (1 dòng) và thất bại (0 dòng).
+- Số lượng hàng tồn kho còn lại.
+- Tốc độ tắc đường: thời gian chờ khóa (lock wait duration), các mã lỗi báo quá tải `55P03`, `40P01`, `40001`.
+- Thời gian từ lúc UPDATE xong đến lúc Chốt sổ (nếu dài là có vấn đề).
+- Tình trạng trùng mã lệnh.
+- Cảnh báo lệch sổ đối soát.
 
-### Spring
+## Khi nào cách này "chào thua"? (Scope boundary)
 
-`@Transactional` không hợp nhất hai SQL statements thành một atomic condition.
-Return value từ modifying query bị bỏ qua.
-
-### Hibernate/JPA
-
-Managed entity dirty checking ghi snapshot-derived values. Bulk DML lại có nguy
-cơ stale persistence context nếu application trộn hai model.
-
-### PostgreSQL
-
-Plain SELECT cho hai transactions thấy cùng committed tuple. Unconditional
-UPDATEs đều hợp lệ. Guarded UPDATE mới cung cấp predicate recheck/affected-row
-outcome trên current target row.
-
-## Observability
-
-Theo dõi:
-
-- conditional attempts, affected rows `1` và `0`;
-- returned remaining quantity;
-- row-lock wait duration, SQLSTATE `55P03`, `40P01`, `40001`;
-- transaction duration sau successful UPDATE;
-- duplicate replay/fingerprint mismatch;
-- reconciliation mismatch;
-- pool active/pending và hot product IDs đã hash/bucket hóa.
-
-Affected rows `0` tăng có thể là stock pressure bình thường; lock wait tăng là
-contention signal khác. Không gộp hai metric.
-
-## Scope boundary
-
-Một known product row chứa counter cần thiết, nên invariant diễn đạt bằng một
-predicate. Nếu capacity được tính từ tập child rows hoặc new rows có thể xuất
-hiện, conditional UPDATE chỉ đúng khi có stable authoritative counter/guard row
-và reconciliation. Predicate-wide design thuộc các isolation/constraint cases.
+Kỹ thuật cập nhật nguyên tử có điều kiện này chỉ bá đạo khi dữ liệu kho và luật lệ nằm GỌN trong đúng một dòng dữ liệu (single row).
+Nếu bạn bán các "combo" liên quan nhiều dòng sản phẩm, hoặc quy tắc dựa vào những dòng chưa từng tồn tại (new rows), 1 câu lệnh UPDATE này vô dụng. Khi đó bạn phải chuyển sang bài Khóa bi quan, Mức cách ly đặc biệt hoặc Thiết kế rào chắn toàn cục.

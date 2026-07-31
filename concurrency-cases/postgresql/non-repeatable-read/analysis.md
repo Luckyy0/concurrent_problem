@@ -1,8 +1,8 @@
-# Phân tích statement snapshot và business decision
+# Mổ Xẻ Tận Cùng: Ảo Ảnh Của Từng Câu Lệnh (Statement snapshot)
 
-## Initial state
+## 1. Bối cảnh ban đầu (Initial state)
 
-Trước khi hai actors bắt đầu, PostgreSQL có committed row:
+Trước khi 2 diễn viên chính (Ông A và Ông B) ra sân, dưới DB PostgreSQL đang có dòng Luật như sau đã chốt (committed):
 
 ```text
 merchant_refund_policy(M-42)
@@ -11,292 +11,257 @@ merchant_refund_policy(M-42)
   revision          = 7
 ```
 
-Refund request có amount `80.00`. Revision `7` cho phép auto-approve; revision
-`8` với limit `50.00` thì không.
+Khách yêu cầu hoàn lại `80.00`. Ở Phiên bản số `7`, lệnh duyệt tự động dư sức chạy qua; nhưng nếu gặp Phiên bản `8` với mức trần `50.00` thì rớt đài cái chắc.
 
-## Expected theo broken design
+## 2. Ảo tưởng sức mạnh của Lập trình viên (Expected theo broken design)
 
-Developer thường suy luận:
+Dev nhà mình hay lẩm nhẩm cái suy luận ngây ngô này:
 
 ```text
-A đã BEGIN transaction
-  -> policy không đổi trong mọi lần đọc của A
-  -> revision dùng để quyết định và revision dùng để audit giống nhau
+Ông A ĐÃ BẮT ĐẦU (BEGIN) Giao dịch (transaction) rồi...
+  -> Nên Luật lệ sẽ đứng yên không bao giờ đổi trong suốt mọi lần Đọc của A.
+  -> Do đó, cái Phiên bản lúc dùng để Phán Quyết và cái Phiên bản lúc đem đi Lưu Sổ sẽ luôn là MỘT.
 ```
 
-Suy luận này đúng với stable transaction snapshot phù hợp, nhưng không đúng cho
-hai plain SELECT ở PostgreSQL `READ COMMITTED`.
+Nghe hợp lý ha? Nó chỉ đúng nếu bạn được phát một Bức Ảnh Giao Dịch Xuyên Suốt (stable transaction snapshot) kìa! Còn với PostgreSQL ở mức mặc định `READ COMMITTED`, nơi mà nó chỉ phát Bức Ảnh Chụp Vội cho Từng Lệnh SELECT (plain SELECT), thì suy luận này sai bét!
 
-## Actual interleaving
+## 3. Thực tế phũ phàng diễn ra (Actual interleaving)
 
-| Bước | Refund evaluator A | Risk administrator B |
+| Bước | Lính Lác A (Xét duyệt - Refund evaluator) | Sếp B (Đổi Luật - Risk administrator) |
 | --- | --- | --- |
-| 1 | `BEGIN READ COMMITTED` | |
-| 2 | SELECT #1 bắt đầu với snapshot S1 | |
-| 3 | Đọc limit `100`, revision `7` | |
-| 4 | Quyết định `APPROVED` cho `80` | `BEGIN` |
-| 5 | | UPDATE limit `50`, revision `8` |
-| 6 | | `COMMIT` |
-| 7 | SELECT #2 bắt đầu với snapshot S2 | |
-| 8 | Đọc limit `50`, revision `8` | |
-| 9 | INSERT approved, evaluated limit `100`, revision `8` | |
-| 10 | `COMMIT` | |
+| 1 | `BẮT ĐẦU VỚI MỨC CÔ LẬP READ COMMITTED` | |
+| 2 | Lệnh SELECT #1 lấy được Bức ảnh S1 | |
+| 3 | Đọc Hạn mức = `100`, Phiên bản = `7` | |
+| 4 | Ký lệnh `APPROVED` cho số tiền `80` (Duyệt trong RAM) | `BẮT ĐẦU` |
+| 5 | | Lệnh UPDATE Hạn mức xuống `50`, Phiên bản lên `8` |
+| 6 | | `CHỐT SỔ (COMMIT)` |
+| 7 | Lệnh SELECT #2 lấy được Bức ảnh MỚI TOANH S2 | |
+| 8 | Đọc Hạn mức = `50`, Phiên bản = `8` | |
+| 9 | Lệnh INSERT báo cáo: Đã Duyệt 80, dựa trên Limit 100, LUẬT PHIÊN BẢN 8 | |
+| 10 | `CHỐT SỔ (COMMIT)` | |
 
-Final state:
-
-```text
-current policy: limit=50, revision=8
-decision:       amount=80, APPROVED, evaluated_limit=100, policy_revision=8
-```
-
-Cả A và B commit thành công. Không row nào bị hai transactions cùng update, nên
-không có lost-update conflict.
-
-> **Nói ngắn gọn:** PostgreSQL bảo đảm mỗi statement không thấy state nửa commit;
-> nó không bảo đảm nhiều statements ở `READ COMMITTED` ghép lại thành một view
-> duy nhất.
-
-## Snapshot chính xác của từng statement
-
-Ở `READ COMMITTED`, mỗi command lấy snapshot khi command bắt đầu:
+Kết cục tàn tạ (Final state):
 
 ```text
-S1 created before B commit
-  -> visible policy tuple: revision 7
-
-B commits revision 8
-
-S2 created after B commit
-  -> visible policy tuple: revision 8
+Luật hiện tại trên DB: Hạn mức=50, Phiên bản=8
+Quyết định lưu lại:    Số tiền=80, APPROVED, Limit dùng xét=100, Gắn nhãn Phiên bản=8
 ```
 
-SELECT #1 không trở thành dirty read hay “sai” sau B commit. Nó là committed view
-hợp lệ tại S1. Lỗi xuất hiện khi application kết hợp decision từ S1 với evidence
-từ S2 mà không revalidate.
+Cả A và B đều cười toe toét báo Thành công. Tại sao không có lỗi? Vì hai giao dịch không đánh nhau trên cùng 1 dòng dữ liệu (A thì UPDATE/INSERT dòng khác, B thì UPDATE dòng Luật). Cho nên Lỗi Ghi Đè (lost-update) hoàn toàn không thèm hiện ra.
 
-## MVCC tuple versions
+> **Nói ngắn gọn:** PostgreSQL rất uy tín ở chỗ: Đảm bảo không cho bạn thấy dữ liệu dở dang chưa chốt. NHƯNG nó KHÔNG HỀ Tuyên thệ rằng: Nhiều câu lệnh ở chế độ `READ COMMITTED` ghép lại sẽ vẽ ra Cùng Một Bức Tranh Tổng Thể. Nó chỉ là 2 tấm ảnh chụp ở 2 thời điểm khác nhau thôi!
 
-B UPDATE tạo tuple version mới:
+## 4. Máy Chụp Ảnh Hoạt Động Ra Sao? (Snapshot chính xác của từng statement)
+
+Ở chế độ `READ COMMITTED`, quản gia PostgreSQL chỉ bấm máy chụp Ảnh (snapshot) đúng vào khoảnh khắc Câu Lệnh chạy:
 
 ```text
-old tuple: limit=100, revision=7
-new tuple: limit=50,  revision=8
+Ảnh S1 chụp TRƯỚC KHI sếp B chốt
+  -> Thấy Luật Phiên bản 7
+
+Sếp B chốt cái Luật Phiên bản 8 (commits)
+
+Ảnh S2 chụp SAU KHI sếp B chốt
+  -> Hiển nhiên thấy Luật Phiên bản 8 Mới Nhất
 ```
 
-Sau B commit:
+Cú SELECT #1 hoàn toàn KHÔNG PHẢI là Đọc Rác (dirty read) hay bị "Sai" khi sếp B chốt sổ. Bức ảnh S1 hoàn toàn vinh quang và hợp lệ ở thời điểm đó.
+Lỗi là do Mấy Trò Xào Nấu (application) ở trên App, vác Quyết Định từ Tấm S1 đem trộn chung với Số Liệu của Tấm S2 mà không hề có động tác Khám lại xem Luật lệ đã đổi chưa (revalidate).
 
-- snapshot S1 vẫn đã đọc old committed version;
-- statement mới của A lấy S2 và chọn new committed version;
-- old tuple còn có thể tồn tại vật lý cho active snapshots/vacuum rules;
-- application vẫn nhìn cùng một logical row.
+## 5. Các Mảnh Đời Song Song (MVCC tuple versions)
 
-MVCC giảm read/write blocking; nó không đóng băng business object cho toàn
-transaction ở mọi isolation level.
-
-## Lock behavior
-
-B UPDATE acquire row-level lock trên policy row và giữ tới commit. A plain SELECT:
-
-- không acquire `FOR SHARE`/`FOR UPDATE` row lock;
-- thường không block sau B vì đọc committed tuple theo snapshot;
-- không giữ quyền ưu tiên cho lần đọc sau;
-- không ngăn B commit giữa hai statements.
-
-A INSERT lock row/index entries của `refund_decision`, không conflict với B UPDATE
-policy row. Đây là lý do database không tự phát hiện evidence mismatch.
-
-## Non-atomic sequence
-
-Root sequence:
+Khi B chạy lệnh UPDATE, DB không ghi đè mất xác dòng cũ, mà tạo ra một Phiên bản Dòng (tuple version) mới tinh:
 
 ```text
-read policy version V1
-  -> decide in Java using V1
-  -> concurrent commit changes policy to V2
-  -> read audit fields from V2
-  -> write decision combining V1 and V2
+Bản cũ (old tuple): Limit=100, Phiên bản=7
+Bản mới (new tuple): Limit=50,  Phiên bản=8
 ```
 
-Transaction làm các writes của A atomic với nhau; nó không làm chuỗi nhiều reads
-thành một atomic observation ở `READ COMMITTED`.
+Sau khi sếp B chốt sổ:
 
-## Root cause theo layer
+- Tấm ảnh S1 của lính A vẫn trỏ về Bản Cũ 7 (dữ liệu vật lý vẫn còn đó).
+- Lệnh Đọc mới của lính A (ảnh S2) tự động chọn Bản Mới 8.
+- Bản Cũ 7 vẫn sống sót vật lý (chờ đội dọn rác Vacuum dẹp đi sau) để phục vụ cho mấy bức ảnh cũ chưa coi xong.
+- Còn App của bạn thì tưởng 2 lần đọc đó là cùng 1 sự vật hiện tượng (cùng logical row). Đời không như mơ!
 
-### PostgreSQL
+Công nghệ MVCC sinh ra là để ĐỌC KHÔNG ĐỢI GHI, GHI KHÔNG ĐỢI ĐỌC (giảm blocking). Nó KHÔNG sinh ra để Đóng Băng thời gian sự vật cho bạn xài từ đầu chí cuối ở mọi isolation level.
 
-`READ COMMITTED` intentionally dùng statement snapshots. Non-repeatable read là
-behavior được phép, không phải database corruption.
+## 6. Trò Chơi Ổ Khóa (Lock behavior)
 
-### Spring
+Khi sếp B UPDATE, sếp bợ luôn cái Ổ Khóa Của Dòng Luật (row-level lock) và giữ khư khư tới khi chốt sổ (commit).
+Còn ông lính A gọi Lệnh SELECT chay:
 
-`@Transactional(isolation = READ_COMMITTED)` tạo đúng physical transaction nhưng
-không yêu cầu stable transaction snapshot. Inner `REQUIRED` method cũng join
-isolation đang có.
+- Hoàn toàn KHÔNG xin Khóa Đọc (`FOR SHARE` hay `FOR UPDATE`).
+- Vẫn đọc ào ào trôi tuột vì MVCC phát cho Bức Ảnh Cũ (không bị block bởi B).
+- Không thèm đặt gạch xí chỗ cho lần đọc sau.
+- Không có quyền gì cấm sếp B chen ngang vào giữa hai statements.
 
-### Hibernate/JPA
+Khi ông A chèn giấy tờ (INSERT `refund_decision`), ông A chỉ xin khóa trên cái bảng Nhật Ký, nên chả đụng chạm gì sếp B đang giữ khóa Bảng Luật. Đó là lý do CSDL mù màu không thể tuýt còi báo Xung Đột.
 
-Scalar projection phát SELECT mới; first-level cache không hợp nhất hai result
-sets. Hibernate dirty checking/flush không thêm policy revision predicate vào
-INSERT của decision.
+## 7. Khối Lệnh Rời Rạc (Non-atomic sequence)
 
-### Application
-
-Decision và evidence không có một explicit policy-version contract. Code đọc lại
-một authoritative row nhưng không recompute, compare revision hoặc lock.
-
-## Persistence context nuance
-
-Managed entity identity có thể làm cùng entity instance được trả về hai lần:
+Quy trình vỡ nát:
 
 ```text
-findById #1 -> managed entity revision 7
-findById #2 -> same Java object revision 7, possibly no SQL
+Đọc Luật (Tấm Ảnh V1)
+  -> Trong RAM: Ra phán quyết dựa trên V1
+  -> Đùng! DB Chốt thành V2
+  -> Đọc Luật (Lấy Audit từ V2)
+  -> GHI: Trộn phán quyết V1 với Audit V2 lại thành một mớ hổ lốn.
 ```
 
-Điều này chỉ che interleaving. Một `refresh`, scalar query, native query hoặc
-persistence context khác lại expose revision `8`. Correctness không nên phụ thuộc
-vào query plan/cache accident.
+Cái Bọc Giao Dịch (`@Transactional`) chỉ giúp các Lệnh GHI dính chùm vào nhau (atomic writes). Nó KHÔNG giúp đóng gói các lệnh ĐỌC RỜI RẠC thành 1 Sự Kiện Duy Nhất (atomic observation) dưới chế độ `READ COMMITTED`.
 
-Nếu query entity được thực thi lại, Hibernate vẫn có thể trả managed instance và
-merge behavior phụ thuộc operation/flush mode. Test phải log SQL và dùng query
-form có semantics rõ.
+## 8. Đổ Lỗi Cho Ai Bây Giờ? (Root cause theo layer)
 
-## `REPEATABLE READ`
+### Lớp PostgreSQL
 
-PostgreSQL `REPEATABLE READ` dùng transaction snapshot:
+Chế độ `READ COMMITTED` cố tình được thiết kế chụp nhiều Tấm Ảnh (statement snapshots). Lỗi "Đọc không lặp lại" (Non-repeatable read) là hành vi hợp lệ được cho phép, không phải do DB bị hư hay sập (corruption).
+
+### Lớp Spring
+
+Cái thẻ `@Transactional(isolation = READ_COMMITTED)` đã làm quá tốt nhiệm vụ tạo 1 Giao dịch vật lý đàng hoàng, nhưng nó Không Thể Đòi Bức Ảnh Xuyên Suốt. Việc bạn gọi method con (propagation `REQUIRED`) nó cũng chỉ bú ké chung cái Giao dịch đang chạy.
+
+### Lớp Hibernate/JPA
+
+Mấy câu Lệnh (Scalar projection) tự kích nổ lệnh SELECT mới thẳng xuống DB. Bộ đệm Cấp 1 (first-level cache) không thèm hòa trộn 2 tập kết quả. Còn lúc Hibernate xả lệnh Ghi (flush/dirty checking), nó cũng bơ luôn việc nhét thêm cái điều kiện (predicate) Kiểm Tra Phiên Bản Cũ vào lệnh INSERT.
+
+### Lớp Mã Nguồn (Application)
+
+Logic ở Code không hề có một "Bản Hợp Đồng" rõ ràng. Đọc lại cái Dòng Quyền Lực (authoritative row) mà KHÔNG HỀ tính toán lại, so sánh thử, hay Đặt Khóa. Làm ăn quá cẩu thả!
+
+## 9. Cú Lừa Bộ Đệm (Persistence context nuance)
+
+Đôi lúc bạn chạy Code thấy 2 lần gọi lại trả về y chang nhau:
 
 ```text
-SELECT #1 -> revision 7
-B commits revision 8
-SELECT #2 -> vẫn revision 7
+Lần 1: findById -> Đối tượng Java (Phiên bản 7)
+Lần 2: findById -> Dùng lại Object cũ (Vẫn Phiên bản 7, chẳng thèm gọi SQL)
 ```
 
-Nó loại non-repeatable read trong A. Tuy nhiên B vẫn có thể commit vì A chỉ đọc
-policy và insert một row khác. Execution có thể được hiểu theo serial order:
+Đừng vội mừng! Đó chỉ là lớp vỏ bọc che đậy (interleaving) của Bộ đệm (Identity Entity). Lỡ ai đó viết câu lệnh Native (native query), gõ ép làm mới (`refresh`), hay mở 1 Giao dịch Khác, Bùm! Phiên bản 8 lòi mặt ra ngay.
+Tính Đúng Đắn (Correctness) không bao giờ được phép trông cậy vào Tai Nạn Tình Cờ của Bộ đệm! Nhớ bật log SQL lên mà soi.
+
+Nếu câu truy vấn Entity thực sự được bắn đi, cách Hibernate Merge dữ liệu mới vào Object cũ thế nào còn hên xui tùy chế độ. Viết code phải rành mạch.
+
+## 10. Liệu `REPEATABLE READ` Có Phải Thuốc Tiên?
+
+Nếu ép PostgreSQL xài `REPEATABLE READ`, nó sẽ cấp Bức Ảnh Giao Dịch Xuyên Suốt (transaction snapshot):
 
 ```text
-A decision theo revision 7
-sau đó B đổi current policy thành revision 8
+SELECT #1 -> Phiên bản 7
+Sếp B chốt Phiên bản 8
+SELECT #2 -> Vẫn giữ nguyên Phiên bản 7
 ```
 
-Nếu business cho phép decision hợp lệ theo policy tại snapshot, đây là acceptable.
-Nếu requirement là “phải dùng policy mới nhất tại thời điểm A commit”,
-`REPEATABLE READ` một mình chưa đủ.
-
-## `SERIALIZABLE`
-
-PostgreSQL Serializable Snapshot Isolation tìm serialization anomalies và có thể
-abort transactions khi có dangerous dependency structure. Nhưng stronger
-isolation không đồng nghĩa “mọi reader phải thấy commit mới nhất”.
-
-Với dependency đơn giản A đọc policy/insert decision, B chỉ update policy, serial
-order A trước B có thể hợp lệ nên cả hai vẫn có thể commit. Muốn policy update và
-decision có ordering chặt, model read/write set hoặc explicit lock phải diễn đạt
-ordering đó.
-
-## Revalidation semantics
-
-Có ba hợp đồng khác nhau:
-
-1. **Snapshot-at-evaluation:** decision hợp lệ theo một policy version đã đọc.
-2. **Current-at-write:** policy revision phải chưa đổi khi decision được insert.
-3. **Locked-through-commit:** policy không được update cho tới decision commit.
-
-Một final conditional statement có thể bảo vệ contract 2 tại statement boundary.
-`FOR SHARE` giữ ordering tới commit cho contract 3. Không nên gọi cả ba là
-“consistent” mà không định nghĩa thời điểm.
-
-## Commit và rollback
-
-### B rollback
-
-Revision `8` không visible. SELECT #2 của A vẫn thấy revision `7`; anomaly không
-xảy ra trong interleaving đó.
-
-### A rollback
-
-Decision INSERT bị rollback. Policy revision `8` của B vẫn committed độc lập.
-
-### A commit trước B
-
-Decision revision `7` có thể hợp lệ theo serial order A rồi B, miễn policy history
-và audit contract cho phép.
-
-## Timeout và lock wait
-
-Broken plain SELECT không cần chờ policy UPDATE đã commit. Nếu chuyển sang
-`FOR SHARE`, concurrent updater có thể:
-
-- block tới A commit/rollback;
-- fail vì `lock_timeout`;
-- tham gia deadlock nếu nhiều policies được lock không theo deterministic order.
-
-Timeout phải map thành domain retry/rejection phù hợp; không tăng timeout để che
-transaction dài.
-
-## Retry
-
-Non-repeatable read ở `READ COMMITTED` không tự ném exception để trigger retry.
-Application phải phát hiện revision mismatch hoặc affected-row `0`.
-
-Retry đúng:
+Tuyệt quá, chữa được bệnh "Đọc Không Lặp Lại" cho A rồi!
+NHƯNG KHOAN, sếp B VẪN CHỐT SỔ THÀNH CÔNG (vì A chỉ đọc, không ghi đè lên Luật). Nếu sắp xếp tuần tự, câu chuyện sẽ kể lại như vầy:
 
 ```text
-attempt 1 transaction rolls back
-bounded backoff/jitter
-attempt 2 starts a new transaction
-reload current policy
-recompute the whole decision
+Ông A duyệt tiền theo Phiên bản 7. Xong xuôi.
+Sau đó Sếp B đổi Luật thành Phiên bản 8.
 ```
 
-Chỉ chạy lại INSERT với decision cũ là sai. Retry trong cùng transaction snapshot
-cũng không đảm bảo freshness.
+Nếu Luật kinh doanh chấp nhận điều kiện ở trên (Duyệt theo hình ảnh lúc đó là xong) -> OK, Thuốc này hiệu nghiệm!
+Nhưng nếu Luật công ty là "Lúc Chốt Sổ, Mày Phải Dùng Đúng Cái Luật Tươi Mới Nhất!", thì xin lỗi, `REPEATABLE READ` Một Mình Mày Là Chưa Đủ!
 
-## Crash behavior
+## 11. Đỉnh Cao `SERIALIZABLE`?
 
-Nếu process A crash trước commit, PostgreSQL rollback transaction và không lưu
-decision. Nếu crash sau commit nhưng trước response, caller có thể retry command;
-unique `command_id`/idempotency xử lý duplicate delivery, nhưng không thay thế
-policy consistency mechanism.
+Chế độ Serializable Snapshot Isolation của PostgreSQL rất thông minh, tự đi bắt bẻ các Giao dịch chạy lung tung (anomalies) và đạp (abort) mấy cái có cấu trúc phụ thuộc Nguy Hiểm. Nhưng Mức Độ Cách Ly Cao Nhất KHÔNG CÓ NGHĨA LÀ "Bắt thằng Đọc phải Thấy Dữ Liệu Tươi Nhất Của Thằng Vừa Chốt".
 
-Policy revision và decision evidence phải durable trong cùng database contract để
-reconciliation không phụ thuộc log trong process đã chết.
+Trong vụ này, A Đọc Luật/Ghi Nhật Ký, còn B Cập Nhật Luật. Trật tự "A chạy trước xong B chạy sau" vẫn Hợp Lệ 100%, nên DB tha cho cả 2 đứa cùng chốt (commit). Muốn B và A chém giết nhau rõ ràng, thì phải đặt Khóa Explicit (chặn cửa rành rọt) hoặc thiết kế model hợp lý.
 
-## Multi-instance
+## 12. Hợp Đồng Chống Vỡ Mặt (Revalidation semantics)
 
-A có thể chạy ở App Node 1 và B ở App Node 2 hoặc admin tool. `synchronized`,
-`ReentrantLock` và in-memory cache trên Node 1 không coordinate các actors đó.
+Làm rõ liền 3 bản Hợp Đồng Luật Lệ này:
 
-Authoritative protection phải nằm ở PostgreSQL:
+1. **Chụp lúc nào, xử lúc đó (Snapshot-at-evaluation):** Xét duyệt dựa trên Tấm Ảnh Luật đã đọc, khỏi lằng nhằng.
+2. **Lúc Cắm Cờ phải Tươi (Current-at-write):** Lúc chốt sổ Ghi Quyết Định, Cái Luật đó phải CHƯA BỊ AI SỬA.
+3. **Cấm Ai Khóa Chặn Mõm (Locked-through-commit):** Cấm ai đụng chạm sửa Luật từ lúc Tui bắt đầu xem đến tận lúc Tui chốt sổ xong.
 
-- immutable policy version + foreign key;
-- conditional write/revision validation;
-- row lock;
-- hoặc isolation/model đủ diễn đạt invariant.
+Một câu lệnh Gắn Điều Kiện Đuôi (conditional statement) giải quyết đẹp Hợp Đồng Số 2. Ổ khóa `FOR SHARE` (khóa đọc) lo gọn Hợp Đồng Số 3. Đừng nói mồm chữ "Nhất quán" (consistent) mà không vạch rõ THỜI ĐIỂM nằm ở đâu!
 
-## Observability
+## 13. Sập Cầu Dao Chốt / Xóa Sổ (Commit và rollback)
 
-Ghi structured fields:
+### Sếp B xù kèo (B rollback)
+
+Luật Phiên bản 8 tan thành mây khói (không visible). Cú SELECT #2 của A lại vui vẻ đọc lại Phiên bản 7; Không hề hấn gì, thế giới hòa bình.
+
+### Lính A xù kèo (A rollback)
+
+Giấy duyệt bị xé (Rollback Decision). Luật Phiên bản 8 của B đã được Chốt Sổ đàng hoàng và sống khỏe. Mọi thứ độc lập.
+
+### Lính A nhanh tay chốt trước B (A commit trước B)
+
+Quyết định Phiên bản 7 của A có thể là hợp lệ nếu soi theo trật tự A chạy trước B, miễn là Lịch sử Đổi Luật và Sổ Nhật Ký chấp nhận chuyện đó.
+
+## 14. Bị Giam Cầm Và Quá Giờ (Timeout và lock wait)
+
+Với cú Lệnh Đọc Chay (plain SELECT) hư đốn, A chả cần chờ B chốt xong làm gì.
+Còn nếu lính A ngoan ngoãn mang Ổ Khóa `FOR SHARE` (Xin Phép Khóa), thằng Sếp B đi sau muốn UPDATE sẽ:
+
+- Bị Đứng Hình chờ A chốt xong hoặc bỏ cuộc (commit/rollback).
+- Tức quá văng lỗi hết giờ (`lock_timeout`).
+- Hoặc dính Chùm Kẹt Xe (deadlock) nếu nhiều Luật bị khóa qua khóa lại không theo thứ tự.
+
+Quá Giờ (Timeout) phải được rẽ nhánh sang logic Từ Chối hoặc Thử Lại đàng hoàng ở Code. Đừng có cố tình nới thời gian timeout lên cả chục giây để lấp liếm sự dốt nát của cái Giao dịch Quá Dài!
+
+## 15. Chiêu Thức Thử Lại (Retry)
+
+Lỗi "Đọc Không Lặp Lại" ở mức `READ COMMITTED` nó chạy lẳng lặng như bóng ma, Đừng Có Mơ CSDL nó ném lỗi (exception) ra cho bạn tự Thử Lại (retry). App phải Tự Động bắt mạch bằng cách so sánh version lệch, hoặc đếm dòng ảnh hưởng (affected-row) = 0.
+
+Quy trình Thử Lại Chuẩn Men:
 
 ```text
-commandId
-merchantId
-amount
-policyRevisionRead
-policyRevisionWritten
-decisionOutcome
-effectiveIsolation
-retryAttempt
+Thử Lần 1: Chết ngắt, lôi nhau Rollback.
+Nghỉ xả hơi một nhịp (có độ trễ / jitter)
+Thử Lần 2: Mở một Giao Dịch MỚI TINH tươm.
+Tải Lại toàn bộ Luật Lệ tươi mới.
+Ngồi xét duyệt tính toán lại từ đầu đến đít.
 ```
 
-Theo dõi:
+Chỉ đem cái Quyết định sai cũ rích chèn (INSERT) lại là tự vả vào mặt. Mà Thử lại bên trong chính Cái Giao Dịch Cũ Bị Nát cũng chả giúp Dữ liệu tươi lên được đâu.
 
-- revision mismatch/conditional no-op count;
-- lock wait và `lock_timeout`;
-- serialization/deadlock retry count;
-- decisions không join được policy history;
-- approved amount vượt stored evaluated limit;
-- transaction duration và connection pool pressure.
+## 16. Chết Đứng Giữa Đường (Crash behavior)
 
-SQL/trace span cho hai SELECT phải có cùng transaction identifier để phân biệt
-non-repeatable read với hai transactions hoàn toàn khác.
+Nếu App của A Sập Nguồn (crash) trước lúc Chốt Sổ, DB PostgreSQL dẹp mớ rác đó đi, Quyết Định không được lưu. Khỏe!
+Nếu sập Sau Khi Chốt Sổ nhưng Chưa Kịp Phản Hồi cho khách, Khách bấm nút Gửi Lại (retry). Mã ID duy nhất (`command_id`) + Cơ chế Bất biến (idempotency) lo vụ Gửi Trùng. Nhưng cái trò đó KHÔNG thể thay thế được cái "Kỷ Luật Chống Trộn Dữ Liệu" nhé!
+
+Bắt buộc Phiên Bản Luật và Số Tiền Duyệt phải được chốt cứng Đóng Đinh cùng 1 chỗ dưới Database, để có cháy rụi cái Server App thì Đội Hậu Kiểm (reconciliation) vẫn còn cái mà dò.
+
+## 17. Chạy 100 Máy Cùng Lúc (Multi-instance)
+
+Ông A chạy ở Server App Số 1, Sếp B ngồi sửa Luật ở Server App Số 2. Mấy cái bùa như `synchronized`, `ReentrantLock` hay Lưu Bộ Đệm Bằng RAM Của Server 1 hoàn toàn phế võ công với Server 2.
+
+Đồn bốt bảo vệ (Authoritative protection) Bắt Buộc phải nằm ở dưới Hầm PostgreSQL:
+
+- Thêm Bảng Lịch Sử Luật (immutable) + Khóa Ngoại (Foreign Key).
+- Điều kiện Khắt Khe Lúc Ghi (conditional write).
+- Khóa Chặn (row lock).
+- Cấp Độ Cô Lập phù hợp để diễn đạt cho trọn nghĩa.
+
+## 18. Mắt Thần Theo Dõi (Observability)
+
+In Log ra đủ các cột này:
+
+```text
+Mã_Lệnh (commandId)
+Mã_Cửa_Hàng (merchantId)
+Số_Tiền (amount)
+Phiên_Bản_Đọc (policyRevisionRead)
+Phiên_Bản_Lúc_Ghi (policyRevisionWritten)
+Quyết_Định (decisionOutcome)
+Mức_Cách_Ly_Thực_Tế (effectiveIsolation)
+Số_Lần_Thử_Lại (retryAttempt)
+```
+
+Giám sát bằng Graph các Món Ăn Chơi:
+
+- Tần suất Lệch Phiên Bản (revision mismatch) / Đếm số lần update hụt (affected-row=0).
+- Số Lượng Đứng Chờ Khóa / Thời gian Hết Hạn Khóa (`lock_timeout`).
+- Đếm số Lần văng lỗi Trùng Khớp Ổ Khóa (deadlock / serialization failure).
+- Tổng Những Cú Quyết Định Lìa Khỏi Lịch Sử.
+- Tổng Số Tiền Duyệt Trót Lọt Vượt Quá Hạn Mức Thực Tại (approved amount vượt stored evaluated limit).
+- Đo tốc độ chạy của Giao Dịch và áp lực nén lên Bể Kết Nối CSDL (connection pool pressure).
+
+Mấy cái Dấu Vết Câu Lệnh (SQL/trace span) cho 2 cú Đọc SELECT Phải Gắn Cùng Mã Giao Dịch (transaction identifier) để anh em Đội Điều Tra phân biệt được Lỗi Đọc Lại (non-repeatable read) khác với Việc Gọi Lệnh bậy bạ ở 2 Giao dịch chả liên quan gì nhau.

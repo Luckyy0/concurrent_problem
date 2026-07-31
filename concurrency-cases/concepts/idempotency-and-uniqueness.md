@@ -1,218 +1,160 @@
-# Idempotency, uniqueness và atomic claim
+# Tính lũy đẳng (Idempotency), Tính duy nhất (Uniqueness) và Xí chỗ dữ liệu (Atomic claim)
 
-## Mục đích
+## Mục tiêu
 
-Tài liệu định nghĩa vocabulary chung cho durable uniqueness, duplicate-command
-prevention và idempotency lifecycle. Mỗi case vẫn phải nêu business key, stored
-outcome, transaction boundary và loser behavior cụ thể.
+Tài liệu này giải thích các từ vựng và khái niệm chung khi bạn cần đảm bảo một thao tác chỉ được thực hiện duy nhất một lần (chống trùng lặp), và cách xử lý khi có ai đó (hoặc hệ thống khác) gửi cùng một yêu cầu (request) nhiều lần.
 
-## Thuật ngữ chính
+## Các thuật ngữ chính cần hiểu
 
-| Thuật ngữ | Ý nghĩa |
+| Thuật ngữ | Giải thích dễ hiểu |
 | --- | --- |
-| business key | Bộ field xác định một logical record, không nhất thiết là primary key |
-| unique constraint | Database rule cấm nhiều rows có cùng key |
-| atomic claim | Một write quyết định duy nhất actor sở hữu key |
-| idempotency key | Client-provided key nhận diện cùng logical command |
-| request fingerprint | Hash/canonical representation để phát hiện key bị reuse cho payload khác |
-| replay | Trả lại stored outcome thay vì chạy side effect lần nữa |
-| in-progress | Claim đã tồn tại nhưng command chưa có final outcome |
-| upsert | `INSERT ... ON CONFLICT` với no-op hoặc update semantics |
+| Khóa nghiệp vụ (`business key`) | Một hoặc vài cột ghép lại để xác định một dữ liệu duy nhất trong thực tế (không nhất thiết phải là ID chính - primary key). Ví dụ: số CCCD. |
+| Ràng buộc duy nhất (`unique constraint`) | Quy tắc cấu hình dưới Database để cấm không cho 2 dòng có chung Khóa nghiệp vụ. |
+| Xí chỗ dữ liệu (`atomic claim`) | Một thao tác ghi xuống Database nhằm tuyên bố: "Tôi là người duy nhất đang xử lý dữ liệu này". |
+| Khóa lũy đẳng (`idempotency key`) | Một mã (thường do Client gửi lên) để báo cho Server biết: "Đây vẫn là yêu cầu cũ đang gửi lại, đừng làm lại từ đầu". |
+| Dấu vân tay yêu cầu (`request fingerprint`) | Một mã băm (hash) của nội dung yêu cầu, dùng để kiểm tra xem Client có gian lận gửi nội dung khác nhưng xài lại cái mã cũ không. |
+| Phát lại (`replay`) | Khi nhận được yêu cầu trùng, thay vì chạy lại code, ta chỉ cần lôi kết quả cũ đã lưu ra trả về lại. |
+| Đang xử lý (`in-progress`) | Trạng thái báo hiệu: Yêu cầu này đã được xí chỗ, đang chạy dở dang, chưa có kết quả cuối cùng. |
+| Ghi đè hoặc thêm mới (`upsert`) | Lệnh `INSERT ... ON CONFLICT` trong SQL: Nếu chưa có thì thêm mới, nếu có rồi thì cập nhật hoặc bỏ qua. |
 
-## Uniqueness khác idempotency
+## Tính duy nhất (Uniqueness) khác Tính lũy đẳng (Idempotency) ở chỗ nào?
 
-Unique constraint trả lời:
+- Ràng buộc **Tính duy nhất** (Uniqueness) ở Database chỉ quan tâm 1 câu hỏi: *"Có được phép thêm dòng thứ 2 cho dữ liệu này không?"* (Đáp án là Không).
+- Hợp đồng **Tính lũy đẳng** (Idempotency) lại quan tâm toàn diện hơn:
+  - *"Nếu gửi trùng yêu cầu thì tôi trả về kết quả gì?"*
+  - *"Nếu gửi trùng mã (key) nhưng ruột dữ liệu (payload) bị thay đổi thì xử lý sao?"*
+  - *"Nếu lần chạy trước bị lỗi hoặc đang chạy dở thì lần này gửi lại có được chạy tiếp không?"*
 
+> **Nói ngắn gọn:** Uniqueness ngăn Database không bị đẻ thêm dòng rác; Idempotency định nghĩa cách Server ứng xử khéo léo khi Client lỡ tay bấm nút "Thanh toán" hai lần.
+
+## Đừng bao giờ kiểm tra rồi mới thêm (Check-then-Insert)
+
+Cách làm sai kinh điển của người mới (rất dễ bị lỗi khi chạy đồng thời - race condition):
 ```text
-Có tối đa một row cho business key này không?
+(1) Luồng 1 dùng SELECT hỏi Database: "Có ai dùng mã này chưa?" -> DB trả lời: "Chưa"
+(2) Cùng lúc đó, Luồng 2 cũng SELECT hỏi câu y hệt -> DB vẫn trả lời: "Chưa"
+(3) Cả hai luồng cùng đinh ninh chưa có ai dùng nên cùng gọi lệnh INSERT -> BÙM! Lỗi trùng lặp dữ liệu.
 ```
+Lý do: Lệnh `SELECT` đơn thuần không có tác dụng khóa giữ chỗ.
 
-Idempotency contract còn phải trả lời:
-
-```text
-Duplicate request nhận response nào?
-Payload khác dùng cùng key bị xử lý ra sao?
-Attempt đang chạy, failed hoặc expired được replay/retry thế nào?
-Side effects nào đã commit?
-```
-
-> **Nói ngắn gọn:** uniqueness ngăn row thứ hai; idempotency định nghĩa toàn bộ
-> hành vi của request thứ hai.
-
-## Không dùng check-then-insert làm correctness boundary
-
-Broken:
-
-```text
-SELECT exists(key) -> false
-concurrent SELECT exists(key) -> false
-INSERT row A
-INSERT row B
-```
-
-Plain SELECT không reserve absent key. Correct boundary là unique index/constraint
-hoặc atomic claim:
-
+**Cách làm đúng:** Phải dùng Ràng buộc duy nhất (Unique Constraint) tạo sẵn trong Database, hoặc lệnh xí chỗ trực tiếp (INSERT ... ON CONFLICT) của Database.
 ```sql
-insert into command_claim(scope_id, idempotency_key, status)
-values (:scopeId, :key, 'IN_PROGRESS')
-on conflict (scope_id, idempotency_key) do nothing;
+INSERT INTO command_claim(scope_id, idempotency_key, status)
+VALUES (:scopeId, :key, 'IN_PROGRESS')
+ON CONFLICT (scope_id, idempotency_key) DO NOTHING;
 ```
+Lệnh này trả về số lượng dòng bị ảnh hưởng. Ai nhận được số `1` thì người đó thắng. Nhận được số `0` nghĩa là đã có người khác xí chỗ trước. 
 
-Affected-row `1` là winner; `0` là existing claim. Mọi application instances dùng
-cùng PostgreSQL constraint nên không cần JVM-local lock cho uniqueness.
+## Thiết kế Khóa nghiệp vụ (Business key)
 
-## Business key design
+Khóa phải xác định đúng phạm vi (scope). Ví dụ:
+- Dùng `(tenant_id, external_reference)` thay vì chỉ dùng `external_reference`.
+Nếu bạn chỉ dùng mã đơn hàng làm khóa duy nhất trên toàn hệ thống (Global), có thể bạn sẽ chặn nhầm mã đơn hàng của hai công ty (tenant) khác nhau.
 
-Key phải đúng scope:
+Lưu ý khi thiết kế: Cẩn thận với chữ hoa/thường, khoảng trắng, hoặc giá trị `NULL`. (Trong PostgreSQL, nhiều giá trị `NULL` vẫn không bị coi là trùng nhau trừ khi bạn có cấu hình rõ ràng).
 
-```text
-(tenant_id, external_reference)
-(account_id, idempotency_key)
-(provider, provider_event_id)
-```
+## Ràng buộc và Chỉ mục (Constraint & Index)
 
-Một globally unique key khi business chỉ unique per tenant gây false conflicts.
-Thiếu tenant/scope lại cho phép duplicate logical records.
-
-Xác định normalization trước insert: case sensitivity, Unicode, whitespace, null
-semantics và key rotation. PostgreSQL unique constraint mặc định cho phép nhiều
-`NULL` values; dùng `NOT NULL`, expression/partial index hoặc `NULLS NOT DISTINCT`
-khi contract yêu cầu.
-
-## Constraint và index
-
-Schema migration là authority:
-
+Để cấu hình tính duy nhất cho Database, **bắt buộc phải viết lệnh SQL Migration** (như dùng Flyway/Liquibase).
 ```sql
-alter table work_item
-    add constraint uk_work_item_business
-    unique (tenant_id, external_reference);
+ALTER TABLE work_item
+    ADD CONSTRAINT uk_work_item_business
+    UNIQUE (tenant_id, external_reference);
 ```
+**Lưu ý quan trọng:** Việc đặt thẻ `@UniqueConstraint` trên đầu class Entity của Hibernate/JPA chỉ có ý nghĩa làm tài liệu cho bạn đọc. Nó **KHÔNG CÓ TÁC DỤNG** ép Database tự tạo ràng buộc ở môi trường Production. Đừng trông cậy vào Hibernate để sửa index!
 
-JPA `@UniqueConstraint` mô tả mapping/schema generation nhưng không thay migration
-đã deploy. Production startup không nên giả định Hibernate tự sửa index.
+## Database xử lý trùng lặp ra sao?
 
-Unique conflict thường có SQLSTATE `23505`. Exception mapping phải kiểm tra đúng
-constraint name/business key, không biến mọi integrity violation thành duplicate.
+Khi 2 luồng cùng lúc gọi lệnh INSERT chung một mã xí chỗ:
+- Luồng 1 chạy vào trước, nó sẽ khóa giữ chỗ mục đó.
+- Luồng 2 chạy vào sau, nó sẽ **bị treo lại, đứng chờ** Luồng 1 xử lý xong.
+- Nếu Luồng 1 lưu thành công (commit): Luồng 2 sẽ bị văng lỗi mã `23505` (Trùng lặp Unique Constraint) hoặc bị bỏ qua tùy theo logic `ON CONFLICT` của bạn.
+- Nếu Luồng 1 bị lỗi và hủy bỏ (rollback): Luồng 2 sẽ được giải phóng đi tiếp và trở thành người thắng cuộc.
 
-## PostgreSQL conflict behavior
+## Cẩn thận với bộ đệm của Spring Data JPA/Hibernate
 
-Hai concurrent INSERTs cùng unique key có thể phải chờ transaction đang sở hữu
-conflicting index entry:
+Lệnh `repository.save(entity)` thường chỉ lưu tạm dữ liệu vào bộ đệm của Java (Persistence Context), chưa hề chạy câu lệnh SQL INSERT xuống Database. 
+Chỉ khi bạn dùng `saveAndFlush()` hoặc giao dịch thực sự kết thúc (commit), lệnh SQL mới bắn xuống Database và lỗi trùng lặp mới xảy ra.
 
-- winner commit: loser nhận unique violation hoặc `ON CONFLICT` outcome;
-- winner rollback: waiter có thể tiếp tục và trở thành winner;
-- lock timeout/deadlock: current transaction rollback/fail theo database rules.
+**Lưu ý cực kỳ quan trọng:** Nếu Database đã báo lỗi trùng lặp (SQLSTATE 23505), toàn bộ giao dịch (Transaction) của Spring đó đã bị hỏng (rollback-only). Bạn **không thể** dùng khối `try-catch` bắt lỗi đó lại, rồi hồn nhiên gọi lệnh `SELECT` tiếp ở ngay bên trong giao dịch đó. 
+Nếu muốn bắt lỗi và đọc lại dữ liệu, bạn phải tách việc "lưu thử" (insert attempt) và việc "đọc lại kết quả cũ" ra thành các giao dịch riêng biệt.
 
-Unique check và row visibility không đồng nhất. Ở `READ COMMITTED`,
-`ON CONFLICT DO NOTHING` có thể skip do conflict rồi SELECT statement sau mới thấy
-winner đã commit.
+## Các lựa chọn khi gặp xung đột (`ON CONFLICT`)
 
-## JPA/Hibernate flush boundary
+### `DO NOTHING` (Bỏ qua)
 
-`save()` có thể chỉ đưa entity vào persistence context. Unique violation xuất hiện
-khi flush hoặc commit:
-
-```java
-repository.saveAndFlush(entity);
-```
-
-Sau SQLSTATE `23505`, PostgreSQL transaction đã abort; Spring transaction thường
-rollback-only. Không catch exception rồi query existing row trong cùng physical
-transaction.
-
-Tách:
-
-1. insert attempt trong transaction riêng;
-2. catch/mapping ở outer non-transactional coordinator;
-3. read/replay existing result trong transaction mới.
-
-## `ON CONFLICT` choices
-
-### `DO NOTHING`
-
-Phù hợp cho claim:
-
+Rất thích hợp khi bạn dùng lệnh xí chỗ (claim):
 ```sql
-insert ... on conflict (scope_id, key) do nothing
-returning claim_id;
+INSERT ... ON CONFLICT (scope_id, key) DO NOTHING
+RETURNING claim_id;
 ```
+Nếu có `claim_id` trả về nghĩa là bạn đã thắng (xí chỗ thành công). Nếu trả về rỗng, bạn là người thua vì đã có người đến trước.
 
-Returned ID có value là winner; empty là loser.
+### `DO UPDATE` (Cập nhật đè)
 
-### `DO UPDATE`
+Chỉ dùng cách này khi bạn THỰC SỰ có nhu cầu lấy dữ liệu mới trộn lẫn (merge) với dữ liệu cũ. 
+Tuyệt đối không dùng lệnh cập nhật giả (no-op) chỉ để ép Database trả về cái ID. Việc này sẽ tạo ra hàng loạt bản nháp (tuple) vô dụng, gây nhiễu log hệ thống và làm Database phình to (bloat). Đặc biệt lưu ý: Đừng bao giờ lấy dữ liệu bị trùng lặp ghi đè lên lịch sử nội dung yêu cầu (fingerprint) ban đầu.
 
-Chỉ dùng khi duplicate thật sự có merge/update semantics. No-op update chỉ để lấy
-ID có thể tạo tuple version, trigger/audit noise và bloat. Đừng overwrite original
-fingerprint/response bằng payload duplicate.
+## Vòng đời của một bản ghi Idempotency (Idempotency lifecycle)
 
-## Idempotency lifecycle
-
-Một durable idempotency record thường cần:
-
+Một bảng lưu thông tin Idempotency bền vững thường cần các cột:
 ```text
-scope/key
-request fingerprint
-status: IN_PROGRESS | SUCCEEDED | FAILED
-resource/response reference
-created_at, completed_at, expires_at
-owner/attempt metadata nếu recovery cần
+scope/key: Khóa phân loại và mã xí chỗ
+request fingerprint: Dấu vân tay để đối chiếu nội dung gửi
+status: Trạng thái (IN_PROGRESS | SUCCEEDED | FAILED)
+resource/response reference: Lưu lại kết quả để sau này dùng lại (replay)
+created_at, completed_at, expires_at: Mốc thời gian
+owner/attempt metadata: Lưu thông tin ai đang xử lý để phục vụ cứu hộ (recovery)
 ```
 
-Contract phải định nghĩa:
+Hợp đồng (Contract) code của bạn bắt buộc phải định nghĩa rõ cách xử lý cho các trường hợp:
+- Gửi trùng key + trùng dấu vân tay.
+- Gửi trùng key + NHƯNG khác dấu vân tay (gian lận).
+- Bị trùng khi trạng thái vẫn đang là `IN_PROGRESS`.
+- Phân biệt lỗi có thể thử lại (retryable) và lỗi chết hẳn (terminal failure).
+- Cách lưu trữ và dựng lại kết quả cũ (response reconstruction).
+- Hạn sử dụng (expiry), dọn dẹp (cleanup) và gửi lại quá trễ (late retry).
+- Sập nguồn ngay giữa lúc xí chỗ và lúc lưu dữ liệu.
 
-- cùng key + cùng fingerprint;
-- cùng key + khác fingerprint;
-- duplicate khi `IN_PROGRESS`;
-- retryable versus terminal failure;
-- response storage/reconstruction;
-- expiry/cleanup và late retry;
-- crash giữa claim, side effect và completion.
+**Mẹo:** Lệnh xí chỗ và lệnh lưu dữ liệu thật nên được gộp chung vào một giao dịch (transaction) nếu dùng chung Database. Nếu gọi qua hệ thống khác, bạn phải dùng các kỹ thuật riêng như Inbox/Outbox hoặc luồng công việc (Workflow).
 
-Claim và database side effect nên commit cùng transaction khi cùng database.
-Cross-system side effects cần inbox/outbox/workflow semantics riêng.
+## Xử lý sự cố và cứu hộ (Failure và recovery)
 
-## Failure và recovery
+Khi có sự cố xảy ra, đây là cách hệ thống nên hoạt động:
+- **Lệnh xí chỗ (insert claim) bị hoàn tác (rollback):** Key đó coi như chưa có ai sở hữu, người khác có thể vào lấy.
+- **Người thắng cuộc sập nguồn trước khi lưu (commit):** Người đang đứng chờ (waiter) sẽ được hệ thống cho phép đi tiếp.
+- **Người thắng cuộc lưu xong nhưng kết quả báo về bị mất mạng:** Lần sau Client gửi lại (duplicate), Server chỉ cần lôi kết quả đã lưu ra trả về.
+- **Yêu cầu bị kẹt mãi ở trạng thái `IN_PROGRESS`:** Cứu hộ bằng cách dựa vào trạng thái đã lưu, thời gian quá hạn (timeout) và quyền sở hữu (owner). Đừng bao giờ viết code xóa các lệnh xí chỗ này một cách mù quáng.
+- **Dọn dẹp (Cleanup):** Chỉ xóa dữ liệu xí chỗ khi thời hạn cho phép lưu trữ (retention window) đã hết.
 
-- Insert claim rollback: key chưa được sở hữu.
-- Winner crash trước commit: waiter có thể tiếp tục.
-- Winner commit nhưng response lost: duplicate đọc stored outcome.
-- Attempt stuck `IN_PROGRESS`: recovery dựa trên durable state, timeout và owner
-  semantics; không xóa claim mù quáng.
-- Cleanup: chỉ xóa khi retention/business replay window cho phép.
+## Kiểm thử (Testing)
 
-## Testing
+Khi viết bài kiểm thử cho Database bằng PostgreSQL Testcontainers, bạn phải đảm bảo có đủ các kịch bản:
+1. Dùng 2 kết nối (connections) cùng lúc gửi chung một mã business key.
+2. Dùng chốt (latch) để điều khiển chính xác thứ tự ai chạy trước, ai commit, ai rollback.
+3. Đảm bảo cuối cùng chỉ có đúng 1 dòng dữ liệu tồn tại.
+4. Kiểm tra đúng kết quả trả về cho người thắng và người thua.
+5. Kiểm tra cảnh người thua phải đứng chờ người thắng commit, và chờ người thắng rollback.
+6. Kiểm tra đúng tên Ràng buộc (constraint name) và mã lỗi SQLSTATE (ví dụ 23505).
+7. Mọi hàm chờ (futures/waits) đều phải có thời gian tối đa (bounded timeout).
 
-PostgreSQL Testcontainers test cần:
+## Theo dõi hệ thống (Observability)
 
-1. two connections cùng attempt exact business key;
-2. start/commit/rollback order được điều phối bằng latch;
-3. assert one durable row;
-4. assert winner/loser domain outcomes;
-5. kiểm tra loser chờ winner commit và winner rollback;
-6. kiểm tra constraint name/SQLSTATE mapping;
-7. mọi futures/waits bounded.
-
-## Observability
-
-Theo dõi:
-
+Nên thiết lập các chỉ số (metric) để theo dõi các sự kiện sau:
 ```text
-claim.created
-claim.duplicate
-claim.payload_mismatch
-claim.in_progress
-claim.replayed
-unique_violation_by_constraint
-claim_wait_duration
-stuck_claim_age
+claim.created (Tạo mới thành công)
+claim.duplicate (Gửi trùng lặp)
+claim.payload_mismatch (Gửi trùng nhưng sai nội dung vân tay)
+claim.in_progress (Đang xử lý)
+claim.replayed (Phát lại kết quả cũ)
+unique_violation_by_constraint (Báo lỗi vi phạm khóa duy nhất)
+claim_wait_duration (Thời gian phải đứng chờ khóa)
+stuck_claim_age (Thời gian bị kẹt quá lâu)
 ```
 
-Không log raw idempotency keys/payload nếu chúng chứa secrets hoặc personal data;
-dùng scoped hash/correlation ID phù hợp.
+**Lưu ý bảo mật:** Tuyệt đối không in nguyên văn mã xí chỗ (idempotency keys) hoặc nội dung (payload) ra log nếu chúng chứa mật khẩu hay dữ liệu cá nhân. Hãy dùng chuỗi mã hóa (hash) hoặc mã định danh (correlation ID) phù hợp.
 
-## Liên kết
+## Liên kết tài liệu tham khảo
 
 - [DB-006 — Unique constraint concurrency](../postgresql/unique-constraint-concurrency/README.md)
 - [Concurrency testing](concurrency-testing.md)

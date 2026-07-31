@@ -1,318 +1,259 @@
-# Phân tích SSI, `40001` và transaction retry
+# Khám Bệnh Đứt Mạch SSI, Đòn Đau `40001` Và Tuyệt Chiêu Hồi Sinh (Transaction retry)
 
-## Trạng thái ban đầu
+## 1. Điểm Xuất Phát (Trạng thái ban đầu)
 
 ```text
-merchant 7 limit             = 100
-committed ACTIVE total       = 60
-C1 requested amount          = 30
-C2 requested amount          = 30
+Trần số đo (limit) của bác merchant 7 = 100
+Tiền cọc ACTIVE đã chốt ném vào (committed) = 60
+Thằng C1 đòi nã = 30
+Thằng C2 cũng ngoạm = 30
 ```
 
-T1 và T2 đều chạy `SERIALIZABLE`, mỗi actor có connection, transaction,
-persistence context và command ID riêng.
+Hai đứa T1 và T2 đều lôi bộ giáp `SERIALIZABLE` ra mặc. Mỗi ông tự mang theo ống thở (connection), bong bóng giao dịch (transaction), cái hộp phép nháp (persistence context) và tờ thẻ bài phân thân (command ID) riêng biệt nhau nhé.
 
-## Timeline bắt buộc
+## 2. Đường Ray Tử Mệnh Phải Bước (Timeline bắt buộc)
 
-| Bước | T1 — C1 | T2 — C2 |
+| Nhịp (Bước) | Bác T1 — Xách Lệnh C1 | Bác T2 — Xách Lệnh C2 |
 | ---: | --- | --- |
-| 1 | `BEGIN SERIALIZABLE` | `BEGIN SERIALIZABLE` |
-| 2 | không thấy decision C1 | không thấy decision C2 |
-| 3 | đọc limit `100`, active total `60` | |
-| 4 | | đọc limit `100`, active total `60` |
-| 5 | quyết định `60 + 30 <= 100` | quyết định `60 + 30 <= 100` |
-| 6 | insert reservation C1 | insert reservation C2 |
-| 7 | insert decision `ACCEPTED` | insert decision `ACCEPTED` |
-| 8 | flush/commit | flush/commit |
-| 9 | ví dụ commit thành công | nhận `40001`, rollback |
-| 10 | active total thành `90` | fresh retry đọc `90`, ghi `REJECTED` |
+| 1 | Bật Máy Bơm `BEGIN SERIALIZABLE` | Cắm Ống Bơm `BEGIN SERIALIZABLE` |
+| 2 | Móc túi đéo thấy án mạng C1 cũ | Soi ví đéo thấy lịch sử C2 cũ |
+| 3 | Đo trần `100`, đếm tổng active `60` | |
+| 4 | | Vén váy đếm trần `100`, tổng active `60` |
+| 5 | Gật gù phán: `60 + 30 <= 100` Ngon! | Vỗ tay chốt: `60 + 30 <= 100` Xúc! |
+| 6 | Nặn cục cọc nháp reservation C1 | Bơm cục cọc nháp reservation C2 |
+| 7 | Viết thẻ xăm phán `ACCEPTED` | Kéo tờ lịnh `ACCEPTED` |
+| 8 | Bấm dội bùn / Xả chốt (flush/commit) | Bấm dội bùn / Xả chốt (flush/commit) |
+| 9 | (Ví dụ) Thoát cửa sướng Commit Dính | Lãnh 1 nhát súng `40001`, cuộn vỡ mồm (rollback) |
+| 10 | Đẩy tổng active trồi lên móc `90` | Trẻ trâu hồi sinh fresh retry đong vội được `90`, sợ té đái ghim thẻ `REJECTED` |
 
-PostgreSQL có thể abort T1 thay vì T2, và failure có thể lộ ra trước `COMMIT`.
-Correct code/test không phụ thuộc victim identity hay exact Java line ném lỗi.
+Ông Cảnh Sát PostgreSQL có quyền nã súng bốc hơi (abort) thằng T1 thả thằng T2 cũng được, chả có gì cấm. Lệnh bắn cũng có thể phát nổ ngay từ trước khi mày rặn nút `COMMIT`! Trình viết code/test chuẩn bài (correct) đéo bao giờ đi đánh đu đo độ hên xui coi "Ai chết - Ai sống" hay là soi cái Lỗi nó văng ra trúng ngay dòng Java số mấy đâu nhen nhóc!
 
-> **Nói ngắn gọn:** SSI không chọn sẵn “request thứ hai” làm loser; nó chỉ bảo
-> đảm tập transaction đã commit có một serial order hợp lệ.
+> **Sếp chốt lại:** Tấm lưới SSI không hề thiên vị đánh dấu "Đứa tới sau ráng chịu" làm con rối loser; Nó chỉ cần giữ đinh một điều: Tổng đàn transaction đã nhét trót (commit) phải khớp nhau chạy thẳng thành một vạch đẹp trật tự đàng hoàng (serial order hợp lệ).
 
-## Kết quả mong đợi và thực tế
+## 3. Mơ Đẹp Và Hiện Thực Vỡ Mộng (Kết quả mong đợi và thực tế)
 
-| Khía cạnh | Đúng | Broken |
+| Trạm Đo (Khía cạnh) | Sạch Mịn Màng (Đúng) | Sứt Mẻ Tùy Tùng (Broken) |
 | --- | --- | --- |
-| Invariant | Final active total `90` | `40001` leak hoặc retry sai |
-| C1/C2 | Một `ACCEPTED`, một `REJECTED` sau retry | Một command mất outcome |
-| Attempt lỗi | Rollback toàn bộ | Application cố tiếp tục trên `25P02` |
-| Snapshot | Fresh transaction thấy winner | Reuse snapshot vẫn thấy `60` |
-| Side effect | Chỉ publish từ committed decision | Attempt aborted đã gửi notification |
+| Lưới Luật (Invariant) | Chốt mốc active cuối = `90` | Máu lỗi `40001` trào tung toé hoặc rặn retry xé ngõ (retry sai) |
+| Lệnh C1/C2 | Một thẻ `ACCEPTED`, một cái vé `REJECTED` sau khi tái tạo | Một đứa command tụt hố mất tiêu số phận (mất outcome) |
+| Trạm Nạn Nháp (Attempt lỗi) | Bể sạch sẽ tuột về đáy (Rollback toàn bộ) | App lỳ lợm đi cắm tiếp trên cái sình lầy vỡ `25P02` |
+| Bảng Cóp Ảo (Snapshot) | Mở màng tươi mới rà ngay ra bóng Thằng Chốt Ván (winner) | Cứ bám cái giẻ rách nháp cũ soi mãi số `60` |
+| Vết Loang Lực (Side effect) | Chỉ đẩy loa phát cho quyết định đã chốt dính commit | Thằng chết đứt aborted lại đi khua loa bắn notification ẩu! |
 
-Nếu dùng `READ COMMITTED` hoặc `REPEATABLE READ` cho cùng read/write shape, cả hai
-distinct inserts có thể commit và đưa total lên `120`; không có same-row lost
-update để tự phát hiện.
+Bảo kê! Nếu tụi bay xách mền `READ COMMITTED` hoặc `REPEATABLE READ` nhét qua cho cái đám đo/sửa này, 2 ổ đẻ C1 C2 đều lọt commit tuốt, kéo cái tổng lủng trần bay lên mịa `120` cmnl! Méo có vụ đè sửa lộn mâm same-row lost update để tụi bay tự tỉnh phát hiện lỗi đâu nha!
 
-## Snapshot của `SERIALIZABLE`
+## 4. Dấu Ánh Tích Tịch Của Kẻ Cao Thủ `SERIALIZABLE` (Snapshot của `SERIALIZABLE`)
 
-PostgreSQL `SERIALIZABLE` đọc stable transaction snapshot giống nền tảng
-snapshot isolation. T1 không tự thấy C2 insert và T2 không tự thấy C1 insert trong
-snapshot của mình.
+Chiêu `SERIALIZABLE` của PostgreSQL kéo giãn ra 1 màng nháp ổn định (stable transaction snapshot) hệt như món nền cơ bản snapshot isolation. Chú T1 đéo thấy đống cặn C2, và T2 cũng mù mờ chẳng dòm ra hũ cứt C1 trong màng soi của mình.
 
-Khác biệt quan trọng là SSI còn theo dõi dependency để ngăn committed history
-không thể serialize. Nó không biến mọi predicate read thành blocking lock và
-không làm hai transaction tự chạy tuần tự.
+Điểm thét lọt màng của SSI là nó có con mắt thần soi đường nối (dependency) để chặn đám đã thành mâm (committed history) KHÔNG THỂ trượt ray bừa bãi. Bác ổng KHÔNG hề lấy mọi cú soi lỗ khóa gông lại (predicate read thành blocking lock) và chả ép 2 thằng transaction tự lết bò theo hàng dọc (tuần tự) đâu!
 
-Dữ liệu đọc trong một serializable transaction chỉ được xem là kết quả hợp lệ sau
-khi transaction commit. Một result object đã được Java method tạo vẫn chưa phải
-durable outcome nếu commit advice chưa hoàn tất.
+Khối cặn mày đọc trong 1 giao dịch serializable chỉ được vinh danh là đồ chốt hợp lệ SAU KHI chú mày ghim sập nút búa commit thành công. Cái cục Java Result lôi lên trên tay vẫn là đồ ẢO chừng nào mâm commit advice chưa phán xong nhé!
 
-## `SIReadLock` và predicate tracking
+## 5. Mảnh Xích Hút Báo Tín `SIReadLock` (Và theo dõi predicate)
 
-Khi hai transactions chạy `SUM ... WHERE merchant_id=7 AND status='ACTIVE'`,
-PostgreSQL ghi nhận vùng dữ liệu đã đọc bằng predicate locks. Trong `pg_locks`,
-chúng có mode `SIReadLock` và có thể ở tuple, page hoặc relation granularity tùy
-query plan và lock promotion.
+Khi hai phe đâm rạch gọi `SUM ... WHERE merchant_id=7 AND status='ACTIVE'`, Trùm Sò PostgreSQL dán mác xăm đánh dấu bãi đất vừa hóng bằng chốt xích vùng (predicate locks). Xuống rạp `pg_locks`, tụi nó khoác mác `SIReadLock` rải đều kích cỡ từ tép tuple, đến cuốn page hay cả mớ relation rần rần tùy hứng cái plan lôi súng đếm và bùa lock promotion của DB nhen.
 
-Các lock này:
+Đám xích ma này:
 
-- không block writer như `FOR UPDATE`;
-- dùng để nhận biết write nào có thể làm thay đổi kết quả read trước đó;
-- có thể được giữ sau commit cho tới khi overlapping read-write transactions kết
-  thúc;
-- có thể coarse hơn dự kiến nếu sequential scan hoặc predicate-lock memory
-  pressure xảy ra.
+- CHẢ THÈM bắt giặc chặn cửa bọn viết (writer) đứt cổ như `FOR UPDATE` đâu;
+- Chỉ dùng để rà đèn xem cú ghi (write) nào dám làm lem luốc cái vùng mà tao vừa đọc hồi nãy;
+- Có khi còn ráng neo giữ dù đã sút búa commit, nén hơi nhịn tới lúc phe đám đâm thọc (overlapping read-write) tụt sạch;
+- Coi chừng nó còn trùm lọt ra to đùng oái ăm (coarse hơn dự kiến) nếu nẹt ga sequential scan hoặc bộ nhớ nhồi nén predicate-lock kẹt cứng họng (memory pressure)!
 
-Vì `SIReadLock` không blocking, `lock_timeout` không phải công cụ contain SSI
-serialization conflict. Application deadline và bounded retry mới giới hạn tổng
-thời gian.
+Do `SIReadLock` ĐÉO Xích Họng Đứng Chờ (không blocking), đừng có điên lấy cái súng báo giờ `lock_timeout` vô làm công cụ nhốt vòng xoáy xé lộn SSI nhen! Lấy dây nịt Hẹn Giờ Bọn Cử Ứng (Application deadline) với Vòng Lặp Tái Sinh Có Giới Hạn (bounded retry) mới khóa chặt tổng thời gian được!
 
-## Read/write dependencies
+## 6. Sợi Dây Chằng Chéo Đọc/Ghi (Read/write dependencies)
 
-Ký hiệu `Treader --rw--> Twriter` nghĩa là reader đã đọc state không gồm write
-của writer, trong khi write đó ảnh hưởng predicate/version đã đọc.
+Kẻ nháp: Ký hiệu `Treader --rw--> Twriter` nghĩa là Mắt Kính Đọc của Mày đã lướt bãi trống trơn mà đéo thấy món cặn bẩn Thằng Kia Ghi, TRONG KHI món rác cặn Thằng Ghi Bắn ra lại vọt bắn trúng tung phét cái mảng vùng (predicate/version) Mày vừa ngắm lúc nãy!
 
-Trong case:
+Ở rạp này:
 
 ```text
-T1 reads active predicate --rw--> T2 inserts C2 into that predicate
-T2 reads active predicate --rw--> T1 inserts C1 into that predicate
+T1 rà vạch active --rw--> T2 nhét kẹp C2 rọt vào vạch đó
+T2 rà vạch active --rw--> T1 nhét tụ C1 ọt thẳng vào vạch đó
 ```
 
-Hai cạnh tạo cycle trực tiếp. Tổng quát hơn, SSI tìm **cấu trúc nguy hiểm**
-(`dangerous structure`) gồm các rw-conflicts kề nhau có thể nằm trong
-serialization cycle. PostgreSQL có thể abort để giữ an toàn ngay cả khi
-application không thấy một blocking lock wait.
+Cả 2 sợi quất nối thành vòng lặp thắt cổ (cycle trực tiếp). Mở rộng hẹp ra, bộ SSI sẽ mò lượn rà bắt "**Lực lượng Nguy Hiểm**" (`dangerous structure`) ôm gọn cái ổ lộn RW-conflicts nách chéo mâm rình đẻ nọc độc (serialization cycle). PostgreSQL nó ỤC súng bắt mày héo cuộn luôn (abort) để dập lửa ngay tắp lự cho dù hệ Application mày ÉO hề cảm thấy cái ngáp chờ khựng nào (blocking lock wait) đâu nha cưng!
 
-Đây không phải deadlock:
+Trò Này KHÔNG PHẢI Deadlock Đâu:
 
-| SSI serialization conflict | Lock deadlock |
+| Ngộp Khó Thở Của SSI (serialization conflict) | Tắc Cửa Khóa Gông Bất Tử (Lock deadlock) |
 | --- | --- |
-| Dependency giữa snapshot reads và writes | Wait-for cycle trên incompatible locks |
-| `SIReadLock` không block writer | Actor thực sự chờ lock |
-| SQLSTATE `40001` | SQLSTATE `40P01` |
-| Có thể lộ ở statement/commit | Detector phá lock wait cycle |
-| Cả hai cần fresh whole-transaction retry khi policy cho phép | Cần canonical lock order ngoài retry |
+| Lưới dính lộn dây giữa snapshot reads và writes | Đâm đầu kẹp họng chết vòng wait-for trên mấy cái mỏ neo incompatible locks |
+| Súng xăm `SIReadLock` đéo cản họng writer | Các ông giằng co chờ cái ổ khóa buông (Actor thực sự chờ lock) |
+| Vọt lỗi rách áo SQLSTATE `40001` | Lòi máu họng SQLSTATE `40P01` |
+| Có thể tung toé hở tại chóp statement/commit | Thần Detector trảm đứt rạch gãy móc xích phá chờ (phá lock wait cycle) |
+| Tụi bay nát thây đều cần LỘT XÁC RÃ TRỌN whole-transaction VÁ LẠI MỚI TOANH khi được cho phép | Thằng kia cần lôi đầu ra chỉnh trật tự nắn khoá (canonical lock order) nằm rạch ra trước chứ chưa bàn chuyện retry |
 
-## Vì sao loser phải chạy lại toàn bộ logic?
+## 7. Sao Thằng Thua Lỗ Phải Đập Đổ Nhảy Xóa Đánh Trận Mới Từ Đầu? (Vì sao loser phải chạy lại toàn bộ logic?)
 
-Attempt đầu đã quyết định dựa trên `active=60`. Sau winner commit, current state là
-`90`. Chỉ chạy lại `INSERT` sẽ vẫn dùng decision/value cũ và phá invariant.
+Lượt nặn đầu mày chốt nháp dính mỏ con số `active=60`. Sau khi thằng Thắng cướp cò (winner commit), mớ số lật vèo lên `90`. Mày mà chỉ lôi hàm `INSERT` móc ra nện thì xài trúng cục dẻ rách quyết định/giá trị xịt cũ gãy mẹ sườn nhà invariant chứ còn gì.
 
-Fresh attempt phải thực hiện lại:
+Làm lại đợt Mới phải xả lật chẻ bài thế này:
 
 ```text
-check durable command decision
-→ load limit
-→ recompute active predicate
-→ compare requested amount
-→ write ACCEPTED/REJECTED decision
-→ commit
+khám coi có đứa nào nắn phán quyết bền chưa
+→ đếm vét lại cái trần limit
+→ quét rờ tính lại tổng kho active predicate
+→ cạ so mâm số đòi yêu cầu (requested amount)
+→ viết xăm giấy phán ACCEPTED/REJECTED
+→ sập búa commit
 ```
 
-PostgreSQL không tự retry vì database không biết application logic nào đã chọn
-SQL, values hoặc external actions. Whole-transaction retry là responsibility của
-caller/coordinator.
+PostgreSQL đéo thèm rảnh đi vớt tự dọng (retry) dùm mày, vì máy chủ nó chả biết bộ óc code App mày mò mẫm bắt sql/chọn số nào hay nặn vút external actions mẻ gì. Rút Ván Đánh Xé Lại Toàn Đội Giao Dịch (Whole-transaction retry) là vác nặng đít của thằng gọi đầu (caller) / anh cầm nhịp (coordinator)!
 
-## Transaction failed state
+## 8. Hố Sập Giao Dịch Thối (Transaction failed state)
 
-Khi statement/commit trả `40001`:
+Khi súng nổ khạc đứt Statement/Commit vãi ra cục `40001`:
 
-- attempted writes không commit;
-- transaction không được dùng tiếp;
-- query tiếp theo trước rollback thường trả `25P02`;
-- Spring proxy phải rollback rồi đóng/return connection;
-- managed entities/result từ attempt không được dùng làm source cho retry.
+- Mớ cặn vừa nặn attempted writes tụt lột không thể dính mâm commit;
+- Cuộn giao dịch dính chàm đéo được ngó ngàng lôi ra xài nữa;
+- Mày đâm thọc quất query tiếp mà chả gỡ rollback thì auto lãnh thẹo `25P02` (doomed transaction);
+- Bóng Proxy Spring bị ép giựt bùn sập rollback rồi ném trả chốt thòng lọng connection đi đóng mâm;
+- Đám thực thể Managed entities hay đống cặn Result vương vãi từ cú té KHÔNG THỂ bứng mót làm đòn khởi cho cú Đấm Lại được nhé!
 
-`EntityManager.clear()`, savepoint hoặc bắt exception bên trong method không tạo
-physical transaction mới. Backoff phải chạy sau rollback, bên ngoài transaction,
-để không giữ connection/SIREAD tracking của attempt cũ.
+Vung chiêu gạt nháp `EntityManager.clear()`, đánh rạch ghim Savepoint hay bao kén Catch rớt ngầm rờ rờ chui bên TRONG hàm đéo hề đẻ bọc physical transaction tươi mới nào nhen! Chuyện Lui Bước Ngáp Chờ (Backoff) Phải Trượt Sau Lúc Lăn Xả Bùn Rollback, nhảy hẳn RA NGOÀI Vòng Transaction, để không còn ôm trói sợi tơ connection/Mác Soi SIREAD ngậm máu của cựu kiếp cũ oái oan!
 
-## Nơi conflict có thể xuất hiện
+## 9. Ngõ Nứt Gãy Conflict Đục Xuất (Nơi conflict có thể xuất hiện)
 
-Hibernate có thể gửi SQL ở nhiều thời điểm:
+Rạp kén Hibernate nó hay phọt lén SQL dọng db lắm kiểu lắm:
 
-- repository query có thể trigger auto-flush;
-- explicit `flush()` có thể nhận `40001`;
-- transaction commit flushes pending changes;
-- PostgreSQL có thể phát hiện serialization conflict khi xử lý statement hoặc
-  lúc transaction kết thúc.
+- gọi lệnh cào repository query lòi chực nổ tự dội phân (auto-flush);
+- Móc vút bóp nổ explicit `flush()` ăn gạch đá nổ `40001`;
+- Véo cú sập Transaction commit nó nắn đâm mớ rác pending changes đi;
+- PostgreSQL thì chốt cú vồ đục khét serialization conflict lúc dòm đang bốc statement hoặc canh cửa tàn canh transaction mới báo án!
 
-Vì vậy coordinator catch exception từ lời gọi **qua transactional proxy**, không
-chỉ catch quanh một repository call. Classifier traverse cause chain để tìm
-`SQLException#getSQLState() == "40001"`; message text và Spring wrapper class
-không phải contract bền vững bằng SQLSTATE.
+Vì thế, anh Coordinator Thượng Điền phải buông lưới catch ôm trọn sập bóng móc gọi **QUA SÀNG Tường Proxy Transactional**, CHỨ ĐÉO phải khép nắp chụp lòi tĩ quanh nhõn 1 chỗ gọi hàm repository call. Lão Bắt Án (Classifier) lướt dọc rễ Cause Chain tít tới xương chót tìm cho ra bóng ma `SQLException#getSQLState() == "40001"`; chứ đem so chuỗi chữ Message Text hay Bọc Wrapper Của Lão Spring thì rạch nát độ lủng gãy lừa lọc đéo thể đanh thép sỏi bằng cái lõi hạch SQLSTATE đâu nhóc!
 
-## Effective isolation trong Spring
+## 10. Trói Áo Lưới Cho Spring Hợp Mạng (Effective isolation trong Spring)
 
-`@Transactional(isolation = Isolation.SERIALIZABLE)` chỉ được áp dụng khi
-transaction manager bắt đầu physical transaction mới:
+Áo nhãn bùa `@Transactional(isolation = Isolation.SERIALIZABLE)` chỉ thực thi phép mầu khi bộ Manager giăng thét tạo 1 bọc Giao dịch vật lý mới (physical transaction):
 
-- call phải đi qua Spring proxy;
-- inner `REQUIRED` join outer transaction đã có, không nâng isolation;
-- self-invocation bỏ qua advice;
-- `DEFAULT` dùng datasource/database default;
-- test có outer transaction có thể che mất boundary thật.
+- Cú chọc hàm PHẢI đi xuyên tròng mặt áo Spring Proxy;
+- Ruột lồng lệnh xé cúc `REQUIRED` chui tụt lấn cướp dồn sập bóng mâm Outer transaction cũ kĩ đã bật, đéo tự ngóc Áo Lưới cách ly vọt lên (không nâng isolation);
+- Trò tự xử (Self-invocation) sút bay màu bóng Lệnh Tụ (Advice);
+- Ngâm ngó Mũ `DEFAULT` ăn bám gầm đít Datasource/Database default;
+- Lớp Test mà trùm mền outer transaction nó nuốt che sạch boundary áo chiến thật thì tạch cmn soi!
 
-Mỗi integration test cần query:
+Tốt nhất chắp tay kéo mỗi integration test tọng query khám:
 
 ```sql
 select current_setting('transaction_isolation');
 ```
 
-và assert `serializable` bên trong attempt.
+Xong assert rạch ròi thấy mặt bóng `serializable` lót trong cái cũi mâm Lượt Ốp nhé!
 
-## Commit, rollback và retry outcomes
+## 11. Bến Cuối Lệnh Nháp (Commit, rollback và retry outcomes)
 
-### Winner commit
+### Đứa Cầm Cúp Sống Thọ (Winner commit)
 
-Reservation và command decision của winner commit atomically. `SIReadLock` có thể
-còn được giữ nội bộ cho dependency tracking tới khi overlapping transactions
-kết thúc; không được xem đó là leaked blocking lock.
+Bọc cọc Reservation và tờ phán Command Decision của đứa sống chốt đinh ngầm gộp dính ngắc (atomically). Bóng mác `SIReadLock` vẫn có thể kìm lún lén giấu trọ ở rốn ruột Database để soi mạch dependency tracking tới khi tụi rễ chằng (overlapping transactions) cút sạch; Đừng có hở ra la lối lu loa "Ối cha ôi Lộ Khóa Dây Bám Đít (leaked blocking lock) Rồi!" nhen!
 
-### Victim rollback
+### Bại Tướng Đổ Sụp (Victim rollback)
 
-Reservation/decision của victim biến mất. Nếu không retry, API phải trả
-temporary failure rõ ràng; không được báo `ACCEPTED`.
+Bọc cọc Reservation/Tờ phán hụt của đứa tử sĩ sẽ trôi dạt vô hư vô (biến mất). Nếu đéo làm cú lật mặt Đấm Lại (retry), cái mõm API mày trả về bắt buộc văng lòi Cáo Trạng Rớt Lực Cục Bộ (temporary failure) Rành Rẽ Bọc Mõm; ĐÉO ĐƯỢC mớ miệng láo xạo chém "Tao DUYỆT (ACCEPTED)" nhé!
 
-### Fresh retry
+### Ván Tái Đấu Tươi Rói (Fresh retry)
 
-Retry giữ nguyên command ID, mở snapshot mới, thấy active total `90` và commit
-decision `REJECTED`. Business rejection không được retry tiếp.
+Bọc Lại ôm vạch ngực tờ Command ID bọc cũ, xé niêm kén Bảng Nháp (snapshot) mới bóng loáng, đong ngắm quả kho active total đội lên `90` và nắn đập sập commit án cút thẻ `REJECTED`. Cái Lỗi cự tuyệt Bọn Trụ Phép Business (Business rejection) KHÔNG Được kéo lôi xài Đấm Lại Ổ Cứt đó hôi tiếp!
 
-### Retry exhaustion
+### Mỏi Hơi Tuột Dây (Retry exhaustion)
 
-Sau attempt cap/deadline, coordinator trả `LimitContentionException` hoặc một
-stable retry-later outcome. Không transaction dở dang nào được để lại. Caller có
-thể query command ID trước khi quyết định retry ở tầng ngoài.
+Rớt ngáp sau chạm giới Tụ Đỉnh Kéo Hẹn Cáp Đứt Mạch (attempt cap/deadline), Cáo Lệnh Trưởng Coordinator phải buông gươm ói lỗi `LimitContentionException` hay bung rèm cáo phán 1 cái thẻ gãy-chờ-sau-nhé (stable retry-later outcome). TUYỆT MỆNH KHÔNG chừa chắp vá vứt 1 đuôi Transaction rỉa rách tươm máu đít nằm đó mụ mị. Người Xưng Giục (Caller) bóc mẻ móc soi cái the Command ID soi xem có rặn kéo cú đập Tầng Ngoại Lai Không Cũng Ổn Á!
 
-## Idempotency và ambiguous outcome
+## 12. Dán Rễ Lì Lợm Và Đứa Con Bơ Vơ Mất Báo Động (Idempotency và ambiguous outcome)
 
-`40001` là known abort: attempt không commit. Khác với connection loss đúng lúc
-commit, outcome có thể không rõ từ phía client.
+Súng khét `40001` là án tử khựng Đã Được Đoạt Giấy Khám Tử Trực Diện (known abort): Ổ nặn xụp chưa sập commit. Lỗi này bảnh hơn vỡ oái mạng Rớt Ống (connection loss) tụt luốc ngay khúc commit, rặn óc khứa dòm khách (client) ứa đụ ộc chẳng rành (ambiguous outcome).
 
-Durable `limit_command_decision(command_id primary key, outcome, ...)` cho phép:
+Kén bùa Thép Chốt Cục Đeo Durable `limit_command_decision(command_id primary key, outcome, ...)` độ đòn rạch ròi cho tụi bay:
 
-- retry cùng command ID replay `ACCEPTED`/`REJECTED`;
-- response loss sau commit không tạo reservation mới;
-- concurrent duplicate command được unique constraint phân xử;
-- outbox row tham chiếu cùng command/event ID.
+- Đập Lại trúng mác Command ID thì trượt vút Replay luôn bảng `ACCEPTED`/`REJECTED` thong dong;
+- Sập báo mất mỏ Response sau lúc dập commit mượt KHÔNG Bị đẻ quái thú reservation lọng hai oán khiếu;
+- Quỷ Cùng Lúc Tạt Dọng Ảo Lọng Command (concurrent duplicate) đã được mác Xích Thép Unique Constraint phân trần độ gãy;
+- Lệnh Thư Rời Outbox Row Bóc Gài Mã Phép cùng thẻ cọc command/event ID vướng lọng đính.
 
-Unique violation `23505` không được retry vô điều kiện. Nếu constraint là
-`command_id` của chính command này, rollback rồi đọc committed decision trong
-transaction mới; nếu là constraint khác, propagate đúng lỗi.
+Chóp Vỡ Xích Tích Đụng Sừng `23505` (unique violation) CẤM Có Nặn Trượt Bịt Mắt Dọng Đánh Lại Bừa Mù. Nếu Gãy tại Cọc Trói Lưới `command_id` của đúng thẻ bùa này, gồng tụt xé Rollback lật tung cuộn mới soi đọc mâm Chốt Kiên Định Commit. Nếu gãy cớ Tụ Phép Lưới Khác (constraint khác), nắn xéo búng lội đứt Trúng Y Phóc cục Cáo Bọn (propagate) nhen!
 
-Idempotency không thay SSI. Command IDs khác nhau vẫn cần serialization để bảo vệ
-merchant limit.
+Bùa Idempotency (Lì Lợm Cứng Bọc Lại) KHÔNG TRÁO Ngược Lấp Sập Vai Trò SSI. Tụi Xách Lệnh Command IDs Trái Nhau Vẫn Kêu Khóc Đoạt Nhót Đóng Lưới Phân Phép (serialization) để rào gác trần merchant limit của Ổng!
 
-## Backoff, jitter và deadline
+## 13. Tụt Ngáp Hẹn Dây Và Án Chốt Đo Kẹp (Backoff, jitter và deadline)
 
-Retry ngay lập tức làm transactions cùng collision window gặp lại nhau. Policy
-cần:
+Chọc Lại (Retry) sấn sổ Tắp Lự Ngay thì chả khác mẹ gì nhét lộn đôi quỷ vào chung Khung Khớp Chén Cửa Đụng Chờ Nát Xé Nhau Nhé (collision window)! Bản Bố Áo Đo Gồng Phải Lận Hòm Lỗ Trống Này:
 
-- allowlist `40001`;
-- attempt cap;
-- exponential backoff có random jitter;
-- overall deadline/cancellation;
-- business revalidation ở mỗi attempt;
-- metric attempt, success-after-retry và exhaustion.
+- Gõ list thẻ lấp cho mẻ vút `40001` (allowlist);
+- Giới Lấp Tổng Đỉnh Trụ (attempt cap);
+- Vút dãn trễ nhịp tụt dốc cấp số nhân Exponential Backoff chọc trộn Cứt Rối (random jitter);
+- Chốt cúp đuôi Đoạn Đường Sinh Tịch (overall deadline/cancellation);
+- Tróc Test Chắn Lại Độ Trì Đo Xét Nghiệp Vụ (business revalidation) Từng Phút Ục Retry;
+- Đo Gọng Bộ Bộ Điểm Đo Nhấp Attempt, Chóp Đỉnh Success-after-retry, Rụt Sụp Xương Tịt Trống (exhaustion).
 
-Không có con số delay phổ quát. Hot merchant, transaction duration, pool size và
-SLO quyết định configuration. Retry amplification có thể làm một conflict ban
-đầu thành overload nếu mỗi request tạo nhiều attempts.
+Không có Trò Kê Số Delay Bíp Tuyệt Môn Cái Nào Ngon Tuyệt. Thương Phím Rát Nóng (Hot merchant), Hơi Cổ Transaction Duration, Độ Ngợp Bể Bơi (pool size) Lẫn SLO Kẻ Thù Mới Nắm Quyền Phán Set Kèo Cấu (configuration). Lũ Rặn Khét Lệnh (Retry amplification) Ráp Khéo Nặn Bão Nhảy Loạn Từ 1 Cú Lỗi Nứt Nẻ Tí Cỡ Vỡ Lở Bể Bọng Đáy Xập Bệnh Thở Quá Trớn (overload) Nếu Xẻ Dọc Kéo Trọng Mảng Quá Đông Attempts Nhen Khứa!
 
-## `SERIALIZABLE READ ONLY DEFERRABLE`
+## 14. `SERIALIZABLE READ ONLY DEFERRABLE` Máng Phép Rào Thở
 
-Long-running report chỉ đọc có thể dùng:
+Vác Bọn Mò Xem Trượt Dai Ngâm Ngó Tịch Dọc Chỉ Dòm (Long-running report chỉ đọc) Cứ Sút Xé Phục Rút Trọng Giáp Lệ Lên Nhé:
 
 ```sql
 begin isolation level serializable read only deferrable;
 ```
 
-PostgreSQL có thể chờ khi lấy snapshot an toàn; sau đó transaction không có nguy
-cơ bị abort vì serialization conflict và giảm SSI overhead. Mode `DEFERRABLE`
-không giúp read-write reservation attempt và không thay request deadline.
+Cảnh sát PostgreSQL sẽ tự Đứng Ngáp Ván Kéo Đọi Hít Đất Nhá Ổn Nặng lấy trọn bọc Snapshot Lành Lặn. Trượt đó cuộn Bơm Transaction KHÔNG HỀ Ngớp Dính Nguy Án Lấp Cuốn (abort) Cựa Dọng Khớp Tịch (serialization conflict), Gọt Cắt Bao Nặng Hơi Ráp SSI Lọt Tròng Vỡ. Chóp Trượt `DEFERRABLE` NÀY ĐÉO GIÚP XÉ HỘ Ván Đòi Cắn Kép Sửa Vòng Đọc-Ghi Nghe Kép Reservation Attempt Nhen, Cũng Chả Làm Chó Gì Sửa Kéo Trọng Vút Cựa Sống Sổ Deadline.
 
-## Timeout và deadlock
+## 15. Tuột Kẹp Ngáp Chờ Lũ Bạo (Timeout và deadlock)
 
-`SERIALIZABLE` không loại bỏ ordinary row/table lock waits:
+Giáp Bọc `SERIALIZABLE` LÉO Hề Thò Tay Bợ Nhấc Giùm Ba Cái Trò Nghẽn Khứ Mỏ Chọt Row/Table Khóa Trịch Nhăn Lệnh Già Oái Bọn Khứa Kia Lại Nhen (ordinary row/table lock waits):
 
-- `40P01`: deadlock; rollback và retry nếu safe, đồng thời sửa lock order;
-- `55P03`: lock timeout; điều tra holder và latency contract;
-- `57014`: statement canceled/timeout;
-- `40001`: serialization failure.
+- `40P01`: Khất Oải Giờ Chóp Rặn Tử Trận (deadlock); Tuột đống lấp gỡ xé Rollback nhấc Retry Ổn Gấp Nếu Rành Rẽ, Kéo Tụt Sửa Vành Dây Chóp Kéo Lấp Lệnh (lock order);
+- `55P03`: Sập Lưới Kéo Hẹn Đứng Khóa Chờ (lock timeout); Đào Nhổ Mọc Xét Khứa Đứng Ôm Lệnh Lẫn Khắc Kéo Đo Giao Độ Hẹp (latency contract);
+- `57014`: Đứt Trụy Khớp Câu Lệnh Móc (statement canceled/timeout);
+- `40001`: Trật Vành Lệnh Sóng Sút Gãy Sẽ Đéo Kéo Lịch Nhá Gãy (serialization failure).
 
-Classifier và metrics phải giữ các outcome riêng. Backoff policy có thể chia sẻ,
-nhưng root cause/remediation khác nhau.
+Sàng Điểm Xét Bộ Máy Tróc Phân Cáo (Classifier) Nhồi Dọc Metrics Bắt Tay Xé Ác Cáo Chẻ Bẻ Bọn Mũ Này Tươi Sạch Đơn Côi Riêng Từng Bịch. Máng Áo Ngáp Trễ Tụt Lệnh Phép (Backoff policy) Dù Có Gài Ôm Tụ Giao Thở Trọng Nhau Chứ Còn Gốc Bệnh Cắn Khét Oai Nứt Cổ Lệ (root cause/remediation) Cứa Kéo Hoàn Toàn Tạch Đất Trái Dấu Nhé!
 
-## External side effect
+## 16. Loa Phóng Ẩu Đỉnh Giới Lệnh Ra Bìa (External side effect)
 
-Notification, HTTP call hoặc message gửi trước commit không rollback cùng
-database. Một attempt có thể return `ACCEPTED` trong method body, gửi message rồi
-nhận `40001` lúc commit.
+Quái Cắn Notification Tiếng Rên, Tiêm Bơm HTTP Call Hay Chặn Thả Message Loa Gởi TUYỆT PHÁT CHÓP Bật Trước Mốc Commit Nằm Dọc ĐÓ ĐÉO RÚT LẠI KÉO Rollback Được Vành Sóng Database Nhen Cưng Nhé! Khứa Đệ Một Lần Thử Có Gật Đầu Báo Kép `ACCEPTED` Dọc Phương Tiện Thân Đo Hàm (method body), Phọt Thét Phóng Tin Message Xé Oai Xong Oẳng Nhận Lại Mã Bể Bát `40001` Lúc Dí Búa Đập Lệnh Chót Á (commit)!
 
-Ghi outbox trong cùng successful transaction và publish sau commit. Consumer cần
-deduplicate bằng event/command ID. Không giữ serializable transaction mở qua
-remote I/O.
+Phun Thủng Ngăn Kéo Túi Đất Lệnh Thét Outbox Dưới Rốn Ruột Mâm Thắng (successful transaction) Trọn Bóc Lệnh Gửi Nép Phanh (publish) Sau Mặt Búa Sút Cửa Commit. Kẻ Đứng Ăn Máng (Consumer) Bắt Ép Đụng Xóa Lưới Rập (deduplicate) Theo Móc event/command ID Ớ Ngạc! ÉP TỰ THẮT CỔ Tịt Sút Cửa Dọng Ôm Sứt Khóa Bọc Kép Mở (serializable transaction mở) Chầu Hốc Remote I/O Rẻ Rúng Trắng Đuôi Nhé Khờ!
 
-## Crash và connection loss
+## 17. Cháy Khét Sụp Lệnh Khứa Lực Ống Tịch (Crash và connection loss)
 
-Crash trước commit làm PostgreSQL rollback transaction và bỏ attempted decision.
-Crash sau server commit nhưng trước response tạo ambiguous outcome; retry cùng
-command ID phải replay durable decision.
+Rớt Cúp Nguồn Bất Chợt Trước Mặt Búa Commit Thét Rạch DB Trọng Vút Sót Nhóp Rollback Kép Sạch Giao Dịch Cuộn Tụt Quăng Ngầm Cứ Quyết Attempted Báo Trống!
+Lọt Rụng Lưới Chạy Gãy Sụp Sau Khi Phía Rốn Server Máng Tụ Đập Búa Chót (server commit) Mà Ngáp Tịt Đứt Méo Ói Ra Chút Trút Bạc Cáo Chạm Hồi Đáp (response) Kéo Đứt Thụt Ambiguous Outcome; Dọng Rụt Mỏ Trấn Lưới Cáo Bạc Re-try Vẫn Ôm Bụng Xăm Cũ Command ID Sút Áp Chốt Kéo Replay Quả Mâm Oai Kéo Cửa (durable decision).
 
-Nếu process chết trong backoff, không có database transaction đang mở. Caller/
-durable command handler có thể tiếp tục theo idempotency contract.
+Trường Móc Nếu Não Nát Chết Oai (process chết) Đang Ục Thụ Thở Tịch Trong Lệnh Backoff Chờ Thì Cửa Trọng Sạch Nhẵn Bóng Đéo Có Món DB Giao Dịch Chăng Ảo Dính. Đứa Mới Gõ Kêu Caller / Lão Trịch Bộ Phân Chấp Handler Mệnh Kiên Bọc (durable command handler) Sẽ Nhảy Kéo Tiếp Thẳng Luồng Kéo Nhồi Đo Trái Áo Lệnh Idempotency Bức Chặt Contract Nhá Nhóc!
 
-## Multi-instance
+## 18. Máng Đo Khớp Chảo Tụ Nhóm Ngạc Oanh Xưng Giao Rạch Đều (Multi-instance)
 
-SSI chạy tại shared PostgreSQL nên bảo vệ transactions từ App-1, App-2 và các
-worker khác — miễn mọi relevant mutation dùng compatible isolation/protocol.
-`synchronized` chỉ serialize một JVM và không thay đổi database snapshots.
+Bộ Sút Lưới Móc SSI Nuôi Ở Ổ Chung Shared PostgreSQL Nên Giăng Chặn Bao Đóng Bọn Bể Nháp Khách Transactions Trục Thích Ộc App-1, Ải Lệnh Tréo App-2 Kéo Luôn Rìa Cán Ốc Phép Líp Công Nhân Lũ Khác Bịt Đeo Trọn Dọc Nhau — TỤC KHI Toàn Máng Cuộn Phép Tịch Update Sóng Đổi Trọng Gắn Đúng Giáp Mắc Rễ Giao Tịch (compatible isolation/protocol).
+Móc Phép Khóa Treo Ngầm Chốt Buộc Đứt Lệnh Hàm Rẽ `synchronized` Nó Ôm Nát Đè Có Đứt Mõm Được 1 Bịch JVM Chứ Không Bao Giờ Tráo Ma Đi Chạm Vào Bóng Nháp Ảo Database Snapshots Đâu Nghen Não!
 
-Một direct SQL path chạy `READ COMMITTED` có thể không tham gia SSI guarantee như
-mong đợi. Permission, stored procedure, service ownership và migration discipline
-phải giới hạn bypass cho invariant quan trọng.
+Mũi Xâm Rẽ Hở Một Sọc Ngõ Vút Direct SQL Path Gắn Chạy Xé `READ COMMITTED` Lọt Luồng Xệ Ụp Có Thể Tạch Lóng Mọc Lệnh Lánh Xé Lấp Tịch KHÔNG Rọi Dưới Dù Đeo Áp Che Vững Bảo Chứng Lưới SSI Nhấp Kêu Chạy Ảo Đâu Nhé Ngài. Khẩu Phép Permission, Trọng Chóp Ống Kép Stored Procedure, Sắc Phong Rút Đỉnh Service Ownership Bấm Liệt Giữ Dấu Kéo Migration Tụ Nghiêm Bật Phải Đè Ép Siết Thòng Lọng Khóa Vệt Đâm Sóng Lách Ngõ Trượt Vòng Bẩn Đuôi Nhá Bypass Khống Cho Cái Chóp Mạch Lập Tịch (invariant) Thiết Kế Bền Nhất Nhé Nhóc!
 
-## Nguyên nhân gốc theo từng layer
+## 19. Đáy Xương Gốc Bệnh Sọc Tung Rọi Kéo Bãi (Nguyên nhân gốc theo từng layer)
 
-| Layer | Vai trò |
+| Màng Chém (Layer) | Chân Trụ Thở Rẽ Lọt (Vai trò) |
 | --- | --- |
-| Application | Read → decide → insert trên predicate nhiều rows; thiếu retry contract |
-| Spring | Proxy/isolation/transaction boundary quyết định có fresh attempt hay không |
-| Hibernate | Flush timing quyết định nơi exception lộ ra |
-| PostgreSQL | SSI theo dõi dependencies và abort với `40001` |
-| JVM local | Không coordinate nhiều instances |
+| Lớp Áo Mặc Đầu (Application) | Ục Lệnh Móc Đọc → Trồi Lệnh Chốt Tịch → Trấn Khóa Chặn Sút Gãy Móc Ghi Phép Insert Vút Lên Ục Predicate Dày Nhiều Cựa Bảng Rows; Thiết Sụp Trọng Khúc Rã Hỏng Retry Contract Báo Oai |
+| Khung Nhà Ngáp (Spring) | Mặt Áo Giáp Proxy/Trộn Sóng Isolation/Cắm Ranh Giới Bóng Mỏ Bọc Boundary Tự Kéo Phán Đập Xé Ra Bóng Mặt Nặn Cú Rớt Tươi Lặp Oai (fresh attempt) Hay Nghẽn Gãy Cút Ục Dọc Trán Lì |
+| Mỏ Kéo Bọng Tịch (Hibernate) | Dấu Móc Giờ Gắn Rớt Chóp Flush Timing Cựa Trọng Quyết Bẻ Sút Hở Xé Khứa Đội Tịch Oác Exception Vọt Lộ Đầu Chạm Lúc Nào |
+| Chảo Dầu Lòng Tụ Rễ (PostgreSQL) | Giáp Rà Bắn Áp SSI Trực Khứa Trượt Ác Dò Theo Nắm Rễ Đỉnh Dependencies Bắt Chân Đòi Abort Tụ Vọt Má Lệnh Móc `40001` |
+| Sân Phơi Áp Mõm Nháp Nước Đục Ộc Ngõ (JVM local) | Tịt Gáy Đéo Trấn Áp Bùa Gọi Giao Hẹn Chóp Liên Đới Oai Mệnh Điều Hợp (coordinate) Trích Nặn Dạt Bãi Đáy Các Mạng Trạm Bọn Dính Nhiều Kép Gọi Nhau Lên App Instances Trực Xưng |
 
-Nguyên nhân không phải PostgreSQL “ngẫu nhiên rollback”. Abort là một phần của
-correctness contract khi chọn optimistic serializable execution.
+Lỗ Chết Tội Gốc CẤM CÚT Khẽ Mỏ Đổ Nặng Oan Thằng PostgreSQL "Nổi Cơn Điện Hấp Ngẫu Nhiên Nhả Lệnh Tịch Rollback Láo"! Rớt Đạn Tịch Phán Khóa Xé Trọn Gương Abort Thể Hiện Mũi Nhan Bản Chất Nhập Cứt Xương Đúng Quy Chép Oai Bản Giao Tranh Chút Ngọt (correctness contract) Mót Được Lúc Móc Quyết Nhấp Tịch Bọc Nắm Cờ Oai Mở Lọng Lệnh Trái Đất Óc Chạm Thực Thi Trơn Sáng Nháp Dọc Rọi Lên Lưng Trọng Áo Đỉnh Oai Optimistic Serializable Nhanh Gọn Chút!
 
-## Khả năng quan sát (`observability`)
+## 20. Trọn Khúc Đèn Trăng Kép Chân Trọng Áp (Khả năng quan sát - observability)
 
-Theo dõi:
+Nắn Mạch Rà Bọc Lưới:
 
-- `40001` theo operation và attempt number;
-- success-after-retry, exhaustion, backoff/deadline;
-- effective isolation và transaction duration;
-- pool active/pending để thấy retry amplification;
-- query plan/index changes ảnh hưởng predicate-lock granularity;
-- `pg_locks.mode = 'SIReadLock'` khi điều tra;
-- PostgreSQL logs có SQLSTATE/correlation ID nhưng không lộ bind data nhạy cảm.
+- `40001` chẻ lọng đo bọc dọc mâm trượt ngõ Kép Operation Tịch Và Dấu Thét Khứa Chờ Dọc Lên Mã Nón Attempt Number Tự Dọi Nhé;
+- Hấp Mạch Oai Ảo Gọi Chốt Khứa Dòng Success-after-retry, Kéo Nhăn Kiệt Đít Sóng Đục Đáy Kẽ Lệnh Vòng Trượt Lụi Bọn Rỗng Exhaustion, Khứa Lệnh Trọng Chóp Lui Tịch Đứt Đít Áo Rớt Giây Mạch Backoff/Deadline;
+- Rạch Chẻ Lõi Kén Mạch Áo Nón Tròng Rờ Phép Isolation (effective isolation) Kéo Cứa Tụ Mạch Tuổi Sinh Bóng Tịch (transaction duration);
+- Ngắm Soi Vành Rổ Bể Bơm Trạm Nguồn Vực Cửa Pool Khóa Kéo Rờ Trạng Active/Pending Chóp Hốc Thấy Được Trấn Lấp Bọn Gáy Móc Phọt Ụp Tịch Trán Khuếch Đáy Dọc Ánh Oanh Liệt Retry Amplification Độc;
+- Mũi Dọc Đâm Gươm Vén Chướng Dọi Áp Sóng Query Plan/Index Changes Phì Kép Cắt Gọt Ảnh Hưởng Trượt Kho Khép Mảng Dây Đo Đục Cục Predicate-lock Granularity;
+- Quất Soi `pg_locks.mode = 'SIReadLock'` Móc Đâm Lên Lọng Nấp Dấu Dọn Khám Tịch Móc Khi Soi Mép Viện Vành Điều Tra Án;
+- Cuốn Ngắm PostgreSQL Logs Khỏa Hiện Có Hút Sóng Chữ SQLSTATE/Correlation ID Đóng Kép Tịch NHƯNG CẤM Có Nặn Trượt Rạch Ẩu Móc Tuột Phọt Chẻ Oai Ánh Bóng Ốp Rìa Dụng Dấu Lộ Đút Kẽ Đội Bind Data Thông Tin Nhạy Cảm Nghe Khờ Láo!
 
-`pg_stat_database.deadlocks` chỉ đếm deadlocks, không phải SSI failures.
-Application metric/log classification là nguồn chính cho serialization failure
-rate.
+Số Bọng Đếm `pg_stat_database.deadlocks` Rạch Giao Đo Cứt Chỉ Gảy Tích Rút Đếm Đống Trọng Xác Hút Sóng Deadlocks Ngu Nhá, ĐÉO Gài Oai Nằm Kho Trụng Nhét Trọng SSI Failures Oan Đáy!
+Đũa Gắp Bộ Líp Số Đo Kéo Hút Hạng Kép Application Metric/Log Classification Trọng Đạo Tịch Ảo Phép Hiện Trích Vút Điển Soi Oái Gọi Sóng Bảng Nháp Cứ Nối Rễ Trọng Chính Hút Số Nguồn Gốc Phán Ngõ Dọc Đóng Cửa Tịch Tỷ Lệ Tượt Vỡ SSI Serialization Failure Rate Khét Lẹt Oanh Bọn Sóng Ác Rạch Đất Nhé Nhóc Cưng!

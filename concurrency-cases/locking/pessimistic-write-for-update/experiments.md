@@ -1,20 +1,22 @@
-# PostgreSQL experiments cho pessimistic write lock
+# Phòng Thí Nghiệm: Ép Trái Tim Database Bằng Testcontainers (Pessimistic Lock)
 
-## Mục tiêu
+## 1. Mục tiêu thí nghiệm
 
-Test suite phải chứng minh cả safety lẫn progress:
+Bài test này không phải viết cho vui, nó phải chứng minh được:
 
-1. plain `SELECT` cho phép hai decision cùng thấy `AVAILABLE`;
-2. `FOR UPDATE` làm competitor block rồi revalidate committed state;
-3. rollback release lock và cho waiter tiếp tục;
-4. `lock_timeout` tạo bounded failure, không làm partial write;
-5. plain reader vẫn đọc committed version khi holder chưa commit;
-6. multi-row operation dùng stable order;
-7. Spring/JPA path giữ invariant trên PostgreSQL thật.
+1. Đọc chay (Plain SELECT) làm 2 thằng cùng tưởng ghế trống.
+2. Đọc có Khóa (`FOR UPDATE`) làm thằng đến sau bị block (chặn họng) và bắt buộc phải đọc lại dữ liệu mới nhất.
+3. Kẻ trước Hủy kèo (Rollback) thì trả Khóa, thằng đến sau tha hồ chốt đơn.
+4. Chờ quá giờ (`lock_timeout`) thì văng lỗi, không có chuyện lưu được 1 nửa.
+5. Ai đi ngang qua xem ghế (Plain reader) thì vẫn thấy dữ liệu cũ, chả bị Khóa chặn lại làm gì.
+6. Mua nhiều ghế phải xếp hàng (Stable order) để tránh đụng độ (Deadlock).
+7. Đoạn code Spring/JPA của mình chạy ngon lành trên PostgreSQL hàng real!
 
-Không dùng H2 để suy luận row-lock behavior.
+Tất nhiên: TUYỆT ĐỐI KHÔNG xài H2 (cái Database đồ chơi chạy trên RAM) để giả lập mấy trò Khóa Dòng này. H2 và Postgres xử lý Khóa khác hẳn nhau!
 
-## Testcontainers fixture
+## 2. Bày Biện Bàn Chơi (Testcontainers fixture)
+
+Đầu tiên, kéo một Docker Image PostgreSQL xịn xò về:
 
 ```java
 @Testcontainers
@@ -23,7 +25,7 @@ class PessimisticSeatHoldIT {
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:17-alpine");
+            new PostgreSQLContainer<>("postgres:17-alpine"); // Postgres xịn đây!
 
     @DynamicPropertySource
     static void datasource(DynamicPropertyRegistry registry) {
@@ -37,12 +39,13 @@ class PessimisticSeatHoldIT {
     @Autowired PlatformTransactionManager transactionManager;
     @Autowired SeatHoldCoordinator coordinator;
 
-    private ExecutorService executor;
+    private ExecutorService executor; // Lò đẻ luồng (Thread)
 
     @BeforeEach
     void reset() {
         executor = Executors.newFixedThreadPool(4);
-        jdbc.update("delete from seat_hold");
+        jdbc.update("delete from seat_hold"); // Dọn rác
+        // Trả 2 ghế A-10 và A-11 về trạng thái TRỐNG
         jdbc.update("""
                 update show_seat
                 set state = 'AVAILABLE',
@@ -55,17 +58,17 @@ class PessimisticSeatHoldIT {
 
     @AfterEach
     void stopExecutor() throws InterruptedException {
-        executor.shutdownNow();
+        executor.shutdownNow(); // Test xong thì đập bỏ lò đẻ luồng
         assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
     }
 }
 ```
 
-Migration thật tạo hai seat rows cố định và các constraints trong
-`solutions.md`. Mỗi test dùng command IDs mới để không vô tình đi vào replay
-path.
+Migration thật tạo hai seat rows cố định và các constraints trong `solutions.md`. Mỗi test dùng command IDs mới để không vô tình đi vào replay path.
 
-## Helper transaction và bounded wait
+## 3. Trợ thủ Đắc Lực (Đồng hồ đếm ngược và Mắt thần)
+
+Để điều khiển các luồng (Thread) chạy dừng đúng ý đồ như đạo diễn phim, ta xài `CountDownLatch`. Để chắc chắn 1 luồng ĐANG BỊ KẸT KHÓA dưới DB, ta xài con mắt thần này:
 
 ```java
 @FunctionalInterface
@@ -103,25 +106,26 @@ private void awaitDatabaseBlock(String applicationName) {
     long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
 
     while (System.nanoTime() < deadline) {
+        // Soi thẳng vào hệ thống nội tạng của PostgreSQL
         Boolean blocked = jdbc.queryForObject("""
                 select exists (
                     select 1
                     from pg_stat_activity
                     where application_name = ?
-                      and wait_event_type = 'Lock'
+                      and wait_event_type = 'Lock' /* Bị kẹt Khóa! */
                       and cardinality(pg_blocking_pids(pid)) > 0
                 )
                 """, Boolean.class, applicationName);
         if (Boolean.TRUE.equals(blocked)) {
-            return;
+            return; // Kẹt thật rồi! Thỏa mãn!
         }
 
-        LockSupport.parkNanos(Duration.ofMillis(10).toNanos());
+        LockSupport.parkNanos(Duration.ofMillis(10).toNanos()); // Ngủ 10ms rồi soi tiếp
         if (Thread.currentThread().isInterrupted()) {
             throw new AssertionError("interrupted while observing lock wait");
         }
     }
-    fail("database lock wait was not observed");
+    fail("Chờ 5 giây rồi mà chả thấy nó bị kẹt Khóa gì cả!");
 }
 
 private String sqlState(Throwable failure) {
@@ -136,12 +140,11 @@ private String sqlState(Throwable failure) {
 }
 ```
 
-`CountDownLatch` tạo event order; PostgreSQL views xác nhận contender đang block
-thật. Mọi `Future.get`, latch wait và executor shutdown đều có timeout.
+Mọi `Future.get`, latch wait và executor shutdown đều có upper bound. Quá giờ là ném lỗi chứ không để treo máy.
 
-## Experiment 1 — Tái hiện stale decision
+## 4. Thí nghiệm 1: Chứng minh Code Ngu (Tái hiện stale decision)
 
-Test-only broken worker dừng hai actors ngay sau plain load:
+Ta chế một cái "Cổng rào" (Barrier). Bắt 2 Luồng nhào vô đọc ghế, đọc xong KHÔNG CHO LƯU, bắt đứng đó đợi nhau. Khi cả 2 đều đã đọc xong (đều thấy Ghế Trống), ta mới thả cửa cho tụi nó ùa vào Lưu.
 
 ```java
 @Service
@@ -158,7 +161,7 @@ class BarrierBrokenSeatHoldTx {
         assertEquals(SeatState.AVAILABLE, seat.state());
 
         try {
-            bothLoaded.await(5, TimeUnit.SECONDS);
+            bothLoaded.await(5, TimeUnit.SECONDS); // 2 anh em đợi nhau ở đây nhé
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(interrupted);
@@ -188,20 +191,23 @@ void plainLoadLetsTwoBusinessDecisionsPass() throws Exception {
     UUID holdA = a.get(10, TimeUnit.SECONDS);
     UUID holdB = b.get(10, TimeUnit.SECONDS);
 
-    assertNotEquals(holdA, holdB);
-    assertEquals(2, activeHoldCount(42, "A-10"));
+    // KẾT QUẢ KINH HOÀNG:
+    assertNotEquals(holdA, holdB); // Đẻ ra 2 cái vé khác nhau!
+    assertEquals(2, activeHoldCount(42, "A-10")); // 1 ghế mà 2 thằng ACTIVE
     assertEquals(1, seatProjectionCount(42, "A-10"));
     assertTrue(currentSeatHoldId(42, "A-10").equals(holdA)
             || currentSeatHoldId(42, "A-10").equals(holdB));
 }
 ```
 
-Assertion chính là business invariant bị phá, không phải chỉ “hai threads đã
-chạy”.
+Trọng tâm là bắt được cái Lỗi Chết Người kia (2 vé ACTIVE), chứ không phải đơn thuần là "code chạy lỗi vặt".
 
-## Experiment 2 — Holder commit, waiter revalidate
+## 5. Thí nghiệm 2: Người đi sau phải Kính Trọng người đi trước (Revalidate)
 
-Holder cập nhật row nhưng dừng trước commit. Contender dùng cùng locking SQL:
+Cho A vào Xin Khóa trước. Xong bắt A dừng lại uống trà (chưa Commit).
+Thả B vào. B đòi xin Khóa. B sẽ BỊ ĐÁ BẬT RA HÀNG CHỜ.
+Sau khi soi DB thấy B "đang đứng chờ" thật, ta mới kêu A: "Commit đi!".
+A commit xong, B vội vàng lao vào lụm Khóa. Nhưng ôi thôi, kết quả lúc này là B báo lỗi vì ghế đã HELD!
 
 ```java
 @Test
@@ -228,27 +234,29 @@ void waiterBlocksThenRejectsCommittedHold() throws Exception {
                 : HoldOutcome.ALREADY_HELD;
     }));
 
-    awaitDatabaseBlock("lock003-waiter");
+    awaitDatabaseBlock("lock003-waiter"); // Soi thấy B há mồm chờ dưới DB
     assertThrows(
             TimeoutException.class,
             () -> waiter.get(100, TimeUnit.MILLISECONDS)
     );
 
-    allowHolderCommit.countDown();
+    allowHolderCommit.countDown(); // A húp trọn và nhả Khóa
 
     assertEquals(HoldOutcome.HELD,
-            holder.get(5, TimeUnit.SECONDS));
+            holder.get(5, TimeUnit.SECONDS)); // A thành công
     assertEquals(HoldOutcome.ALREADY_HELD,
-            waiter.get(5, TimeUnit.SECONDS));
+            waiter.get(5, TimeUnit.SECONDS)); // B khóc ròng
     assertEquals(1, activeHoldCount(42, "A-10"));
-    assertEquals(501L, currentSeatCustomer(42, "A-10"));
+    assertEquals(501L, currentSeatCustomer(42, "A-10")); // Khách A (501) lấy được ghế
 }
 ```
 
-> **Nói ngắn gọn:** test không chỉ thấy waiter chậm; nó chứng minh waiter bị
-> PostgreSQL lock chặn, sau đó đọc outcome mới và không tạo side effect thứ hai.
+> **Nói ngắn gọn:** Test này chọc thẳng xuống DB chứng minh B thực sự bị Block, và B khôn ngoan đọc lại Dữ liệu Mới để tự dội gáo nước lạnh vào mặt chứ không chèn đè lên A.
 
-## Experiment 3 — Rollback release lock
+## 6. Thí nghiệm 3: Kẻ Hủy Kèo Bỏ Băn Khoăn (Rollback)
+
+Giống hệt Thí nghiệm 2, nhưng thay vì A Commit, ta bắt A tung Exception để Rollback!
+Lúc này B lụm Khóa, thấy ghế vẫn `AVAILABLE` -> B húp trọn!
 
 ```java
 @Test
@@ -262,7 +270,7 @@ void waiterCanWinAfterHolderRollsBack() throws Exception {
         createHold("hold-a", 501);
         holderHasLock.countDown();
         awaitLatch(forceRollback);
-        throw new RollbackForTest();
+        throw new RollbackForTest(); // Giữa chừng A ném vỡ cái ly (Rollback)
     }));
 
     assertTrue(holderHasLock.await(5, TimeUnit.SECONDS));
@@ -283,17 +291,18 @@ void waiterCanWinAfterHolderRollsBack() throws Exception {
     assertInstanceOf(RollbackForTest.class, rolledBack.getCause());
 
     assertEquals(HoldOutcome.HELD,
-            waiter.get(5, TimeUnit.SECONDS));
+            waiter.get(5, TimeUnit.SECONDS)); // Lần này B thành công!
     assertEquals(1, activeHoldCount(42, "A-10"));
-    assertEquals(902L, currentSeatCustomer(42, "A-10"));
+    assertEquals(902L, currentSeatCustomer(42, "A-10")); // Khách B (902) lên ngôi
     assertEquals(0, holdCountByCommand("hold-a"));
 }
 ```
 
-Assertions chứng minh cả uncommitted projection lẫn audit insert của holder đã
-rollback.
+## 7. Thí nghiệm 4: Chờ lâu quá thì Giải Tán (`lock_timeout`)
 
-## Experiment 4 — `lock_timeout` tạo bounded failure
+Ta ép thằng B chỉ được chờ 150 mili-giây.
+Ta cố tình cho thằng A cầm Khóa đi dạo lâu hơn thế.
+Băng B đứt bóng ngay lập tức với mã lỗi `55P03`.
 
 ```java
 @Test
@@ -314,6 +323,7 @@ void lockTimeoutRollsBackWithoutPartialHold() throws Exception {
     Future<HoldOutcome> contender = executor.submit(() ->
             inTransaction(() -> {
                 useApplicationName("lock003-timeout-contender");
+                // B chạy vào và dặn DB: "Chỉ chờ 150ms thôi nghen!"
                 jdbc.queryForObject(
                         "select set_config('lock_timeout', '150ms', true)",
                         String.class
@@ -326,20 +336,20 @@ void lockTimeoutRollsBackWithoutPartialHold() throws Exception {
     ExecutionException failed =
             assertThrows(ExecutionException.class,
                     () -> contender.get(5, TimeUnit.SECONDS));
-    assertEquals("55P03", sqlState(failed));
+    assertEquals("55P03", sqlState(failed)); // Lỗi Không Lấy Được Khóa
     assertEquals(0, holdCountByCommand("hold-b"));
-    assertEquals("AVAILABLE", currentSeatState(42, "A-10"));
+    assertEquals("AVAILABLE", currentSeatState(42, "A-10")); // Ghế vẫn an toàn
 
     releaseHolder.countDown();
     assertNull(holder.get(5, TimeUnit.SECONDS));
 }
 ```
 
-Test phải release holder trong `finally` ở implementation đầy đủ để failure của
-một assertion không để task treo. Sau timeout, framework rollback transaction
-trước một retry/mapping mới.
+Test phải release holder trong `finally` ở implementation đầy đủ để failure của một assertion không để task treo. Sau timeout, framework rollback transaction trước một retry/mapping mới.
 
-## Experiment 5 — Plain reader không bị row lock chặn
+## 8. Thí nghiệm 5: Dân Thường Vẫn Được Đi Ngang (Plain reader)
+
+A đang xin Khóa để sửa ghế. Một câu lệnh Đọc Chay bay ngang qua. Liệu nó có bị cản? Không! Nó vẫn lấy được Dữ Liệu Cũ trước khi A chốt sổ. Đừng biến mấy API hiện danh sách chơi chơi thành bãi kẹt xe!
 
 ```java
 @Test
@@ -360,7 +370,7 @@ void plainReaderSeesLastCommittedVersion() throws Exception {
     Future<String> reader = executor.submit(
             () -> currentSeatState(42, "A-10")
     );
-    assertEquals("AVAILABLE", reader.get(2, TimeUnit.SECONDS));
+    assertEquals("AVAILABLE", reader.get(2, TimeUnit.SECONDS)); // Đọc thoải mái
 
     allowCommit.countDown();
     assertNull(holder.get(5, TimeUnit.SECONDS));
@@ -369,10 +379,9 @@ void plainReaderSeesLastCommittedVersion() throws Exception {
 }
 ```
 
-Nếu dashboard chỉ cần last committed value, plain SELECT tránh biến read traffic
-thành lock waiters.
+## 9. Thí nghiệm 6 & 7: Cuộc Chiến Đỉnh Cao và Tránh Cắn Đuôi (Deadlock)
 
-## Experiment 6 — Spring/JPA end-to-end invariant
+**Test 6:** Bắn luồng JPA y hệt Production. Bắn 2 luồng cùng lúc. Chắc chắn chỉ 1 luồng Win, luồng kia văng exception.
 
 ```java
 @Test
@@ -410,11 +419,7 @@ void twoJpaRequestsProduceOneHoldAndOneRejection() throws Exception {
 }
 ```
 
-Test chạy nhiều lần có thể thay winner nhưng invariant và outcome cardinality
-không đổi. Deterministic raw-SQL experiments phía trên giải thích exact blocking
-mechanism; test này bảo vệ wiring Spring proxy/Hibernate.
-
-## Experiment 7 — Stable order cho group hold
+**Test 7:** Bắn Khách 1 mua `[A-10, A-11]`. Bắn Khách 2 mua `[A-11, A-10]`. Nếu code bạn xịn (có thao tác Sắp Xếp thứ tự ghế trước khi khóa), sẽ KHÔNG BAO GIỜ có Lỗi Kẹt Cứng (Deadlock). Khách 1 hoặc 2 sẽ ôm trọn 2 ghế, kẻ kia ra rìa.
 
 ```java
 @Test
@@ -449,11 +454,9 @@ void reverseInputUsesSameDatabaseLockOrder() throws Exception {
 }
 ```
 
-Ngoài assertions, SQL capture phải cho thấy cả calls dùng
-`ORDER BY show_id, seat_no FOR UPDATE`. Không biến “không thấy deadlock trong một
-run” thành bằng chứng duy nhất; audit query/order là primary guarantee.
+Ngoài assertions, SQL capture phải cho thấy cả calls dùng `ORDER BY show_id, seat_no FOR UPDATE`. Không biến “không thấy deadlock trong một run” thành bằng chứng duy nhất; audit query/order là primary guarantee.
 
-## Experiment 8 — Duplicate replay
+## 10. Thí nghiệm 8 — Cùng 1 Request, Gửi Đúp 2 Lần
 
 ```java
 @Test
@@ -484,9 +487,9 @@ void reusedCommandWithDifferentCustomerIsRejected() {
 }
 ```
 
-Replay protection không thay assertions same-seat contention.
+Lớp áo giáp Idempotency (Chống Trùng Lặp) này độc lập với cái Khóa Dòng ở trên.
 
-## Core JDBC helper
+## 11. Đồ Đọc Lõi (Core JDBC helper)
 
 ```java
 private ShowSeatRow lockSeat(long showId, String seatNo) {
@@ -499,25 +502,24 @@ private ShowSeatRow lockSeat(long showId, String seatNo) {
 }
 ```
 
-Test helper phải fail nếu row không tồn tại; zero-row query không chứng minh lock
-đã được acquire.
+Hàm Helper này BẮT BUỘC phải nổ lỗi (fail) nếu dòng ghế Không Tồn Tại. Nếu về 0 dòng, nghĩa là chả có cái Khóa nào được sinh ra cả!
 
-## Coverage matrix
+## 12. Bảng Tóm Tắt Chiến Tích (Coverage matrix)
 
-| Experiment | Interleaving được ép | Business assertion |
+| Trận Đánh | Tình Cảnh Tạo Ra | Kết Quả Bắt Được |
 | --- | --- | --- |
-| 1 | Hai plain loads trước flush | Hai ACTIVE holds tái hiện invariant violation |
-| 2 | B wait khi A giữ lock | Một HELD, một ALREADY_HELD |
-| 3 | A rollback trước B acquire | Chỉ hold B tồn tại |
-| 4 | B vượt `lock_timeout` | `55P03`, không partial hold |
-| 5 | Plain reader khi A uncommitted | Đọc old committed rồi thấy new committed |
-| 6 | Hai JPA calls cùng bắt đầu | Đúng một accepted hold |
-| 7 | Reverse group input | Stable order, một group winner |
-| 8 | Duplicate command | Replay cùng response, không duplicate |
+| 1 | Hai ông cùng ngó bảng mà chả thèm khóa | Lòi ra ngay vụ 1 ghế 2 chủ |
+| 2 | B đứng chờ A giữ khóa | Trả về 1 HELD, một ALREADY_HELD (Chuẩn) |
+| 3 | A Hủy kèo trước khi B giật khóa | Vé thuộc về B |
+| 4 | B chờ lố giờ `lock_timeout` | Nổ lỗi `55P03`, chả húp được gì |
+| 5 | Dân thường xem danh sách khi A chưa chốt | Vẫn đọc được bản cũ bình thường |
+| 6 | 2 luồng chọc thẳng vào tầng JPA | Chỉ có 1 kẻ chiến thắng |
+| 7 | Nhập lộn xộn danh sách ghế | Khóa theo ID, khỏi kẹt xe, 1 winner |
+| 8 | Bấm 2 lần 1 request | Phát hiện trùng, không đẻ thêm rác |
 
-## Production verification
+## 13. Đem Kính Lúp Lên Production (Giám sát thật)
 
-Theo dõi đồng thời:
+Khi đẩy code lên Production, hãy làm cho mình một cái Bảng Theo Dõi xịn sò bằng câu Query này:
 
 ```sql
 select application_name,
@@ -532,23 +534,20 @@ where datname = current_database()
   and state <> 'idle';
 ```
 
-- Hibernate SQL/`StatementInspector`: locking query có clause phù hợp.
-- SQLSTATE counters: `55P03` riêng với `40P01`.
-- Lock wait và transaction duration histograms.
-- HikariCP active, idle, pending và acquisition timeout.
-- Domain outcomes theo hot seat/show.
-- Reconciliation query giữa `show_seat.hold_id` và ACTIVE `seat_hold`.
+Bạn sẽ dễ dàng vạch mặt kẻ nào ôm Khóa đi ngủ quá lâu, hay đếm được bao nhiêu ông khách bị văng lỗi vì xếp hàng quá giờ (`55P03`). Giám sát thêm các chỉ số:
+- SQL Log xem Hibernate có tự sinh chữ `FOR UPDATE` không.
+- Số lượng văng lỗi Timeout (`55P03`) và Deadlock (`40P01`).
+- Số lượng Connection nằm lì chờ đợi (Pool idle/pending).
+- Khách văng `ALREADY_HELD` nhiều quá chứng tỏ cái Ghế đó cực Hot.
 
-Không log customer/payment data hoặc raw bind values. Khi test timeout, thu
-`pg_stat_activity`, `pg_locks`, `pg_blocking_pids` và thread dump trước khi chỉ
-tăng timeout.
+Nhớ là: Tuyệt đối không log thông tin Thanh toán hay Số thẻ của Khách hàng vào mấy cái View theo dõi kỹ thuật này!
 
-## Chống flaky
+## 14. Bí Kíp Chống Test "Bị Sảng" (Flaky)
 
-- Dùng latch/barrier để tạo causal order, không đoán scheduler timing.
-- Xác nhận `wait_event_type = 'Lock'` trước khi release holder.
-- Mọi wait/future đều có upper bound.
-- Release latches và shutdown executor trong `finally`.
-- Mỗi test reset rows và dùng unique command IDs.
-- Giữ raw lock-semantic test cạnh Spring/JPA integration test.
-- Không dùng một stress loop pass làm bằng chứng correctness.
+Mấy bài Test đa luồng rất hay bị "sảng" (lúc xanh lúc đỏ). Để trị tụi nó:
+- Dùng `CountDownLatch` bắt chúng nó làm diễn viên xếp hàng chờ đạo diễn hô "Action", không phó mặc cho độ trễ hên xui của Hệ điều hành.
+- Bắt buộc kiểm tra `wait_event_type = 'Lock'` trong DB trước khi sang cảnh tiếp theo.
+- Mọi cái wait đều phải có GIỜ CHÓT (Timeout bound).
+- Nhớ xả `Latch` và dọn dẹp Lò Đẻ Luồng trong khối `finally`, lỡ test tạch thì máy không bị treo vĩnh viễn.
+- Dùng ID dữ liệu MỚI TOANH cho mỗi Test để khỏi bị dính rác của bài Test trước.
+- Không dùng trò "Treo vòng lặp spam lệnh cả ngày không dính lỗi thì coi như đậu", cái đó không phải là Bằng Chứng Hợp Lệ!

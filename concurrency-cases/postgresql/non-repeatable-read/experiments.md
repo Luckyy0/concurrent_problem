@@ -1,23 +1,21 @@
-# Deterministic non-repeatable-read experiments
+# Phòng Thí Nghiệm: Ép Lỗi Đọc Không Lặp Lại Bằng Mọi Giá (Deterministic non-repeatable-read experiments)
 
-## Mục tiêu
+## 1. Mục tiêu (Objective)
 
-Test suite cần chứng minh riêng:
+Đã viết Test suite thì phải chứng minh cho bằng được mấy cái này:
 
-1. `READ COMMITTED` có thể thấy revision khác giữa hai SELECT.
-2. Interleaving đó tạo decision vi phạm policy/evidence invariant.
-3. `REPEATABLE READ` giữ stable snapshot nhưng không hứa latest-at-commit.
-4. B rollback không làm revision mới visible.
-5. `FOR SHARE` giữ updater chờ/fail theo bounded timeout.
-6. Conditional validation trả affected-row `0` khi revision đổi.
+1. Chế độ `READ COMMITTED` có thể quăng ra cái `revision` khác nhau giữa hai lệnh SELECT liên tiếp.
+2. Việc chọt ngang (Interleaving) đó đủ sức tạo ra một Quyết định Vi phạm trắng trợn Luật Lệ kinh doanh.
+3. Chế độ `REPEATABLE READ` ráng giữ Bức Ảnh Ổn Định nhưng đéo hứa hẹn nó là Bức Ảnh Mới Nhất (latest-at-commit).
+4. Khi ông B Xù Kèo (rollback), phiên bản mới tuyệt đối KHÔNG ĐƯỢC lòi ra.
+5. Xài Ổ Khóa `FOR SHARE` phải bắt thằng Cập Nhật chờ hoặc Văng Lỗi (fail) đàng hoàng theo mốc Hết Giờ (bounded timeout).
+6. Viết Lệnh Thẩm Định (Conditional validation) phải chả về số dòng cập nhật (affected-row) = `0` khi Luật đổi.
 
-Không dùng delay theo wall clock để điều phối. Latch đặt B commit chính xác giữa
-hai statements; mọi `await` và `Future.get` đều có timeout.
+Nhớ nha: Tuyệt đối KHÔNG dùng mấy cái lệnh dở hơi như Ngủ (Delay theo wall clock) để điều phối. Phải xài Cổng Chặn (Latch) ép sếp B chốt lệnh CHÍNH XÁC ngay giữa 2 lệnh Đọc; Mọi lệnh chờ (`await`) hay `Future.get` ĐỀU PHẢI có giới hạn thời gian (timeout).
 
-> **Nói ngắn gọn:** test phải kiểm soát commit order và assert decision invariant,
-> không chỉ in ra hai giá trị khác nhau rồi phụ thuộc scheduler.
+> **Nói ngắn gọn:** Viết Test là phải Nắm Thóp trật tự Chốt Sổ và tự tay soi Cổng Kiểm Soát Lỗi, chứ KHÔNG CHỈ in mồm ra 2 cái giá trị khác nhau rồi chắp tay cầu nguyện cho Trình Lập Lịch (scheduler) hệ điều hành nó chạy trúng!
 
-## PostgreSQL Testcontainers
+## 2. Dựng Trại Testcontainers (PostgreSQL Testcontainers)
 
 ```java
 @Testcontainers
@@ -96,10 +94,9 @@ class NonRepeatableReadIntegrationTest {
 }
 ```
 
-Test methods không có outer `@Transactional`; mỗi actor tự mở JDBC connection và
-physical transaction riêng.
+Nhắc lại: Trong Test KHÔNG Gắn `@Transactional` lồng bên ngoài (outer). Mỗi diễn viên phải Tự Mở Kết Nối JDBC và Giao dịch vật lý RIÊNG BIỆT của mình!
 
-## Coordination gate
+## 3. Cổng Điều Phối (Coordination gate)
 
 ```java
 final class ReadCommitGate {
@@ -125,11 +122,11 @@ final class ReadCommitGate {
     private static void await(CountDownLatch latch, String step) {
         try {
             if (!latch.await(5, TimeUnit.SECONDS)) {
-                throw new AssertionError("Timed out waiting for " + step);
+                throw new AssertionError("Hết giờ! Đứng chờ " + step + " quá lâu!");
             }
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
-            throw new AssertionError("Interrupted while waiting for " + step, ex);
+            throw new AssertionError("Đang chờ " + step + " thì bị đá văng!", ex);
         }
     }
 }
@@ -145,7 +142,7 @@ record TwoReads(
 }
 ```
 
-## JDBC helpers
+## 4. Các Đồ Nghề JDBC Chặt Chẽ (JDBC helpers)
 
 ```java
 private static PolicyRow readPolicy(Connection connection) throws SQLException {
@@ -219,10 +216,9 @@ private static TwoReads readAroundCommit(
 }
 ```
 
-Nếu writer fail trước commit, reader timeout thay vì treo. Future của writer vẫn
-trả exception gốc cho test diagnostics.
+Kể cả thằng chép (writer) lăn đùng ra chết ngỏm trước khi Chốt, thằng Đọc (reader) cũng sẽ văng lỗi Timeout chứ không treo máy. Bằng chứng Phạm Tội gốc rễ (exception) vẫn nằm trong `Future` để soi.
 
-## Experiment 1 — `READ COMMITTED` thấy revision khác
+## 5. Thí Nghiệm 1 — `READ COMMITTED` Lòi Ra 2 Cái Revision
 
 ```java
 @Test
@@ -248,12 +244,11 @@ void readCommittedUsesANewSnapshotForTheSecondSelect() throws Exception {
 }
 ```
 
-Assertion chính là committed business row thay đổi giữa hai controlled statement
-snapshots.
+Bắt quả tang tận tay sự tráo trở của dữ liệu Kinh doanh ngay giữa 2 lần bấm máy chụp ảnh (statement snapshots).
 
-## Experiment 2 — Broken decision vi phạm invariant
+## 6. Thí Nghiệm 2 — Râu Ông Nọ Cắm Cằm Bà Kia (Broken decision vi phạm invariant)
 
-Reader giữ eligibility từ lần đầu, nhưng insert revision của lần hai:
+Người đọc giữ kết quả xét duyệt từ Tấm Ảnh đầu, nhưng lại thó cái Revision của Tấm Ảnh thứ hai nhét vô CSDL:
 
 ```java
 @Test
@@ -299,6 +294,7 @@ void mixingTwoSnapshotsCreatesAnImpossibleDecision() throws Exception {
     DecisionRow decision = inspector().decision(commandId);
     PolicyRow current = inspector().policy(MERCHANT_ID);
 
+    // Assert CỐ TÌNH SAI LỆCH để Bắt Bài cái Bug!
     assertThat(decision.outcome()).isEqualTo("APPROVED");
     assertThat(decision.policyRevision()).isEqualTo(current.revision());
     assertThat(decision.amount()).isGreaterThan(current.limit());
@@ -306,15 +302,14 @@ void mixingTwoSnapshotsCreatesAnImpossibleDecision() throws Exception {
 }
 ```
 
-Test cố ý assert broken final state để khóa reproduction. Regression test cho
-solution phải đảo lại thành:
+Bài Test này TỰ GIÀY VÒ bản thân, cố tình Assert Cái Kết Tệ Hại để Khóa Cứng (reproduction) cái Bug. Lúc code xong giải pháp, phải lật ngược (Regression test) cái cờ lại thành:
 
 ```java
 assertThat(decision.amount())
     .isLessThanOrEqualTo(policyHistory.limitAt(decision.policyRevision()));
 ```
 
-## Experiment 3 — `REPEATABLE READ` giữ stable snapshot
+## 7. Thí Nghiệm 3 — `REPEATABLE READ` Ôm Khư Khư Tấm Ảnh Đầu
 
 ```java
 @Test
@@ -334,15 +329,14 @@ void repeatableReadKeepsTheTransactionSnapshot() throws Exception {
 
     assertThat(observed.effectiveIsolation()).isEqualTo("repeatable read");
     assertThat(observed.first().revision()).isEqualTo(7);
-    assertThat(observed.second().revision()).isEqualTo(7);
-    assertThat(inspector().policy(MERCHANT_ID).revision()).isEqualTo(8);
+    assertThat(observed.second().revision()).isEqualTo(7); // VẪN LÀ 7 NÀY!
+    assertThat(inspector().policy(MERCHANT_ID).revision()).isEqualTo(8); // THỰC TẾ LÀ 8 RỒI NÀY!
 }
 ```
 
-Cả hai assertions quan trọng: A stable ở revision `7`, nhưng current committed
-policy sau cùng vẫn là revision `8`. Stable không đồng nghĩa latest.
+Lưu ý đoạn này rất đắt giá: Ông A vẫn Đọc được Revision ổn định `7`, nhưng dữ liệu Thật Dưới Database đã chốt là `8`. Đứng Yên Không Đổi (Stable) Không Có Nghĩa là Mới Nhất (latest)!
 
-## Experiment 4 — Updater rollback không visible
+## 8. Thí Nghiệm 4 — Đứa Ghi Xù Kèo (Updater rollback không visible)
 
 ```java
 @Test
@@ -359,7 +353,7 @@ void rolledBackRevisionIsNotVisibleToLaterReadCommittedStatement()
         try (Connection connection = dataSource.getConnection()) {
             connection.setAutoCommit(false);
             updatePolicy(connection, new BigDecimal("50.00"));
-            connection.rollback();
+            connection.rollback(); // B XÙ KÈO!
         }
         gate.signalWriterCommitted();
         return null;
@@ -374,12 +368,11 @@ void rolledBackRevisionIsNotVisibleToLaterReadCommittedStatement()
 }
 ```
 
-Gate name `writerCommitted` ở helper biểu diễn “writer outcome published” trong
-test này; production semantics vẫn phân biệt commit và rollback.
+Chữ `writerCommitted` ở trong helper chỉ có nghĩa là "Cờ Báo Xong Chuyện" thôi nhé, đừng nhầm lẫn với Commit và Rollback Thật trên Production.
 
-## Experiment 5 — `FOR SHARE` chặn policy updater
+## 9. Thí Nghiệm 5 — Bùa `FOR SHARE` Khóa Chặn Mõm Thằng Đổi Luật
 
-Dùng `lock_timeout` để có bounded, deterministic loser:
+Gắn trò Timeout Mới Nhất (`lock_timeout`) để Ép Kẻ Xâm Nhập Bỏ Cuộc:
 
 ```java
 @Test
@@ -438,10 +431,9 @@ void shareLockPreventsPolicyChangeUntilDecisionTransactionEnds()
 }
 ```
 
-SQLSTATE `55P03` là lock-not-available do configured timeout. Sau A commit, một
-transaction mới của B có thể reload row và update thành revision `8`.
+Mã Lỗi SQLSTATE `55P03` nghĩa là Éo-Có-Khóa-Mà-Đợi-Quá-Lâu (lock-not-available). Tránh vỏ dưa gặp vỏ dừa, khi A chốt xong, một Giao dịch MỚI TINH của B vẫn được phép Đọc lại rồi UPDATE lên `8`.
 
-## Experiment 6 — Conditional validation phát hiện revision đổi
+## 10. Thí Nghiệm 6 — Chốt Chặn Bằng Điều Kiện (Conditional validation)
 
 ```java
 @Test
@@ -485,11 +477,11 @@ void conditionalInsertReturnsZeroAfterPolicyRevisionChanges() {
 }
 ```
 
-Test assert cả conflict signal và absence của side effect dở dang.
+Đoạn Test ngầu lòi, vừa kiểm chứng cờ Lỗi Tranh Chấp, vừa chứng tỏ không có "Rác Dữ Liệu" (side effect) nào lọt vô DB.
 
-## Experiment 7 — Version history giữ audit evidence
+## 11. Thí Nghiệm 7 — Kho Lịch Sử Cứng Nhắc Giữ Mạng (Version history giữ audit evidence)
 
-Sau khi migrate schema versioned:
+Sau khi Chuyển Đổi sang Bảng Lưu Lịch Sử (Migrate schema versioned):
 
 ```java
 @Test
@@ -517,19 +509,19 @@ void decisionStillJoinsItsImmutablePolicyAfterCurrentPointerMoves() {
 }
 ```
 
-Đây là business-invariant regression test của recommended audit model.
+Đây là đỉnh cao của Audit Model Regression Test: Dù dòng thời gian trôi đi, Bằng Chứng Quyết Định vẫn Gắn Liền Mãi Mãi với Dữ Liệu Quá Khứ.
 
-## Shared helpers
+## 12. Bãi Rác Bọc Sẵn (Shared helpers)
 
 ```java
 private static void await(CountDownLatch latch, String step) {
     try {
         if (!latch.await(5, TimeUnit.SECONDS)) {
-            throw new AssertionError("Timed out waiting for " + step);
+            throw new AssertionError("Hết giờ chờ " + step);
         }
     } catch (InterruptedException ex) {
         Thread.currentThread().interrupt();
-        throw new AssertionError("Interrupted while waiting for " + step, ex);
+        throw new AssertionError("Bị đá văng lúc đang đợi " + step, ex);
     }
 }
 
@@ -573,7 +565,7 @@ private static void insertApprovedDecision(
 }
 ```
 
-Imports chính:
+Import các Bùa Cần Thiết:
 
 ```java
 import java.math.BigDecimal;
@@ -606,32 +598,32 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 ```
 
-## Coverage matrix
+## 13. Ma Trận Bao Phủ Bài Test (Coverage matrix)
 
-| Experiment | Isolation/lock | Interleaving | Business assertion |
+| Cuộc Thí Nghiệm | Mức Cô lập/Khóa (Isolation/lock) | Việc Trộn Nhau (Interleaving) | Mục Tiêu Kinh Doanh Đã Bắt Được |
 | --- | --- | --- | --- |
-| 1 | `READ COMMITTED` | B commit giữa SELECTs | revision `7 -> 8` |
-| 2 | `READ COMMITTED` | Mix S1 decision/S2 audit | approved evidence inconsistent |
-| 3 | `REPEATABLE READ` | B commit giữa SELECTs | reader `7 -> 7`, current `8` |
-| 4 | `READ COMMITTED` | B update rồi rollback | reader `7 -> 7` |
-| 5 | `FOR SHARE` | B UPDATE khi A giữ lock | B `55P03`, policy unchanged |
-| 6 | Revision predicate | B commit trước final insert | affected-row `0`, no decision |
-| 7 | Immutable history | Pointer chuyển revision | old decision vẫn audit được |
+| 1 | `READ COMMITTED` | B Chốt giữa 2 phát SELECT | Revision Đảo Chiều `7 -> 8` |
+| 2 | `READ COMMITTED` | Râu S1 Cắm Audit S2 | Bằng chứng Duyệt Tan Nát |
+| 3 | `REPEATABLE READ` | B Chốt giữa 2 phát SELECT | A Vẫn Đọc `7 -> 7`, DB là `8` |
+| 4 | `READ COMMITTED` | B Ghi Xong Xù Kèo | Đứa Đọc Vẫn Thấy `7 -> 7` |
+| 5 | `FOR SHARE` | B GHI đè lúc A Giam Khóa | B Văng Lỗi `55P03`, Luật Đứng Yên |
+| 6 | Gắn Điều Kiện Đuôi | B Chốt Trị Số trước Lệnh Ghi Sổ | Cập nhật dòng `0`, Đóng sổ sớm |
+| 7 | Lịch Sử Bất Khả Xâm Phạm | Cổng chỉ tới Revision Mới Nhất | Quyết định xưa Cũ vẫn Dò Lại Được |
 
-## Chống flaky
+## 14. Cách Chống Đứt Gãy Test Nhảm Nhí (Chống flaky)
 
-- Không dùng wall-clock delay để đặt commit giữa SELECTs.
-- Mọi latch/future có timeout và giữ interrupt flag.
-- Reader/writer dùng connection riêng; test method không có outer transaction.
-- Chạy class `SAME_THREAD` vì dùng shared container state.
-- Reset committed data trước mỗi test.
-- Khi timeout, dump `pg_stat_activity` và `pg_locks` thay vì tăng timeout tùy ý.
-- Assert `current_setting('transaction_isolation')`, SQLSTATE và final rows.
-- H2 không được dùng làm bằng chứng cho PostgreSQL MVCC.
+- Cấm Tuyệt Đối trò Ngủ 1 giây để chốt sổ!
+- Mọi nút bấm Cổng (latch)/Tương lai (future) bắt buộc xài Timeout và Giữ cờ ngắt mạch (interrupt flag).
+- Người Đọc/Người Ghi Bắt buộc Dùng 2 Kênh (connection) riêng. File Test không Đội Mũ Giao Dịch ngoài cùng.
+- Phải nhốt các hàm chạy vào Chung 1 luồng (`SAME_THREAD`) vì xài chung CSDL Container.
+- Diệt sạch cỏ (Reset committed data) trước khi chạy mỗi hàm test.
+- Khi bị Dính Timeout, in mọe cái Dump `pg_stat_activity` và `pg_locks` ra màn hình, đừng có rảnh mà vặn tăng thời gian Timeout nhé.
+- Xác Minh Kép: Xem Trị Số Mức Cô Lập đang xài (`current_setting`), Mã SQLSTATE văng ra và Tình Trạng Hàng Cuối cùng.
+- Cấm Lấy Cái CSDL Đồ Chơi H2 ra để bao biện cho Tính Năng MVCC Khủng Bố Của PostgreSQL!
 
-## Production verification
+## 15. Bộ Câu Hỏi Bắt Lỗi Cho Dân Cấp Cứu Production (Production verification)
 
-Queries chẩn đoán:
+Bắn Câu Hình Tội Phạm:
 
 ```sql
 select pid,
@@ -646,6 +638,8 @@ from pg_stat_activity
 where datname = current_database();
 ```
 
+Soi Băng Nhóm Cầm Khóa:
+
 ```sql
 select l.pid,
        l.locktype,
@@ -659,15 +653,14 @@ where l.relation in (
 );
 ```
 
-Metrics/logs:
+Bảng Phong Thần Metrics/Logs:
 
-- `refund.policy_revision_mismatch`;
-- `refund.conditional_insert_noop`;
-- `refund.decision_retry`;
-- `db.lock_wait` và `db.lock_timeout`;
-- `db.serialization_failure`;
-- transaction duration;
-- approved decisions không join được immutable policy version.
+- `refund.policy_revision_mismatch`: Phát còi hụ Lệch Phiên Bản!
+- `refund.conditional_insert_noop`: Vỗ Tay vì Ghi Đè Hụt!
+- `refund.decision_retry`: Sổ tay số lần Thử Lại Quyết Định;
+- `db.lock_wait` và `db.lock_timeout`: Khóc thé vì Chờ Khóa quá lâu;
+- `db.serialization_failure`: Chết Ngắt vì Vi Phạm Phân Tách;
+- Đo thời gian ngâm Giao dịch (transaction duration);
+- Cảnh Cáo Số Lượng Quyết Định Đã Duyệt Mà Éo Dò Được Lịch Sử.
 
-Production canary nên kiểm tra join/invariant trên committed rows, không suy luận
-từ exception count bằng `0`.
+Chó săn (Canary) thả vô Production thì phải rà soát được Cái Invariant trên Đống Dữ Liệu Đã Chốt Sổ, đéo được phán an toàn bằng cách "Ồ, không thấy Bắn Exception Count lên đồ thị".

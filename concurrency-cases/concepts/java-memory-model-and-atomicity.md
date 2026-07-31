@@ -1,63 +1,51 @@
-# Java Memory Model, tính nguyên tử và trạng thái dùng chung
+# Mô hình bộ nhớ Java (Java Memory Model), Tính nguyên tử và Trạng thái dùng chung
 
-## Mục đích
+## Mục tiêu
 
-Tài liệu này giải thích nền tảng cho các case có nhiều luồng cùng truy cập một
-object trong một JVM. Mục tiêu là phân biệt ba đặc tính thường bị nhầm lẫn:
+Tài liệu này giải thích các nền tảng cơ bản khi bạn có nhiều luồng (thread) cùng lúc truy cập vào một đối tượng (object) trong ứng dụng Java. Mục tiêu quan trọng nhất là giúp bạn phân biệt rõ 3 đặc tính rất hay bị nhầm lẫn với nhau:
 
-- **tính nguyên tử** (`atomicity`): thao tác có thể bị luồng khác chen vào giữa
-  chừng hay không;
-- **khả năng nhìn thấy thay đổi** (`visibility`): một luồng có nhìn thấy giá trị
-  mà luồng khác vừa ghi hay không;
-- **thứ tự quan sát** (`ordering`): compiler, JVM và CPU được phép sắp xếp hoặc
-  quan sát các thao tác theo thứ tự nào.
+- **Tính nguyên tử** (`atomicity`): Thao tác có thể bị luồng khác chen ngang phá bĩnh vào giữa chừng hay không?
+- **Khả năng nhìn thấy** (`visibility`): Nếu một luồng vừa sửa dữ liệu xong, luồng khác có nhìn thấy ngay sự thay đổi đó hay không?
+- **Thứ tự quan sát** (`ordering`): Máy ảo Java (JVM) và CPU được phép tự do sắp xếp lại thứ tự các dòng code của bạn như thế nào để tối ưu tốc độ?
 
-Một chương trình có thể bảo đảm khả năng nhìn thấy nhưng vẫn sai về tính nguyên
-tử. Ví dụ, `volatile long counter` giúp các luồng nhìn thấy giá trị mới hơn,
-nhưng `counter++` vẫn gồm ba bước riêng:
-
+Một đoạn code có thể bảo đảm mọi người đều nhìn thấy dữ liệu mới (visibility), nhưng vẫn bị sai về tính nguyên tử (atomicity). 
+Ví dụ kinh điển: Dùng từ khóa `volatile long counter` giúp các luồng luôn nhìn thấy giá trị mới nhất. Nhưng lệnh `counter++` thực chất lại gồm 3 bước rời rạc:
 ```text
-đọc counter → cộng 1 → ghi counter
+(1) Đọc counter hiện tại → (2) Cộng thêm 1 → (3) Ghi lại vào counter
 ```
+Giữa 3 bước này, một luồng khác hoàn toàn có thể chen ngang vào!
 
-## Thuật ngữ chính
+## Các thuật ngữ chính cần hiểu
 
-| Thuật ngữ | Ý nghĩa trong tài liệu này |
+| Thuật ngữ | Giải thích dễ hiểu |
 | --- | --- |
-| `Java Memory Model` | Bộ quy tắc xác định một luồng được phép nhìn thấy giá trị nào |
-| `atomicity` | Tính không thể bị chen ngang giữa chừng |
-| `visibility` | Khả năng một luồng nhìn thấy thay đổi của luồng khác |
-| `ordering` | Thứ tự mà các thao tác được phép quan sát |
-| `happens-before` | Quan hệ bảo đảm visibility và ordering giữa hai action |
-| `compound operation` | Thao tác logic được tạo từ nhiều bước nhỏ |
-| `safe publication` | Công bố object theo cách các luồng khác nhìn thấy state hoàn chỉnh |
-| `thread confinement` | Chỉ cho một luồng sở hữu và thay đổi state |
+| Mô hình bộ nhớ Java (`Java Memory Model` - JMM) | Bộ luật của Java quy định xem một luồng được phép nhìn thấy giá trị nào do luồng khác ghi xuống. |
+| Tính nguyên tử (`atomicity`) | Một thao tác là nguyên tử nếu nó chạy một mạch từ đầu đến cuối, không ai có thể chen ngang. |
+| Khả năng nhìn thấy (`visibility`) | Đảm bảo khi luồng A sửa biến X, luồng B ngay lập tức nhìn thấy X đã thay đổi. |
+| Thứ tự quan sát (`ordering`) | Trật tự mà các hành động thực sự diễn ra dưới góc nhìn của các luồng khác. |
+| Xảy ra-trước (`happens-before`) | Một quy tắc cốt lõi: Nếu A "xảy ra-trước" B, thì B chắc chắn sẽ nhìn thấy mọi thay đổi do A làm ra. |
+| Thao tác ghép (`compound operation`) | Một chuỗi xử lý logic được tạo thành từ nhiều bước nhỏ (ví dụ: `counter++` hoặc `if(x > 0) x--`). |
+| Công bố an toàn (`safe publication`) | Cách bạn chia sẻ một object cho các luồng khác sao cho chúng thấy được trạng thái hoàn chỉnh, không bị "mẻ" dữ liệu. |
+| Giam giữ trong luồng (`thread confinement`) | Chiến thuật an toàn nhất: Tuyệt đối chỉ cho đúng một luồng được quyền giữ và sửa dữ liệu đó. |
 
-## Java Memory Model và quan hệ xảy ra-trước
+## Mô hình bộ nhớ Java (JMM) và quy tắc Xảy ra-trước (happens-before)
 
-Java Memory Model (JMM) xác định giá trị mà một thao tác đọc được phép quan sát.
-Nó dùng quan hệ **xảy ra-trước** (`happens-before`) để nối các action giữa nhiều
-luồng.
+JMM sử dụng một khái niệm gọi là quan hệ **xảy ra-trước** (`happens-before`) để kết nối các hành động giữa nhiều luồng với nhau. 
 
-Một số quan hệ quan trọng:
+Dưới đây là một số luật "xảy ra-trước" quan trọng nhất:
+- Hành động **mở khóa** (unlock) luôn xảy ra-trước hành động **khóa** (lock) tiếp theo trên cùng một ổ khóa đó.
+- Hành động **ghi** vào một biến `volatile` luôn xảy ra-trước hành động **đọc** tiếp theo trên chính biến đó.
+- Bất cứ hành động nào bạn làm trước khi gọi `Thread.start()` đều xảy ra-trước mọi hành động bên trong luồng mới được tạo.
+- Mọi hành động bên trong một luồng đã kết thúc đều xảy ra-trước thời điểm một luồng khác thoát khỏi hàm `Thread.join()`.
+- Các câu lệnh viết liền nhau trong cùng một luồng thì lệnh trên xảy ra-trước lệnh dưới (tuân theo đúng thứ tự code của bạn).
 
-- thao tác mở khóa một monitor xảy ra-trước lần khóa tiếp theo trên cùng monitor;
-- thao tác ghi vào field `volatile` xảy ra-trước lần đọc tiếp theo của field đó;
-- action trước `Thread.start()` xảy ra-trước action trong thread mới;
-- action của thread đã hoàn tất xảy ra-trước khi thread khác trở về từ
-  `Thread.join()`;
-- các action trong cùng một thread tuân theo program order của thread đó.
+Quy tắc này giúp đảm bảo luồng đi sau sẽ nhận được dữ liệu đúng của luồng đi trước. Tuy nhiên, nó **không** biến một chuỗi nhiều bước thành một thao tác nguyên tử.
 
-Quan hệ xảy ra-trước giúp truyền giá trị và thứ tự quan sát giữa các luồng. Nó
-không tự biến một chuỗi nhiều bước thành một thao tác nguyên tử.
+> **Nói ngắn gọn:** Nhìn thấy đúng giá trị mới nhất KHÔNG có nghĩa là luồng của bạn sẽ không bị chen ngang giữa chừng khi thực hiện các bước xử lý.
 
-> **Nói ngắn gọn:** nhìn thấy đúng giá trị không đồng nghĩa với việc toàn bộ
-> chuỗi xử lý được thực hiện như một bước duy nhất.
+## Thao tác nguyên tử và các quy tắc gồm nhiều bước
 
-## Thao tác nguyên tử và quy tắc gồm nhiều bước
-
-Một lần đọc hoặc ghi reference riêng lẻ có thể là nguyên tử, nhưng quy tắc cần
-bảo vệ thường gồm nhiều thao tác:
+Một thao tác đọc hoặc ghi biến đơn giản thì có thể là nguyên tử. Nhưng lỗi thường xảy ra ở các khối code có điều kiện logic:
 
 ```java
 if (remaining > 0) {
@@ -65,80 +53,64 @@ if (remaining > 0) {
 }
 ```
 
-Quy tắc `remaining >= 0` trải qua chuỗi đọc–quyết định–ghi. Muốn bảo vệ toàn bộ
-chuỗi, mọi actor phải dùng cùng một cơ chế phối hợp, chẳng hạn:
+Đoạn code trên bao gồm một chuỗi: Đọc kiểm tra → Quyết định → Ghi trừ đi. 
+Để bảo vệ toàn bộ chuỗi này khỏi việc bị luồng khác chen ngang, TẤT CẢ các luồng tham gia phải dùng chung một "ổ khóa", ví dụ như:
+- Dùng chung khóa qua từ khóa `synchronized`.
+- Dùng chung đối tượng `Lock` (như ReentrantLock).
+- Dùng vòng lặp so-sánh-và-cập-nhật (`compare-and-set` - CAS).
+- Thiết kế code sao cho chỉ một luồng duy nhất được quyền sửa biến đó.
+- **Tốt nhất:** Thiết kế code không có trạng thái dùng chung (loại bỏ hoàn toàn các biến toàn cục có thể thay đổi).
 
-- cùng một monitor qua `synchronized`;
-- cùng một `Lock`;
-- vòng lặp compare-and-set;
-- chỉ cho một luồng sở hữu state;
-- loại bỏ hoàn toàn trạng thái dùng chung có thể thay đổi.
+**Lưu ý:** Việc bạn dùng một biến an toàn (thread-safe) không có nghĩa là toàn bộ logic của bạn an toàn. Ví dụ: Dùng `AtomicLong sequence` chỉ bảo vệ được việc tăng số `sequence`. Nó không thể bảo vệ được một quy tắc đòi hỏi phải cập nhật cùng lúc hai biến `(sequence, customerId)`.
 
-Một field an toàn cho nhiều luồng không tự bảo vệ quy tắc gồm nhiều field. Ví dụ,
-`AtomicLong sequence` chỉ bảo vệ sequence; nó không bảo vệ cặp
-`(sequence, customerId)` nếu `customerId` vẫn là field dùng chung.
+## Bảng so sánh Volatile, Biến Atomic và Khóa
 
-## volatile, biến atomic và khóa
-
-| Cơ chế | Điều được bảo đảm | Điều không tự được bảo đảm |
+| Cơ chế | Điểm mạnh (Bảo đảm được) | Điểm yếu (Không tự bảo đảm được) |
 | --- | --- | --- |
-| `volatile` | Visibility và ordering quanh một field | Tính nguyên tử của chuỗi nhiều bước |
-| `AtomicLong` | Thao tác atomic/CAS trên một value | Quy tắc gồm nhiều field |
-| `synchronized` | Mutual exclusion và happens-before trên cùng monitor | Phối hợp giữa nhiều JVM |
-| `ReentrantLock` | Mutual exclusion cùng timeout/interrupt policy | Correctness nếu actor dùng lock khác |
-| Immutable object | State không đổi sau safe publication | Tính nguyên tử của workflow bên ngoài object |
+| Từ khóa `volatile` | Đảm bảo tính nhìn thấy (visibility) và thứ tự (ordering) cho duy nhất một biến. | KHÔNG bảo vệ được chuỗi nhiều bước (`counter++`). |
+| `AtomicLong` | Bảo vệ hoàn hảo (atomic/CAS) khi tính toán trên một giá trị duy nhất. | KHÔNG bảo vệ được quy tắc liên quan đến nhiều biến cùng lúc. |
+| Khối `synchronized` | Bảo vệ độc quyền (mutual exclusion) và thứ tự xảy ra-trước trên cùng một ổ khóa (monitor). | KHÔNG thể phối hợp khóa giữa 2 server (JVM) khác nhau. |
+| `ReentrantLock` | Bảo vệ độc quyền, kèm theo tính năng nâng cao như giới hạn thời gian chờ (timeout) hoặc ngắt (interrupt). | Vẫn sẽ sai nếu luồng khác cố tình dùng một ổ khóa khác. |
+| Biến bất biến (`Immutable object`) | Trạng thái không bao giờ bị đổi sau khi khởi tạo thành công (safe publication). | KHÔNG giúp chuỗi xử lý logic ở bên ngoài object trở thành nguyên tử. |
 
-Các từ trong bảng được giữ bằng tiếng Anh khi chúng là tên API hoặc khái niệm
-cần tra cứu trực tiếp. Trong phần diễn giải, có thể hiểu:
+*(Một vài định nghĩa bổ sung cho người mới:)*
+- `Mutual exclusion` (Độc quyền): Tại một thời điểm, chỉ cho phép đúng 1 luồng được đi qua cửa để vào khối code.
+- `Compare-and-set` (CAS): Kỹ thuật "So sánh rồi mới cập nhật". Nó chỉ ghi giá trị mới xuống nếu giá trị hiện tại dưới RAM vẫn y hệt như giá trị mà nó vừa đọc lúc nãy.
 
-- `mutual exclusion`: tại một thời điểm chỉ một luồng được vào vùng bảo vệ;
-- `compare-and-set` (CAS): chỉ ghi giá trị mới nếu giá trị hiện tại vẫn đúng như
-  lúc đã quan sát;
-- immutable object: object không thay đổi state sau khi được tạo hoàn chỉnh.
+**Lời khuyên vàng:** Hãy ưu tiên thiết kế các service phi trạng thái (stateless) hoặc dùng các object bất biến (immutable) trước khi nghĩ đến việc dùng khóa (lock). Không có biến dùng chung thì sẽ không bao giờ có lỗi tranh chấp luồng!
 
-Ưu tiên thiết kế service không giữ trạng thái request hoặc dùng immutable object
-trước khi thêm lock. Không có trạng thái dùng chung thì cũng không còn vùng cần
-tranh chấp.
+## Công bố đối tượng an toàn (Safe publication)
 
-## Công bố object an toàn
+Một đối tượng (object) chỉ thực sự an toàn và bất biến (immutable) trong mắt các luồng khác khi đạt đủ 4 điều kiện:
+1. Toàn bộ dữ liệu của object phải được gán xong xuôi đâu vào đấy trước khi được tung ra cho luồng khác xài.
+2. Các biến bên trong nên được khai báo là `final`.
+3. Trong lúc hàm khởi tạo (`constructor`) đang chạy, tuyệt đối không được để lọt từ khóa `this` ra ngoài.
+4. Object phải được chia sẻ cho luồng khác thông qua một quan hệ "xảy ra-trước" hợp lệ.
 
-Một object chỉ thực sự immutable đối với các luồng khác khi:
+Trong Spring Boot, các Bean (dạng singleton) được Spring công bố rất an toàn sau khi khởi tạo xong. Tuy nhiên, điều đó **chỉ** đảm bảo các luồng nhìn thấy Bean đã được tạo hoàn chỉnh. Nếu bên trong Bean đó bạn cố tình viết một biến có thể thay đổi (mutable field) rồi sửa nó khi xử lý request, thì code của bạn vẫn sẽ bị lỗi đa luồng như thường!
 
-1. state được thiết lập hoàn chỉnh trước khi công bố;
-2. các field phù hợp được khai báo `final`;
-3. reference `this` không thoát khỏi constructor;
-4. object được công bố qua một quan hệ xảy ra-trước hợp lệ.
+## Ranh giới giữa một máy ảo (JVM) và nhiều máy chủ (Application Instances)
 
-Spring công bố singleton bean an toàn sau khi khởi tạo. Điều đó chỉ bảo đảm các
-luồng nhìn thấy bean đã được tạo hoàn chỉnh; nó không làm cho mutable field được
-cập nhật trong lúc xử lý request trở nên an toàn.
-
-## Ranh giới giữa một JVM và nhiều application instance
-
-Mỗi application instance có heap, monitor và biến atomic riêng:
+Mỗi khi bạn chạy một ứng dụng Java, nó sẽ nằm trong một máy ảo (JVM). Mỗi máy ảo có vùng nhớ (heap), ổ khóa (monitor) và biến atomic CỦA RIÊNG NÓ:
 
 ```text
-Load Balancer
-    ├── App A: counter = 42, lock A
-    └── App B: counter = 42, lock B
+Cân bằng tải (Load Balancer)
+    ├── Máy chủ A: counter = 42, giữ ổ khóa A
+    └── Máy chủ B: counter = 42, giữ ổ khóa B
 ```
 
-`AtomicLong`, `synchronized` hoặc `ReentrantLock` trong App A không phối hợp với
-App B. Nếu quy tắc nghiệp vụ dùng chung giữa nhiều node, nó phải được bảo vệ tại
-ranh giới authoritative dùng chung, ví dụ:
+Việc bạn dùng `AtomicLong`, `synchronized` hay `ReentrantLock` trong code của Máy chủ A **hoàn toàn không có tác dụng gì** đối với Máy chủ B. 
+Nếu bạn có một quy tắc nghiệp vụ cần chạy chung cho cả 2 máy chủ (ví dụ: trừ tiền tài khoản), bạn BẮT BUỘC phải phối hợp khóa ở tầng cơ sở dữ liệu chung, ví dụ như:
+- Các ràng buộc của cơ sở dữ liệu (Database constraint).
+- Lệnh SQL cập nhật có điều kiện (Conditional SQL).
+- Lệnh khóa dòng (Row lock).
+- Bảng lưu dấu vân tay chống trùng lặp (Durable idempotency record).
+- Cơ chế thuê quyền (Protocol lease/fencing) phù hợp khi có máy chủ bị sập.
 
-- database constraint;
-- conditional SQL;
-- row lock;
-- durable idempotency record;
-- protocol lease/fencing phù hợp với failure model.
+> **Nói ngắn gọn:** Các loại Khóa trong Java (như `synchronized`) chỉ bảo vệ được các luồng chạy bên trong cùng một cái máy tính (tiến trình). Nó vô dụng khi bạn chạy ứng dụng trên nhiều máy chủ khác nhau!
 
-> **Nói ngắn gọn:** khóa Java bảo vệ các luồng trong một tiến trình, không bảo vệ
-> toàn bộ cụm application.
-
-## Liên kết
+## Liên kết tài liệu tham khảo
 
 - Case áp dụng trực tiếp: [JVM-001](../jvm/spring-singleton-mutable-state/README.md)
 - Kỹ thuật kiểm thử: [Kiểm thử đồng thời](concurrency-testing.md)
-- Các case liên quan trong [catalog](../CONCURRENCY_CASE_LIBRARY.md):
-  `JVM-005`, `JVM-006`, `DB-001`
+- Các case liên quan trong [catalog](../CONCURRENCY_CASE_LIBRARY.md): `JVM-005`, `JVM-006`, `DB-001`

@@ -1,6 +1,8 @@
-# Giải pháp bounded retry với fresh attempt
+# Giải pháp Code Chuẩn: Thử lại Có Chừng Mực (Bounded Retry) và Sạch Sẽ (Fresh Attempt)
 
-## One-attempt worker
+## 1. Người Lính Đánh Thuê (One-attempt worker)
+
+Nhiệm vụ của anh lính này chỉ đơn giản là: Vào trong, làm việc 1 lần duy nhất, thất bại thì báo cáo. Không tự ý thử lại!
 
 ```java
 @Service
@@ -20,8 +22,10 @@ public class RewardCreditAttempt {
         this.outbox = outbox;
     }
 
+    // BẮT BUỘC tạo Giao dịch mới tinh cho mỗi lần gọi
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public CreditResult creditOnce(CreditCommand command) {
+        // Kiểm tra chống trùng trước tiên
         var existing = credits.findById(command.commandId());
         if (existing.isPresent()) {
             return CreditResult.replayed(existing.orElseThrow());
@@ -29,7 +33,7 @@ public class RewardCreditAttempt {
 
         RewardWallet wallet = wallets.findById(command.walletId())
                 .orElseThrow();
-        wallet.requireActive();
+        wallet.requireActive(); // Bóp nghẹt mấy cái Ví đã bị khóa
         wallet.credit(command.points());
 
         credits.save(RewardCredit.from(command));
@@ -42,22 +46,20 @@ public class RewardCreditAttempt {
 }
 ```
 
-`REQUIRES_NEW` phù hợp vì coordinator là root không có outer transaction.
-Independent commit/extra connection cost phải được chấp nhận; guard architecture
-ngăn transactional caller bọc coordinator.
+`REQUIRES_NEW` cực kỳ phù hợp ở đây vì Class Chỉ huy (bên ngoài) hoàn toàn không có Giao dịch. Mặc dù tốn kém thêm chút kết nối (connection cost) cho mỗi Giao dịch mới, nhưng đó là cái giá phải trả để hệ thống không bị dính chùm. (Lưu ý: Phải có rào cản chặn mấy Class khác vô tình bọc cái Chỉ huy lại).
 
-## Retry policy
+## 2. Luật Thử Lại (Retry policy)
 
 ```java
 public record RetryBudget(
         int maxAttempts,
-        Duration initialBackoff,
-        Duration maxBackoff
+        Duration initialBackoff, // Thời gian ngủ lần đầu
+        Duration maxBackoff      // Ngưỡng ngủ tối đa không được vượt qua
 ) {
     public RetryBudget {
         if (maxAttempts < 1 || initialBackoff.isNegative()
                 || maxBackoff.compareTo(initialBackoff) < 0) {
-            throw new IllegalArgumentException("invalid retry budget");
+            throw new IllegalArgumentException("Ngân sách thử lại sai quy tắc!");
         }
     }
 }
@@ -68,6 +70,7 @@ public class OptimisticRetryPolicy {
     private final Clock clock;
     private final RetryBudget budget;
 
+    // Phải thỏa mãn cả 2 điều kiện: Còn ngân sách số lần VÀ chưa hết giờ
     public boolean canRetry(int completedAttempts, Instant deadline) {
         return completedAttempts < budget.maxAttempts()
                 && clock.instant().isBefore(deadline);
@@ -75,14 +78,14 @@ public class OptimisticRetryPolicy {
 }
 ```
 
-> **Nói ngắn gọn:** attempts giới hạn database work; deadline giới hạn user-visible
-> time. Không cái nào thay thế cái kia.
+> **Nhớ kỹ:** Giới hạn Số lần (attempts) là để cứu Database khỏi quá tải; còn Giới hạn Thời gian (deadline) là để API phản hồi cho User kịp lúc. Thiếu 1 trong 2 là toang!
 
-## Backoff có jitter và testable
+## 3. Ngủ ngẫu nhiên (Backoff có jitter) và Dễ viết Test
 
-Tách calculation khỏi waiting:
+Phải tách biệt "Thuật toán tính giờ ngủ" và "Hành động ngủ" ra làm 2 cái riêng:
 
 ```java
+// Đồ xóc đĩa ngẫu nhiên
 public interface JitterSource {
     long nextLong(long exclusiveUpperBound);
 }
@@ -93,6 +96,7 @@ public final class BackoffPlan {
     private final JitterSource jitter;
 
     public Duration delayAfter(int completedAttempt) {
+        // Hàm số mũ: 1, 2, 4, 8... tối đa mũ 10
         long factor = 1L << Math.min(completedAttempt - 1, 10);
         long base = Math.min(
                 budget.maxBackoff().toMillis(),
@@ -101,6 +105,7 @@ public final class BackoffPlan {
                         factor
                 )
         );
+        // Trộn thêm "gia vị" thời gian ngẫu nhiên
         long extra = jitter.nextLong(Math.max(1, base / 2 + 1));
         return Duration.ofMillis(
                 Math.min(budget.maxBackoff().toMillis(), base + extra)
@@ -109,7 +114,7 @@ public final class BackoffPlan {
 }
 ```
 
-Waiter abstraction tôn trọng deadline/interrupt:
+Hành động Ngủ phải Tôn trọng người khác (lỡ bị gọi ngắt ngang interrupt):
 
 ```java
 public interface RetryWaiter {
@@ -117,10 +122,11 @@ public interface RetryWaiter {
 }
 ```
 
-Production có thể dùng scheduler hoặc interruptible parking; test dùng recording
-waiter, không fixed sleep.
+Trên Production bạn xài Scheduler hay Parking tùy ý, nhưng khi viết Test thì dùng đồ giả (Recording waiter) để test chạy vèo vèo không phải chờ `sleep`.
 
-## Non-transactional coordinator
+## 4. Kẻ Chỉ Huy Không Giao Dịch (Non-transactional coordinator)
+
+Đây mới là ngôi sao chính của chúng ta:
 
 ```java
 @Service
@@ -133,6 +139,7 @@ public class RewardCreditCoordinator {
     private final Clock clock;
 
     public CreditResult credit(CreditCommand command, Instant deadline) {
+        // Đạp văng ra nếu thằng nào nhét Tui vào chung Transaction
         if (TransactionSynchronizationManager
                 .isActualTransactionActive()) {
             throw new IllegalStateException(
@@ -142,20 +149,27 @@ public class RewardCreditCoordinator {
 
         for (int attempt = 1; ; attempt++) {
             try {
+                // Thả chó... à nhầm, thả Lính Đánh Thuê vào làm việc
                 return attempts.creditOnce(command);
             } catch (ObjectOptimisticLockingFailureException conflict) {
+                // Có Lỗi! Lấy Luật ra soi!
                 if (!policy.canRetry(attempt, deadline)) {
+                    // Cạn kiệt ngân sách hoặc hết giờ, văng cờ trắng đầu hàng
                     throw new WalletContentionException(
                             command.commandId(),
                             attempt,
                             conflict
                     );
                 }
+                
+                // Xem xem thời gian tối đa còn lại là bao nhiêu
                 Duration remaining = Duration.between(
                         clock.instant(),
                         deadline
                 );
+                // Chọn thời gian ngủ nhỏ nhất giữa Tính Toán và Thời Gian Còn Lại
                 Duration delay = min(backoff.delayAfter(attempt), remaining);
+                // Ôm gối đi ngủ ngoài phòng khách (Ngoài Transaction)
                 waiter.waitFor(delay, deadline);
             }
         }
@@ -163,15 +177,12 @@ public class RewardCreditCoordinator {
 }
 ```
 
-Catch chạy sau attempt proxy rollback. `min` chọn duration nhỏ hơn. Production
-code inject dependencies/validated config bằng constructor.
+Nhớ nhé, khối `catch` chạy lúc này là Proxy Giao Dịch đã bị tiêu hủy xong xuôi! Code Production xịn luôn bơm đồ vào bằng Constructor chứ không chơi `@Autowired` dơ dáy nha.
 
-## Duplicate command race
+## 5. Cuộc đua Bấm Đúp (Duplicate command race)
 
-Hai requests cùng command ID có thể cùng thấy record absent. Unique primary key
-chọn winner; loser rollback. Coordinator chỉ replay `23505` nếu constraint chính
-xác là `reward_credit_pkey`, bằng fresh read transaction. Unique failure khác
-propagate.
+Hai yêu cầu y hệt nhau lọt vào 2 luồng. Khóa chính `reward_credit_pkey` sẽ phán quyết thằng nào đi sau bị nổ (unique failure). 
+Tuy nhiên, lỗi Unique này không được tính là lỗi Khóa Lạc Quan nên vòng lặp sẽ bị bẻ gãy. Class bên ngoài sẽ bắt được, mở thêm một Giao Dịch "Chỉ Đọc" cực nhanh để lôi kết quả cũ ra gửi trả về (replay):
 
 ```java
 @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
@@ -182,16 +193,19 @@ public CreditResult requireCommitted(UUID commandId) {
 }
 ```
 
-Không phân loại duplicate-command race là optimistic retry.
+Lỗi Trùng Lặp Khóa (Duplicate) hoàn toàn khác với Lỗi Đụng Độ Dữ Liệu (Optimistic Retry), đừng gộp chung nhé!
 
-## Spring Retry alternative
+## 6. Xài hàng có sẵn của Spring (`@Retryable`)
 
-`@Retryable` dùng được khi retry advisor nằm ngoài transactional worker bean,
-exception type allowlisted, max attempts/backoff/exhaustion rõ. Overall deadline
-và transaction identity vẫn cần integration test. Separate beans dễ audit hơn
-đặt `@Retryable` + `@Transactional` cùng method.
+Bạn hoàn toàn có thể dùng `@Retryable` của Spring thay vì tự viết Vòng Lặp. NHƯNG hãy cẩn thận:
 
-## TransactionTemplate alternative
+- Bắt buộc phải đặt `@Retryable` ở Class Chỉ Huy bên ngoài, còn thằng Lính bên trong vẫn mang `@Transactional(REQUIRES_NEW)`. Tuyệt đối không đặt hai Annotation này chung 1 chỗ!
+- Phải lọc riêng Exception.
+- Rất khó để kiểm soát cái `overall deadline` (hết hạn tổng). Lời khuyên là tách Bean riêng như cách trên dễ Audit và bảo trì hơn.
+
+## 7. Giải pháp xài `TransactionTemplate` (Code chay)
+
+Nếu lười chia thành 2 Class, bạn xài Code chay cũng được:
 
 ```java
 var tx = new TransactionTemplate(transactionManager);
@@ -201,27 +215,29 @@ tx.setPropagationBehavior(
 
 for (int attempt = 1; ; attempt++) {
     try {
+        // Cục execute này sẽ mở và đóng Giao dịch gọn gàng
         return tx.execute(status -> work.credit(command));
     } catch (ObjectOptimisticLockingFailureException conflict) {
-        // policy/deadline/backoff ngoài completed transaction
+        // Lúc nhảy xuống đây thì Giao dịch đã chết ngủ yên rồi
+        // Áp dụng luật/deadline/backoff y như trên
     }
 }
 ```
 
-Không cache entity ngoài `execute`.
+**Nhớ:** Không được nhét (cache) Entity ôi thiu từ bên ngoài vào trong `execute`.
 
-## Exhaustion contract
+## 8. Hợp đồng "Cạn Kiệt Sinh Lực" (Exhaustion contract)
 
-Exhaustion là explicit technical contention outcome:
+Một khi đã báo lỗi Kiệt Sức, bạn phải trả thẳng về phía Client:
 
-- synchronous API: `409/503` tùy contract, `Retry-After` chỉ khi có ý nghĩa;
-- async durable command: giữ pending/requeue bằng workflow riêng;
-- không trả success nếu không có `reward_credit`;
-- caller query status bằng command ID khi outcome ambiguous.
+- API đồng bộ: Táng mã `409 Conflict` hoặc `503 Service Unavailable`. Có thể gửi kèm `Retry-After` (thử lại sau chừng đó giây).
+- API bất đồng bộ: Nhét vào Hàng đợi (Queue) chờ cứu xét sau (workflow riêng).
+- Tuyệt đối không xạo chó báo "Success 200" nếu bảng `reward_credit` chưa có dữ liệu.
+- Cho phép người dùng hoặc App tự tra cứu trạng thái bằng Mã `command ID` nếu mọi chuyện không rõ ràng.
 
-## Alternatives khi contention tăng
+## 9. Các Phương Án Khác khi Đụng Độ Quá Gắt
 
-### Atomic delta
+### Phép màu Cộng Trừ Nguyên Tử (Atomic delta)
 
 ```sql
 update reward_wallet
@@ -229,49 +245,46 @@ set points = points + :delta
 where wallet_id = :id;
 ```
 
-Commutative delta có thể tránh read/version retry; idempotency record vẫn phải
-cùng transaction. Đây thường là lựa chọn nhỏ hơn cho simple counter.
+Chỉ cần update cộng/trừ thẳng vào DB mà khỏi cần quan tâm Version! Thường dùng cho các bộ đếm đơn giản. Nhưng nhớ là cái bảng Lưu lịch sử (idempotency) vẫn phải nằm chung một Transaction đó nha.
 
-### Pessimistic lock
+### Khóa Bi Quan (Pessimistic lock)
 
-Serialize trước calculation, giảm wasted retries nhưng tăng wait/connection
-occupancy và deadlock/timeout policy.
+Khóa mõm luôn dòng dữ liệu. Giảm bớt số lần đập đầu thử lại vô ích, nhưng đổi lại làm đám luồng chờ chực tắc đường (wait/connection occupancy), dễ dính Tử Trận (Deadlock). Khó ăn lắm!
 
-### Per-key queue/ownership
+### Hàng đợi riêng biệt (Per-key queue/ownership)
 
-Giảm concurrent writers nhưng thêm ordering, delivery, crash và operational
-complexity. Xem selection framework `LOCK-005`.
+Giảm được đua đòi chen lấn, nhưng phải thiết kế hệ thống xếp hàng rất phức tạp (đọc, lưu, sập nguồn...). Hãy đọc qua `LOCK-005` để xem cách chọn hệ thống.
 
-## Failure matrix
+## 10. Ma Trận Giải Quyết Thất Bại
 
-| Outcome | Retry? | State |
+| Hậu quả | Có thử lại không? | Tình trạng hiện tại |
 | --- | --- | --- |
-| Optimistic conflict | Có nếu budget/deadline | Old attempt rollback |
-| Duplicate command | Fresh replay | Một credit |
-| Wallet suspended/invalid | Không | Domain rejection |
-| Deadline/attempt exhausted | Không | Explicit contention failure |
-| Interrupt/cancel | Không | Propagate cancellation |
-| Commit response loss | Query same command ID | Có thể đã commit |
-| External publish | Outbox only | Sau commit |
+| Đụng độ Khóa Lạc Quan | **Có** (Nếu còn ngân sách/thời gian) | Lần thử trước đã bị Hủy bỏ |
+| Bấm đúp trùng mã Lệnh | Làm phát Đọc mới (Fresh replay) | Trả về 1 lịch sử cũ |
+| Ví bị cấm/Sai logic | **Không** | Báo lỗi Doanh Nghiệp (Domain rejection) |
+| Cạn kiệt lần thử / Hết giờ | **Không** | Văng lỗi Quá tải/Tranh chấp |
+| Khách tắt trình duyệt (Cancel) | **Không** | Truyền tiếp lệnh Cancel |
+| Chốt xong nhưng mất mạng | Nhờ Client gửi lại `command ID` | Có khả năng DB đã được lưu (commit) |
+| Bắn Event đi nơi khác | Phải dùng Outbox | Chỉ xuất ra SAU KHI chốt sổ |
 
-## Trade-off
+## 11. Đánh Đổi Chọn Lựa (Trade-off)
 
-| Strategy | Correctness | Load under contention | Latency | Complexity |
+| Chiến thuật | Tính Chính Xác | Tải hệ thống lúc Đụng độ | Độ Trễ (Latency) | Độ Phức Tạp |
 | --- | --- | --- | --- | --- |
-| Bounded optimistic retry | Mạnh + idempotency | Attempts amplify | Backoff/tail | Trung bình |
-| Atomic delta | Mạnh cho simple delta | Ít round trips | Thấp | Thấp |
-| Pessimistic | Mạnh | Blocking wait | Predictable/timeout | Trung bình |
-| Queue | Phụ thuộc delivery protocol | Serialized per key | Queueing | Cao |
+| Thử lại có chừng mực (Bài này) | Mạnh + Chống Trùng Lặp | Bão khuếch đại tải | Cao do rớt/ngủ chờ | Trung bình |
+| Cộng Trừ Nguyên Tử (Atomic) | Mạnh cho cộng trừ | Rất ít Request rác | Thấp | Thấp |
+| Khóa Bi Quan | Mạnh | Hàng dài kẹt cứng | Dễ bị quá giờ | Trung bình |
+| Hàng đợi (Queue) | Tùy cơ chế vận chuyển | Chạy mượt mà tuần tự | Phải tốn thời gian xếp hàng | **Cao** |
 
-## Checklist
+## 12. Danh sách Check-list (Hãy tự soi lại Code của mình)
 
-- [ ] Coordinator không transaction; attempt qua proxy.
-- [ ] Previous rollback hoàn tất trước backoff.
-- [ ] Fresh attempt reload entity/command state.
-- [ ] Attempt cap và overall deadline.
-- [ ] Exponential backoff có jitter, interrupt/cancel aware.
-- [ ] Command ID stable và unique record cùng transaction.
-- [ ] Chỉ allowlist optimistic conflict.
-- [ ] Exhaustion không báo success.
-- [ ] Attempts/success, conflicts, backoff, exhaustion và pool pressure có metric.
-- [ ] Hot-key bền vững trigger strategy review, không chỉ tăng cap.
+- [ ] Kẻ Chỉ huy không ôm Transaction; Tách riêng Lính Đánh Thuê bọc Proxy.
+- [ ] Lần thử trước phải chết hẳn (Rollback hoàn tất) rồi mới được đi Ngủ.
+- [ ] Lần thử sau phải bốc (load lại) 1 bản Entity sạch sẽ và kiểm tra lại luật từ đầu.
+- [ ] Code chặn Cả số lần tối đa (attempt cap) lẫn Tổng Thời Gian (overall deadline).
+- [ ] Đi ngủ tính giờ theo Hàm số Mũ có trộn Số Ngẫu Nhiên (jitter), biết tôn trọng lệnh Cancel.
+- [ ] Giữ nguyên 1 Mã Lệnh (Command ID) từ đầu tới cuối, chốt cùng Transaction với cái Ví.
+- [ ] Chỉ cho phép bế lỗi Khóa Lạc Quan (Optimistic conflict) đi thử lại.
+- [ ] Kiệt sức là lỗi bận rộn, không được giả vờ thành công.
+- [ ] Có Metric giám sát cẩn thận Tỷ lệ đâm (attempts/success), đụng độ, Hết Giờ và Áp lực Hồ Bơi (pool).
+- [ ] Ví mà hot quá lâu thì phải đổi sang Queue/Bi quan chứ đừng có ngu ngục tăng `maxAttempts` lên nữa!

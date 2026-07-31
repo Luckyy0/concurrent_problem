@@ -1,85 +1,83 @@
-# Giải pháp — guarded mutation và explicit outcome
+# Giải pháp Chuẩn mực — Vừa cập nhật vừa tự vệ (Guarded Mutation)
 
 ## Mục tiêu thiết kế
 
-Solution phải giữ đồng thời bốn lớp correctness:
+Giải pháp chuẩn phải đồng thời thỏa mãn 4 lớp bảo vệ:
 
-1. stock guard và counter mutation là một SQL statement;
-2. affected/returned row quyết định `RESERVED` hay `OUT_OF_STOCK`;
-3. command claim ngăn replay decrement lần hai;
-4. claim, counters, durable outcome và outbox commit/rollback cùng nhau.
+1. Việc "Kiểm tra kho" và "Trừ kho" phải dính chặt vào nhau trong duy nhất 1 câu SQL.
+2. Số lượng dòng trả về từ lệnh SQL sẽ là căn cứ duy nhất để quyết định là "Thành công" hay "Hết hàng".
+3. Phải lưu nháp một mã (command claim) ngay từ đầu để chống việc bị gửi đúp (replay) dẫn đến trừ hàng 2 lần.
+4. Lệnh chống trùng, lệnh trừ kho, lưu lịch sử, và lưu hộp thư ra ngoài (outbox) phải CÙNG SỐNG hoặc CÙNG CHẾT trong 1 Giao dịch (Transaction).
 
-## Schema đề xuất
+## Cấu trúc Bảng (Schema) đề xuất
 
 ```sql
-create table inventory_item (
-    product_id bigint primary key,
-    on_hand_quantity integer not null,
-    available_quantity integer not null,
-    reserved_quantity integer not null,
-    revision bigint not null default 0,
-    check (on_hand_quantity >= 0),
-    check (available_quantity >= 0),
-    check (reserved_quantity >= 0),
-    check (available_quantity + reserved_quantity = on_hand_quantity)
+CREATE TABLE inventory_item (
+    product_id BIGINT PRIMARY KEY,
+    on_hand_quantity INTEGER NOT NULL,
+    available_quantity INTEGER NOT NULL,
+    reserved_quantity INTEGER NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 0,
+    CHECK (on_hand_quantity >= 0),
+    CHECK (available_quantity >= 0),
+    CHECK (reserved_quantity >= 0),
+    CHECK (available_quantity + reserved_quantity = on_hand_quantity)
 );
 
-create table inventory_reservation (
-    command_id uuid primary key,
-    reservation_id uuid unique,
-    order_id uuid not null,
-    product_id bigint not null,
-    quantity integer not null check (quantity > 0),
-    outcome varchar(24) not null,
-    request_fingerprint varchar(64) not null,
-    remaining_available integer,
-    remaining_reserved integer,
-    created_at timestamptz not null,
-    completed_at timestamptz,
-    check (outcome in ('PROCESSING', 'RESERVED', 'OUT_OF_STOCK')),
-    check (
+CREATE TABLE inventory_reservation (
+    command_id UUID PRIMARY KEY, -- Mã đơn lệnh duy nhất
+    reservation_id UUID UNIQUE,
+    order_id UUID NOT NULL,
+    product_id BIGINT NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    outcome VARCHAR(24) NOT NULL, -- Kết quả
+    request_fingerprint VARCHAR(64) NOT NULL,
+    remaining_available INTEGER,
+    remaining_reserved INTEGER,
+    created_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    CHECK (outcome IN ('PROCESSING', 'RESERVED', 'OUT_OF_STOCK')),
+    CHECK (
         outcome <> 'RESERVED'
-        or (
-            reservation_id is not null
-            and remaining_available is not null
-            and remaining_reserved is not null
+        OR (
+            reservation_id IS NOT NULL
+            AND remaining_available IS NOT NULL
+            AND remaining_reserved IS NOT NULL
         )
     )
 );
 
-create table outbox_event (
-    event_id uuid primary key,
-    aggregate_type varchar(64) not null,
-    aggregate_id varchar(128) not null,
-    event_type varchar(128) not null,
-    payload jsonb not null,
-    created_at timestamptz not null,
-    published_at timestamptz
+CREATE TABLE outbox_event (
+    event_id UUID PRIMARY KEY,
+    aggregate_type VARCHAR(64) NOT NULL,
+    aggregate_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(128) NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    published_at TIMESTAMPTZ
 );
 ```
 
-`PROCESSING` chỉ là state bên trong transaction đang sở hữu command. Service
-không có path commit trước khi chuyển sang final outcome.
+Trạng thái `PROCESSING` (Đang xử lý) chỉ là một trạng thái tạm thời trong lúc Giao dịch đang chạy. Ứng dụng không bao giờ được phép Chốt sổ (commit) nửa vời khi cái đơn vẫn còn nằm ở chữ `PROCESSING`.
 
-## Core conditional SQL
+## Trái tim của Giải pháp: Câu SQL Nguyên tử
 
 ```sql
-update inventory_item
-set available_quantity = available_quantity - :quantity,
+UPDATE inventory_item
+SET available_quantity = available_quantity - :quantity,
     reserved_quantity = reserved_quantity + :quantity,
     revision = revision + 1
-where product_id = :productId
-  and available_quantity >= :quantity
-returning product_id,
+WHERE product_id = :productId
+  AND available_quantity >= :quantity
+RETURNING product_id,
           available_quantity,
           reserved_quantity,
           revision;
 ```
 
-Quantity được validate positive trong Java và schema. Product lifecycle bảo đảm
-row tồn tại cho command; vì vậy zero returned rows map `OUT_OF_STOCK`.
+Dữ liệu truyền vào `:quantity` đã được code Java chặn lại nếu là số âm. Nhờ khóa ngoại và vòng đời thiết kế chuẩn, ta chắc chắn mã `:productId` phải tồn tại. Do đó, nếu hàm `RETURNING` trả về rỗng (0 dòng) thì lý do duy nhất chỉ có thể là `OUT_OF_STOCK` (Hết hàng).
 
-## Value objects
+## Đối tượng chuyên chở dữ liệu (Value objects)
 
 ```java
 public record ReserveStockCommand(
@@ -94,7 +92,7 @@ public record ReserveStockCommand(
         Objects.requireNonNull(orderId);
         Objects.requireNonNull(requestFingerprint);
         if (quantity <= 0) {
-            throw new IllegalArgumentException("quantity must be positive");
+            throw new IllegalArgumentException("quantity must be positive"); // Chặn số lượng âm
         }
     }
 }
@@ -107,10 +105,9 @@ public record InventoryAfterReserve(
 ) {}
 ```
 
-Fingerprint được tính từ canonical command payload ở trusted boundary, không lấy
-một hash tùy ý do client gửi.
+Cái "Dấu vân tay" (Fingerprint) dùng để chống trùng mã được băm (hash) từ chính những thông tin quan trọng của Đơn hàng, chứ không được lấy 1 chuỗi băm vớ vẩn do frontend gửi lên.
 
-## Command claim DAO
+## Tầng giao tiếp (DAO) để Đăng ký và Chống trùng lặp
 
 ```java
 @Repository
@@ -121,9 +118,10 @@ public class ReservationCommandDao {
         this.jdbc = jdbc;
     }
 
+    // Cố gắng đăng ký quyền xử lý cái mã lệnh này
     public boolean tryClaim(ReserveStockCommand command, Instant now) {
         int changed = jdbc.update("""
-                insert into inventory_reservation (
+                INSERT INTO inventory_reservation (
                     command_id,
                     order_id,
                     product_id,
@@ -131,7 +129,7 @@ public class ReservationCommandDao {
                     outcome,
                     request_fingerprint,
                     created_at
-                ) values (
+                ) VALUES (
                     :commandId,
                     :orderId,
                     :productId,
@@ -140,7 +138,7 @@ public class ReservationCommandDao {
                     :fingerprint,
                     :createdAt
                 )
-                on conflict (command_id) do nothing
+                ON CONFLICT (command_id) DO NOTHING
                 """, new MapSqlParameterSource()
                 .addValue("commandId", command.commandId())
                 .addValue("orderId", command.orderId())
@@ -148,12 +146,12 @@ public class ReservationCommandDao {
                 .addValue("quantity", command.quantity())
                 .addValue("fingerprint", command.requestFingerprint())
                 .addValue("createdAt", Timestamp.from(now)));
-        return changed == 1;
+        return changed == 1; // 1 = Thành công chưa có ai đăng ký; 0 = Đã có người gửi mã này rồi
     }
 
     public StoredReservation requireExisting(UUID commandId) {
         return jdbc.queryForObject("""
-                select command_id,
+                SELECT command_id,
                        reservation_id,
                        order_id,
                        product_id,
@@ -162,8 +160,8 @@ public class ReservationCommandDao {
                        request_fingerprint,
                        remaining_available,
                        remaining_reserved
-                from inventory_reservation
-                where command_id = :commandId
+                FROM inventory_reservation
+                WHERE command_id = :commandId
                 """, Map.of("commandId", commandId), STORED_ROW_MAPPER);
     }
 
@@ -174,14 +172,14 @@ public class ReservationCommandDao {
             Instant completedAt
     ) {
         int changed = jdbc.update("""
-                update inventory_reservation
-                set reservation_id = :reservationId,
+                UPDATE inventory_reservation
+                SET reservation_id = :reservationId,
                     outcome = 'RESERVED',
                     remaining_available = :available,
                     remaining_reserved = :reserved,
                     completed_at = :completedAt
-                where command_id = :commandId
-                  and outcome = 'PROCESSING'
+                WHERE command_id = :commandId
+                  AND outcome = 'PROCESSING'
                 """, new MapSqlParameterSource()
                 .addValue("commandId", commandId)
                 .addValue("reservationId", reservationId)
@@ -193,11 +191,11 @@ public class ReservationCommandDao {
 
     public void completeOutOfStock(UUID commandId, Instant completedAt) {
         int changed = jdbc.update("""
-                update inventory_reservation
-                set outcome = 'OUT_OF_STOCK',
+                UPDATE inventory_reservation
+                SET outcome = 'OUT_OF_STOCK',
                     completed_at = :completedAt
-                where command_id = :commandId
-                  and outcome = 'PROCESSING'
+                WHERE command_id = :commandId
+                  AND outcome = 'PROCESSING'
                 """, Map.of(
                 "commandId", commandId,
                 "completedAt", Timestamp.from(completedAt)
@@ -215,12 +213,10 @@ public class ReservationCommandDao {
 }
 ```
 
-`ON CONFLICT DO NOTHING` dùng unique primary key làm atomic arbiter. Concurrent
-duplicate có thể wait transaction owner; sau statement, một SELECT mới ở
-`READ COMMITTED` đọc durable outcome đã commit. Nếu owner rollback, contender có
-thể trở thành inserter.
+Dùng tuyệt chiêu `ON CONFLICT DO NOTHING` trên Khóa chính (Primary key) để làm chốt chặn phân xử đụng độ hoàn hảo. 
+Nếu có ai đó bấm đúp đơn hàng vào cùng lúc, 1 luồng sẽ bị PostgreSQL cho đứng chờ. Sau khi luồng đi trước chốt sổ (commit), luồng đứng sau sẽ được đánh giá lại và query ra cái trạng thái chốt sổ từ DB chứ không bị chạy lại toàn bộ quy trình. 
 
-## Atomic inventory DAO với `RETURNING`
+## Tầng giao tiếp (DAO) để cập nhật Kho kèm hàm `RETURNING`
 
 ```java
 @Repository
@@ -236,13 +232,13 @@ public class InventoryMutationDao {
             int quantity
     ) {
         List<InventoryAfterReserve> rows = jdbc.query("""
-                update inventory_item
-                set available_quantity = available_quantity - :quantity,
+                UPDATE inventory_item
+                SET available_quantity = available_quantity - :quantity,
                     reserved_quantity = reserved_quantity + :quantity,
                     revision = revision + 1
-                where product_id = :productId
-                  and available_quantity >= :quantity
-                returning product_id,
+                WHERE product_id = :productId
+                  AND available_quantity >= :quantity
+                RETURNING product_id,
                           available_quantity,
                           reserved_quantity,
                           revision
@@ -266,11 +262,9 @@ public class InventoryMutationDao {
 }
 ```
 
-DAO không load `InventoryItem` thành managed entity, nên không có stale object
-cùng product trong persistence context. `RETURNING` cung cấp exact post-update
-values.
+Lớp DAO này KHÔNG HỀ tải đối tượng `InventoryItem` lên bằng JPA, thế nên bộ đệm trên RAM hoàn toàn trong sạch, không có dữ liệu thiu. Lệnh `RETURNING` tự động ném ra con số mới nhất sau khi sửa xong.
 
-## Bounded lock wait
+## Giới hạn thời gian chờ khóa (Bounded lock wait)
 
 ```java
 @ConfigurationProperties("app.inventory.database")
@@ -310,13 +304,14 @@ public class PostgreSqlStatementPolicy {
     }
 
     public void apply() {
+        // Chủ động áp thời gian chờ cho riêng kết nối này!
         jdbc.queryForObject("""
-                select set_config('lock_timeout', :value, true)
+                SELECT set_config('lock_timeout', :value, true)
                 """, Map.of(
                 "value", timeouts.lockTimeoutValue()
         ), String.class);
         jdbc.queryForObject("""
-                select set_config('statement_timeout', :value, true)
+                SELECT set_config('statement_timeout', :value, true)
                 """, Map.of(
                 "value", timeouts.statementTimeoutValue()
         ), String.class);
@@ -324,12 +319,9 @@ public class PostgreSqlStatementPolicy {
 }
 ```
 
-Settings là transaction-local. Giá trị thật phải nằm trong overall request
-deadline và được cấu hình theo workload; ví dụ production `750ms/1500ms`.
-Register record bằng `@ConfigurationPropertiesScan` hoặc
-`@EnableConfigurationProperties`; không nhận raw timeout từ client.
+Nhớ rằng cái Cài đặt này chỉ áp dụng ranh giới giao dịch hiện tại (transaction-local). Các cấu hình này cực kỳ quan trọng, ví dụ thiết lập `750ms/1500ms`. Và đừng bao giờ tin tưởng truyền con số timeout này trực tiếp từ Frontend lên!
 
-## Transactional worker
+## Trái tim của Giao dịch (Transactional worker)
 
 ```java
 @Service
@@ -357,37 +349,47 @@ public class InventoryReservationTx {
         this.clock = clock;
     }
 
+    // Bắt đầu một Giao dịch, nếu chết là cả đám chết chung
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public ReservationResult reserve(ReserveStockCommand command) {
         Instant now = clock.instant();
-        statementPolicy.apply();
+        statementPolicy.apply(); // Gắn luật chờ Timeout
 
+        // Bước 1: Thử giành quyền xử lý mã đơn này
         if (!commands.tryClaim(command, now)) {
+            // Có người xử lý rồi, đọc kết quả của người ta rồi trả về thôi
             StoredReservation existing =
                     commands.requireExisting(command.commandId());
             existing.requireSameRequest(command);
             return existing.toResult();
         }
 
+        // Bước 2: Bắn SQL Nguyên tử cập nhật và giành hàng
         Optional<InventoryAfterReserve> changed =
                 inventory.tryReserve(
                         command.productId(),
                         command.quantity()
                 );
 
-        if (changed.isEmpty()) {
-            commands.completeOutOfStock(command.commandId(), now);
+        // Bước 3: Rẽ nhánh nghiệp vụ dựa trên số dòng bị sửa (affected rows)
+        if (changed.isEmpty()) { // Trả về 0 dòng
+            commands.completeOutOfStock(command.commandId(), now); // Sửa trạng thái lại thành Hết hàng
             return ReservationResult.outOfStock(command.commandId());
         }
 
+        // Bước 4: Lấy số liệu trả về
         InventoryAfterReserve stock = changed.orElseThrow();
         UUID reservationId = UUID.randomUUID();
+        
+        // Bước 5: Cập nhật lại lịch sử thành THÀNH CÔNG
         commands.completeReserved(
                 command.commandId(),
                 reservationId,
                 stock,
                 now
         );
+        
+        // Bước 6: Thả tin nhắn vào Hộp thư
         outbox.save(OutboxEvent.inventoryReserved(
                 UUID.randomUUID(),
                 reservationId,
@@ -396,6 +398,7 @@ public class InventoryReservationTx {
                 now
         ));
 
+        // Cưỡng ép xả đống lệnh này xuống DB để phát hiện lỗi khóa ngoại (nếu có) trước khi return
         entityManager.flush();
         return ReservationResult.reserved(
                 command.commandId(),
@@ -407,18 +410,11 @@ public class InventoryReservationTx {
 }
 ```
 
-JDBC DAOs và JPA outbox phải dùng cùng `DataSource` và Spring transaction manager.
-Với `JpaTransactionManager`, JDBC access cần participate cùng thread-bound
-connection; integration test phải chứng minh rollback composition trên cấu hình
-thật.
+Hãy nhớ rằng JDBC Dao (SQL thuần) và JPA (Lưu Outbox) phải dùng CHUNG một Kết nối (DataSource) và một Quản lý Giao dịch (Spring transaction manager) thì chúng mới cùng sống cùng chết được. Lệnh `flush()` ở cuối đảm bảo rác rưởi lọt ra được báo lỗi sớm thay vì ngâm giấm đến cuối Giao dịch.
 
-`flush()` làm insert/constraint error xuất hiện trước method body return. Success
-chỉ tới caller sau transaction interceptor commit.
+> **Nói ngắn gọn:** Kết quả của câu SQL sẽ là người cầm cân nảy mực phân xử thắng/bại. Còn cục Giao dịch (Transaction) sẽ quyết định sinh mạng của cục dữ liệu tồn kho, kết quả lịch sử và cục tin nhắn Hộp thư ra ngoài cùng nhau!
 
-> **Nói ngắn gọn:** affected row quyết định business result; transaction quyết
-> định counter, durable outcome và outbox có cùng tồn tại hay cùng biến mất.
-
-## Map technical failure ngoài transaction
+## Điều phối Lỗi bên ngoài Giao dịch (Map technical failure ngoài transaction)
 
 ```java
 @Component
@@ -435,6 +431,7 @@ public class InventoryReservationCoordinator {
     }
 
     public ReservationResult reserve(ReserveStockCommand command) {
+        // Cảnh sát: Hàm này KHÔNG được phép có @Transactional
         if (TransactionSynchronizationManager.isActualTransactionActive()) {
             throw new IllegalStateException(
                     "coordinator must run outside a transaction"
@@ -444,12 +441,13 @@ public class InventoryReservationCoordinator {
         try {
             return worker.reserve(command);
         } catch (RuntimeException failure) {
+            // Bước phân loại mã lỗi
             return classifier.lockOrSerializationFailure(failure)
                     .map(kind -> ReservationResult.busy(
                             command.commandId(),
                             kind.name()
                     ))
-                    .orElseThrow(() -> failure);
+                    .orElseThrow(() -> failure); // Bị lỗi khác thì quăng luôn
         }
     }
 }
@@ -477,16 +475,13 @@ public class SqlStateClassifier {
 }
 ```
 
-Exception rời transactional proxy trước khi coordinator map, nên attempt đã
-rollback. Không map technical failure thành `OUT_OF_STOCK`, và không swallow
-unknown database/programming errors.
+Nơi bắt các lỗi hệ thống (catch block) PHẢI đứng bên ngoài phạm vi của `@Transactional` để đảm bảo Giao dịch đã được hủy (rollback) sạch sẽ trước khi biến nó thành kết quả báo về là "Hệ thống bận" (Busy).
 
-Nếu product policy cho retry, dùng transaction mới, stable command ID, reload,
-attempt cap, overall deadline và backoff. Không retry unbounded immediate.
+Đừng có hở một chút bị Exception rồi map nó thành chữ "HẾT HÀNG", cũng không được lơ đi những lỗi Database nguy hiểm. Nếu cần tính năng "Tự động thử lại" (Retry), hãy dùng 1 transaction hoàn toàn mới mẻ, giữ nguyên ID của đơn và cấu hình thuật toán Backoff (đợi ngẫu nhiên) hợp lý. Đừng bao giờ chơi vòng lặp "Retry nã đại bác" liên tục.
 
-## Spring Data JPA affected-count variant
+## Cách dùng Spring Data JPA thuần túy (Nếu không muốn xài JdbcTemplate)
 
-Khi response không cần remaining counters:
+Nếu API của bạn không cần trả về con số tồn kho mới nhất, bạn có thể rút gọn lại bằng cái này:
 
 ```java
 public interface InventoryItemRepository
@@ -494,12 +489,12 @@ public interface InventoryItemRepository
 
     @Modifying
     @Query(value = """
-            update inventory_item
-            set available_quantity = available_quantity - :quantity,
+            UPDATE inventory_item
+            SET available_quantity = available_quantity - :quantity,
                 reserved_quantity = reserved_quantity + :quantity,
                 revision = revision + 1
-            where product_id = :productId
-              and available_quantity >= :quantity
+            WHERE product_id = :productId
+              AND available_quantity >= :quantity
             """, nativeQuery = true)
     int reserveIfEnough(
             @Param("productId") long productId,
@@ -508,98 +503,73 @@ public interface InventoryItemRepository
 }
 ```
 
-Service bắt buộc kiểm tra `changed == 1`. Method contract phải cấm load/save cùng
-`InventoryItem` trong persistence context, hoặc chủ động flush/clear/refresh.
+Service CẦN BẮT BUỘC phải soi xem kết quả `changed == 1` hay không. Và nhắc lại lần nữa: Đừng có gọi hàm tải `InventoryItem` lên RAM trước, trừ phi bạn biết dùng các cờ dọn dẹp như `clear/refresh`. 
+Có thể lạm dụng `@Modifying(flushAutomatically = true, clearAutomatically = true)` nhưng phải cẩn thận vì nó sẽ quét sạch cả các entity chả liên quan ra khỏi bộ nhớ. Đừng dùng nó như kiểu "nhắm mắt đưa chân".
 
-`@Modifying(flushAutomatically = true, clearAutomatically = true)` hữu ích khi
-boundary sở hữu toàn persistence context, nhưng clear có thể detach unrelated
-entities. Không dùng flags để che transaction design mơ hồ.
+## Chuỗi Hoàn tác (Rollback composition)
 
-## Rollback composition
-
-Nếu outbox insert fail:
+Nếu bước chèn Hộp thư (outbox) bị lỗi văng Exception:
 
 ```text
-conditional UPDATE affected 1
-→ command marked RESERVED
-→ outbox constraint fails
-→ transaction rollback
-→ inventory counters return to original values
-→ command claim/outcome disappears
+Lệnh UPDATE có điều kiện trả về ảnh hưởng 1 dòng
+→ Lịch sử được đóng dấu là THÀNH CÔNG (RESERVED)
+→ Bỗng nhiên lỗi rào chắn ở Hộp thư
+→ CẢ GIAO DỊCH LẬT KÈO, HỦY BỎ (ROLLBACK)
+→ Trả số tồn kho về nguyên vẹn như cũ
+→ Mã đơn đăng ký/Lịch sử cũng bay màu sạch sẽ không kèn không trống
 ```
 
-Caller retry cùng command ID có thể claim lại. Test phải assert counter và
-reservation table, không chỉ exception type.
+Khách hàng thấy rớt mạng, gửi lại Y CHANG cái mã đơn đó, code vẫn cho đi vào và đăng ký quyền như một người mới toanh.
 
-## Cancel/release stock
+## Trả lại hàng / Hủy đơn (Cancel/release stock)
 
-Cancellation là state transition riêng: command phải chứng minh ownership, đổi
-reservation từ `RESERVED` sang `CANCELLED` đúng một lần và hoàn lại counters
-trong cùng transaction. Một reverse UPDATE chỉ tăng available mà không atomically
-claim transition sẽ hoàn stock nhiều lần khi request bị replay.
+Đổi ý hủy đơn là một hành động (state transition) hoàn toàn độc lập. Mã đơn phải chứng minh nó từng là của mình, cập nhật trạng thái từ `RESERVED` thành `CANCELLED` CHỈ 1 LẦN DUY NHẤT và cộng trả lại tồn kho. Đừng có ngây thơ viết riêng 1 câu UPDATE tự cộng hàng lên mù quáng, rủi mạng lag nó gửi 2 lần hủy đơn là bạn cộng hàng lố cho 1 đơn cũ.
 
-Schema của case chưa mô hình hóa cancellation fields/outcomes; full protocol cần
+## Các Giải pháp Kế vị (Alternatives)
 
-## Alternatives
+### Cách 1: Khóa Bi quan (PESSIMISTIC_WRITE)
+Nói dễ hiểu là dùng `SELECT ... FOR UPDATE`. Rất hợp nếu logic quyết định bán hàng phức tạp dính tới 2-3 bảng, nhưng nhược điểm là bạn tốn 1 cuốc đi ra đi vô DB để Đọc, và phải cắn răng ôm Khóa khóa luôn thằng khác trong lúc Code Java của bạn đang suy nghĩ.
 
-### `PESSIMISTIC_WRITE`
+### Cách 2: Khóa Lạc quan (`@Version`)
+Thích hợp với việc sửa bự nguyên 1 màn hình và hiếm khi có 2 thằng đụng nhau. Chứ với kiểu đếm tồn kho, cách Cập nhật Có điều kiện (Atomic UPDATE) vừa gọn nhẹ lại chả phải lo cảnh 1 luồng hụt chân.
 
-Load row `FOR UPDATE`, validate rồi mutate. Dễ dùng khi decision cần nhiều fields
-hoặc child records, nhưng thêm read round trip và giữ lock qua Java decision.
+### Cách 3: Ỉ Lại Rào chắn (Constraint-only)
+Rào `CHECK available >= 0` ngăn kho âm là cực tốt, nhưng nó câm như hến, chả tự biết móc nối với bảng lịch sử, nên phải dùng kèm như 1 lớp phòng thủ sâu (defense in depth).
 
-### Optimistic `@Version`
+### Cách 4: Mức cách ly tối thượng (`SERIALIZABLE`)
+Bảo vệ bao la mọi lỗi, nhưng đổi lại code sẽ ném lỗi `40001` dồn dập vào mặt bạn bắt bạn phải code vòng lặp Tự thử lại (Retry). Trò chẻ dao mổ trâu giết gà, không cần thiết khi 1 cục `WHERE` đã giải quyết quá xinh đẹp.
 
-Loser conflict khi flush, sau đó reload/reject/retry. Hợp với aggregate edit và
-contention thấp; stock delta đơn giản thường gọn hơn bằng conditional SQL.
+### Cách 5: Đưa vào Hàng Đợi (Queue/serialized processing)
+Giống như bắt mọi người xếp hàng mua trà sữa, tránh húc nhau sứt đầu mẻ trán. Nhưng cực kỳ rườm rà về thiết kế, hãy dùng nó vì quy mô hệ thống quá khủng, chứ đừng lấy cớ "Do em viết SQL kém" để xài.
 
-### Constraint-only
+## So sánh thực tiễn (Định tính)
 
-`CHECK available >= 0` chặn negative row nhưng không trả domain outcome sớm và
-không bảo đảm audit counters cross-table reconcile. Dùng như defense in depth.
-
-### `SERIALIZABLE`
-
-Bảo vệ anomaly rộng hơn nhưng tạo `40001` retry contract. Không cần thiết khi
-known-row invariant đã nằm trọn trong one-statement predicate.
-
-### Queue/serialized processing
-
-Có thể tạo backpressure/order cho hot product bền vững, nhưng thêm asynchronous
-workflow và operational complexity. Chỉ chọn từ load/failure model, không vì SQL
-trông “quá đơn giản”.
-
-## So sánh định tính
-
-| Strategy | Round trips | Loser | Retry | Lock lifetime | Multi-instance |
+| Chiến thuật | Số cuốc (Round trips) | Người thua | Tự thử lại (Retry) | Tuổi thọ khóa | Môi trường nhiều Máy chủ |
 | --- | --- | --- | --- | --- | --- |
-| Conditional `UPDATE` | Một mutation | affected `0` | Thường không | Đến Tx end, acquire tại UPDATE | Có |
-| `UPDATE RETURNING` | Một mutation/result | zero rows | Thường không | Như trên | Có |
-| `FOR UPDATE` + write | Read + write | block rồi reject/timeout | Không bắt buộc | Từ locking read | Có |
-| `@Version` | Read + versioned write | conflict lúc flush | Có thể | Writer lock ngắn | Có |
-| JVM lock | Tùy | local wait | Không | JVM only | Không |
+| Câu lệnh Có Điều Kiện (`UPDATE`) | 1 cuốc (Mutation) | Lấy về `0` dòng | Ít khi cần | Rất ngắn (Từ lúc phát SQL đến cuối Tx) | Dư sức |
+| Kèm `RETURNING` | 1 cuốc | Về rỗng | Ít khi | Rất ngắn | Dư sức |
+| `FOR UPDATE` + Ghi | 2 cuốc | Đứng ngó / Hết giờ | Không bắt buộc | Dài (Ngâm từ lúc bắt đầu đọc) | Dư sức |
+| Gắn `@Version` | 2 cuốc | Rớt cái bẹp lúc Flush | Có thể | Rất ngắn | Dư sức |
+| Khóa Java (`synchronized`) | Tùy duyên | Ngồi chờ | Không | Vô dụng với đa máy chủ | Nát bét |
 
-## Khuyến nghị
+## Lời khuyên cuối cùng (Khuyến nghị)
 
-Với known inventory row và guard `available >= quantity`, dùng conditional
-`UPDATE RETURNING` làm primary mutation. Validate input trước SQL, định nghĩa
-zero-row contract, commit durable outcome/outbox cùng counters, và giữ persistence
-context tránh xa direct-mutated entity.
+Với kiểu chỉ có 1 dòng dữ liệu tồn kho rõ ràng, cứ lôi Câu Lệnh Nguyên Tử `UPDATE ... RETURNING` làm võ công phòng thân. Nhớ rào kỹ logic trước SQL, quy định rõ số "0" trả về mang ý nghĩa gì, lưu Hộp thư chung Giao dịch, và nhớ CẤM JPA hốt cái Entity đó lên RAM.
 
-Khi hot-row contention bền vững, không chỉ tăng timeouts. Đo no-op/wait/latency và
-đánh giá strategy trong `LOCK-005`.
+Khi sản phẩm quá hot (hot-row), không phải cứ đi tháo tung trần thời gian timeout lên là ngon. Hãy đo lường và tính đường rút lui (Tham khảo thêm bài `LOCK-005`).
 
-## Production checklist
+## Checklist trước khi đem lên Production
 
-- [ ] `WHERE` chứa toàn bộ business guard cần cho mutation.
-- [ ] `SET` dùng current column values, không stale absolute values.
-- [ ] Query cardinality là zero hoặc one cho command.
-- [ ] Affected/returned row được map explicit.
-- [ ] Zero-row meanings được document và validate.
-- [ ] Constraint bảo vệ nonnegative/conservation state.
-- [ ] Không load/save managed inventory entity quanh bulk DML.
-- [ ] Command ID unique và fingerprint replay được kiểm tra.
-- [ ] Outcome/outbox cùng transaction với counter.
-- [ ] Lock/statement timeout nằm trong overall deadline.
-- [ ] `55P03`, `40P01`, `40001` không bị map thành out-of-stock.
-- [ ] Test PostgreSQL thật chứng minh predicate recheck và rollback.
-- [ ] Reconciliation so projection với reservation audit.
+- [ ] Cụm `WHERE` đã chứa sạch bách logic kiểm tra tồn kho?
+- [ ] Cụm `SET` đang trừ trực tiếp bằng `(cột + tham số)` chứ không phải lấy 1 số chết áp vào?
+- [ ] Số dòng bị sửa đổi chỉ có thể là 0 hoặc 1?
+- [ ] Số dòng trả về (affected/returned row) đã được lưu vào biến và xài `if - else` đàng hoàng?
+- [ ] Con số "0 dòng" đã được định nghĩa và kiểm chứng đàng hoàng?
+- [ ] Đã ốp Constraint chống số Âm trong Schema chưa?
+- [ ] Kiểm tra xem có lệnh `findById` dư thừa nào tải Entity lên không?
+- [ ] Mã đơn hàng đã dùng Unique ID chống trùng và vân tay (fingerprint) đã ổn định?
+- [ ] Lịch sử / Hộp thư / Ghi kho đã nằm trọn vẹn trong CÙNG 1 Giao dịch `@Transactional`?
+- [ ] Thời gian Timeout (Khóa và Lệnh) có nhỏ hơn tổng thời gian Deadline của HTTP Request?
+- [ ] Lỗi hết giờ / kẹt xe `55P03`, `40P01` đã phân loại chưa hay nhắm mắt phán "HẾT HÀNG"?
+- [ ] Đã viết Test bằng PostgreSQL THẬT (chống chỉ định H2/Mocks)?
+- [ ] Đã hẹn giờ Job (Cronjob) chạy quét lệch đối soát định kỳ?

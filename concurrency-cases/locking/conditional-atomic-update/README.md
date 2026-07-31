@@ -1,124 +1,111 @@
-# LOCK-004 — Conditional atomic `UPDATE`
+# Bài toán LOCK-004 — Cập nhật an toàn với điều kiện (Conditional atomic `UPDATE`)
 
-## Tóm tắt
+## Tóm tắt câu chuyện
 
-Kho sản phẩm `77` còn `5` đơn vị. Hai checkout khác nhau cùng muốn giữ `4`.
-Nếu application đọc tồn kho, kiểm tra rồi ghi absolute values, cả hai có thể cùng
-accept trên state `5`; cuối cùng database chỉ còn projection của writer cuối
-nhưng đã có hai reservation tổng cộng `8`.
+Tưởng tượng kho hàng của bạn có mặt hàng số `77` đang còn đúng `5` chiếc. Có hai khách hàng cùng lúc bấm nút thanh toán, mỗi người đều muốn mua `4` chiếc.
+Nếu ứng dụng của bạn làm theo kiểu ngây thơ: Đọc kho lên thấy còn `5`, kiểm tra thấy `5 > 4` là thỏa mãn, rồi ghi đè con số `1` (5 trừ 4) xuống Database... thì cả hai luồng sẽ cùng thấy hợp lệ! Kết cục là Database bị ghi đè chỉ còn `1`, nhưng bạn đã nhận đặt cọc của cả 2 khách (tổng cộng `8` chiếc) trong khi kho chỉ có `5`. Chào mừng bạn đến với thảm họa thất thoát hàng!
 
-Khi invariant nằm gọn trong một predicate, gửi thẳng business intent tới
-authoritative store:
+Khi quy tắc nghiệp vụ có thể gói gọn lại trong một điều kiện, hãy gửi thẳng "ý định" của bạn xuống Database để nó tự xử lý:
 
 ```sql
-update inventory_item
-set available_quantity = available_quantity - :quantity,
+UPDATE inventory_item
+SET available_quantity = available_quantity - :quantity,
     reserved_quantity = reserved_quantity + :quantity
-where product_id = :productId
-  and :quantity > 0
-  and available_quantity >= :quantity;
+WHERE product_id = :productId
+  AND :quantity > 0
+  AND available_quantity >= :quantity;
 ```
 
-Affected-row count `1` nghĩa là reservation đã thắng. `0` nghĩa là mutation
-không được áp dụng; caller không được tạo reservation/outbox như thể đã thành
-công.
+Nếu số dòng bị ảnh hưởng (affected-row count) trả về là `1`, nghĩa là bạn đã đặt hàng thành công. Nếu trả về `0`, nghĩa là câu lệnh không thỏa mãn điều kiện và chẳng có gì thay đổi; lúc này ứng dụng KHÔNG ĐƯỢC PHÉP báo thành công hay lưu dữ liệu đặt hàng.
 
-> **Nói ngắn gọn:** đừng hỏi “còn hàng không?” rồi ghi sau; hãy yêu cầu database
-> “chỉ giữ hàng nếu ngay lúc ghi vẫn còn đủ”.
+> **Nói ngắn gọn:** Đừng bao giờ hỏi Database "Còn hàng không?" rồi đem về RAM tính toán xong mới ghi lại. Hãy ra lệnh trực tiếp: "Chỉ trừ hàng giùm tôi nếu ngay tại giây phút ghi, số lượng vẫn còn đủ".
 
-## Actor và trạng thái dùng chung
+## Các diễn viên và Trạng thái tranh chấp
 
 | Thành phần | Trạng thái ban đầu |
 | --- | --- |
-| `inventory_item` | Product `77`, available `5`, reserved `0` |
-| Command A | Order `A`, quantity `4`, chạy trên App-1 |
-| Command B | Order `B`, quantity `4`, chạy trên App-2 |
-| `inventory_reservation` | Durable outcome theo command ID |
-| `outbox_event` | Chỉ được tạo cho reservation đã commit |
+| Bảng tồn kho (`inventory_item`) | Sản phẩm `77`, đang có sẵn (available) `5`, đã giữ chỗ (reserved) `0` |
+| Lệnh A | Đơn `A`, số lượng mua `4`, chạy trên Máy chủ 1 |
+| Lệnh B | Đơn `B`, số lượng mua `4`, chạy trên Máy chủ 2 |
+| Bảng giữ chỗ (`inventory_reservation`) | Bảng lưu lịch sử kết quả dựa trên mã lệnh (command ID) |
+| Hộp thư gửi đi (`outbox_event`) | Chỉ được tạo ra khi đơn hàng đã chốt (commit) thành công |
 
-Điểm tranh chấp là `inventory_item(product_id=77)`. Hai commands có ID khác nhau,
-nên idempotency không làm chúng trùng nhau; chính conditional mutation bảo vệ
-cùng stock row.
+Điểm tranh giành đẫm máu nhất chính là dòng dữ liệu của sản phẩm số 77. Hai luồng đến từ hai nơi khác nhau mang mã khác nhau, nên cơ chế chống trùng lặp (idempotency) không giúp ích gì ở đây; chính mẹo "cập nhật kèm điều kiện" (conditional mutation) mới là tấm khiên bảo vệ kho hàng.
 
-## Invariant
+## Những quy tắc bất di bất dịch (Invariant)
 
-Trong phạm vi không có restock/shipment:
+Khi không có lệnh nhập/xuất kho nào xen ngang, ta phải đảm bảo:
 
 ```text
-available_quantity >= 0
+Số lượng hàng có sẵn (available_quantity) >= 0
 
-reserved_quantity
-  = tổng quantity của các reservation có outcome RESERVED
+Số lượng hàng đã giữ chỗ (reserved_quantity) 
+  = Tổng số lượng của các đơn có trạng thái RESERVED (đã giữ)
 
-available_quantity + reserved_quantity = on_hand_quantity ban đầu
+Hàng có sẵn + Hàng đã giữ chỗ = Tổng hàng ban đầu trong kho
 
-Mỗi command ID chỉ tạo một durable outcome.
+Mỗi mã lệnh (command ID) chỉ được phép tạo ra ĐÚNG MỘT kết quả.
 
-Caller chỉ nhận RESERVED sau transaction commit.
+Hệ thống gọi (Caller) chỉ nhận được thông báo RESERVED sau khi giao dịch đã thực sự chốt (commit).
 ```
 
-`CHECK (available_quantity >= 0)` là defense in depth. Nó không đủ để phát hiện
-lost update làm hai audit rows cùng được accept nhưng counter chỉ phản ánh một.
+Lưu ý: Bạn có thể cài thêm cờ kiểm tra dưới Database `CHECK (available_quantity >= 0)` để phòng hờ (defense in depth), nhưng chừng đó là chưa đủ để phát hiện lỗi ghi đè mất dữ liệu (lost update).
 
-## Ranh giới transaction
+## Ranh giới Giao dịch (Transaction)
 
-Một `InventoryReservationTx.reserve()` attempt bao gồm:
+Một lần thử chạy hàm `InventoryReservationTx.reserve()` sẽ trải qua các bước:
 
-1. atomically claim command ID hoặc replay durable outcome;
-2. chạy conditional `UPDATE ... RETURNING`;
-3. nếu zero row, lưu outcome `OUT_OF_STOCK` và không tạo outbox;
-4. nếu có row, lưu `RESERVED` cùng remaining quantities và tạo outbox;
-5. commit/rollback cả claim, stock mutation và side effects database.
+1. Đăng ký cái mã lệnh (command ID) hoặc đọc lại kết quả nếu lệnh này từng chạy rồi.
+2. Bắn câu SQL `UPDATE ... RETURNING` có kèm điều kiện.
+3. Nếu trả về `0` dòng: Lưu trạng thái `OUT_OF_STOCK` (hết hàng) và KHÔNG tạo thư gửi đi (outbox).
+4. Nếu trả về `1` dòng: Lưu trạng thái `RESERVED` cùng số lượng còn lại và tạo thư gửi đi.
+5. Chốt (commit) hoặc Hủy (rollback) TẤT CẢ các bước trên cùng lúc.
 
-Remote payment, message publish và retry wait nằm ngoài transaction. Nếu bước
-sau UPDATE lỗi, rollback phải hoàn nguyên cả stock counters.
+Tuyệt đối KHÔNG nhét các việc như: gọi API thanh toán, gửi tin nhắn RabbitMQ/Kafka, hoặc vòng lặp chờ đợi (retry wait) vào trong Giao dịch này. Nếu quá trình UPDATE sau đó bị lỗi, lệnh Rollback phải hoàn trả lại toàn bộ số đếm kho như cũ.
 
-## Vì sao concurrent `UPDATE` vẫn đúng?
+## Tại sao nhiều luồng cùng `UPDATE` mà vẫn không sai?
 
-Ở PostgreSQL `READ COMMITTED`:
+Giả sử PostgreSQL đang ở mức cách ly `READ COMMITTED` (mặc định):
 
 ```text
-Tx-A UPDATE: predicate 5 >= 4 → true → row becomes available=1 → holds lock
-Tx-B UPDATE: targets same row → waits
-Tx-A COMMIT: releases lock
-Tx-B: re-evaluates WHERE on current row → 1 >= 4 is false → affected rows 0
+Giao dịch A (Tx-A) UPDATE: Kiểm tra 5 >= 4 → Đúng → Dòng này bị khóa, số lượng còn 1
+Giao dịch B (Tx-B) UPDATE: Đòi đánh vào đúng dòng đó → Bị chặn lại, phải đứng chờ
+Tx-A COMMIT (Chốt sổ): Chìa khóa được nhả ra
+Tx-B: Tự động đánh giá lại điều kiện WHERE trên dữ liệu thực tế mới nhất → 1 >= 4 là Sai → Báo cập nhật 0 dòng
 ```
 
-Nếu Tx-A rollback, Tx-B re-evaluate trên state `5` và có thể affected rows `1`.
-Database expression trừ/cộng dùng current row version; application không gửi
-absolute value tính từ stale snapshot.
+Nếu Tx-A xui xẻo bị Rollback, Tx-B sẽ đánh giá lại trên con số `5` gốc và nó sẽ giành chiến thắng (cập nhật 1 dòng).
+Sức mạnh ở đây là phép cộng/trừ được Database tự làm trên **phiên bản dữ liệu mới nhất dưới ổ cứng**, chứ ứng dụng không hề gửi một con số cụ thể tính từ đồ "thiu" trên RAM.
 
-## Outcome contract
+## Bảng quy ước kết quả (Outcome contract)
 
-| Database outcome | Domain outcome |
+| Database trả về | Kết quả nghiệp vụ |
 | --- | --- |
-| Một row returned / affected rows `1` | `RESERVED` |
-| Zero rows với product row được bảo đảm tồn tại | `OUT_OF_STOCK` |
-| SQLSTATE `55P03` do lock timeout | `BUSY`, transaction rollback |
-| SQLSTATE `40P01`/`40001` | Technical conflict; bounded fresh retry nếu an toàn |
-| Constraint/insert/outbox failure sau UPDATE | Rollback toàn attempt |
-| Duplicate command cùng fingerprint | Replay durable result, không decrement lại |
-| Duplicate command khác fingerprint | `IDEMPOTENCY_MISMATCH` |
+| Sửa được 1 dòng (affected rows `1`) | Báo `RESERVED` (Giữ chỗ thành công) |
+| Sửa 0 dòng (và chắc chắn dòng đó có tồn tại) | Báo `OUT_OF_STOCK` (Hết hàng) |
+| Báo lỗi `55P03` do hết giờ chờ khóa | Báo `BUSY` (Hệ thống bận), sau đó Rollback |
+| Báo lỗi `40P01` hoặc `40001` | Lỗi kỹ thuật; Có thể tự động thử lại (retry) nếu an toàn |
+| Bị văng lỗi Constraint / Insert / Outbox sau khi UPDATE | Phải Rollback lại toàn bộ quá trình |
+| Trùng mã lệnh y chang (Duplicate fingerprint) | Trả về kết quả cũ, KHÔNG bị trừ hàng 2 lần |
+| Trùng mã lệnh nhưng dữ liệu sai lệch (Different fingerprint)| Báo `IDEMPOTENCY_MISMATCH` (Lỗi xung đột dữ liệu) |
 
-Zero affected rows tự nó có thể còn nghĩa “product không tồn tại” hoặc một
-predicate khác fail. API phải bảo đảm row tồn tại hoặc định nghĩa rõ cách phân
-biệt; không đoán từ `0`.
+Lưu ý: Kết quả "Sửa 0 dòng" đôi khi bị hiểu nhầm là do "sản phẩm không tồn tại". Code của bạn phải đủ thông minh để phân biệt 2 trường hợp này, đừng có ngồi đoán mò từ con số `0`.
 
-## Thuật ngữ cần biết
+## Các thuật ngữ kỹ thuật cần thuộc lòng
 
-| Thuật ngữ | Ý nghĩa trong case |
+| Thuật ngữ | Ý nghĩa trong bài toán này |
 | --- | --- |
-| conditional mutation | Chỉ mutate khi business predicate còn đúng |
-| atomic `UPDATE` | Predicate check và write là một database statement |
-| affected-row count | Số rows thực sự được statement update |
-| predicate recheck | PostgreSQL đánh giá lại `WHERE` sau khi chờ concurrent writer |
-| current row version | Tuple version mới nhất mà updating command được phép xử lý |
-| `RETURNING` | Trả state sau mutation từ chính statement thắng |
-| no-op | Statement hợp lệ nhưng không row nào được thay đổi |
-| bulk DML | Update trực tiếp, bỏ qua dirty checking của managed entity |
-| defense in depth | Constraint bổ sung, không thay thế outcome handling |
+| Cập nhật kèm điều kiện (`conditional mutation`) | Chỉ sửa dữ liệu nếu như điều kiện nghiệp vụ vẫn còn đúng. |
+| Câu lệnh `UPDATE` nguyên tử (`atomic UPDATE`) | Gom việc kiểm tra (WHERE) và việc sửa dữ liệu (SET) vào chung 1 câu lệnh duy nhất. |
+| Số dòng bị ảnh hưởng (`affected-row count`) | Con số trả về báo hiệu có bao nhiêu dòng thực sự đã được sửa. |
+| Đánh giá lại điều kiện (`predicate recheck`) | Sự thông minh của PostgreSQL: Nó tự động xét lại cụm `WHERE` ngay khi đối thủ vừa nhả khóa ra. |
+| Phiên bản dòng mới nhất (`current row version`) | Dữ liệu tươi mới nhất đang có dưới ổ cứng mà câu lệnh được phép đụng vào. |
+| Mệnh đề `RETURNING` | Một chiêu của PostgreSQL giúp trả về kết quả ngay sau khi Update thành công. |
+| Không làm gì cả (`no-op`) | Lệnh chạy thành công nhưng chả có dòng nào thỏa mãn để thay đổi. |
+| Cập nhật hàng loạt (`bulk DML`) | Cập nhật trực tiếp bằng SQL, lách qua mặt bộ đệm của JPA/Hibernate. |
+| Phòng thủ nhiều lớp (`defense in depth`) | Dùng rào chắn (Constraint) của DB để bảo hiểm thêm, nhưng nó không thay thế được logic code. |
 
-## Điều hướng
+## Điều hướng tài liệu
 
 - [Code read–check–write bị hỏng](broken-code.md)
 - [Timeline, row lock và predicate recheck](analysis.md)
@@ -130,33 +117,29 @@ biệt; không đoán từ `0`.
 - [DB-001 — Lost update dưới MVCC](../../postgresql/lost-update-mvcc/README.md)
 - [DB-007 — Row/table lock lifecycle](../../postgresql/row-table-lock-lifecycle/README.md)
 
-## Hậu quả trong production nếu dùng sai
+## Hậu quả thảm khốc trên Production nếu dùng sai
 
-- Accepted reservation quantity lớn hơn stock counters.
-- Projection và audit/reservation rows không reconcile.
-- Ignore affected rows làm request thua vẫn trả success.
-- Bulk DML để lại stale managed entity rồi một flush sau overwrite atomic result.
-- Retry cùng command ID nhưng không có durable claim làm decrement nhiều lần.
-- Map lock timeout thành `OUT_OF_STOCK` che giấu hot-row contention.
-- External publish trước commit tạo event cho transaction đã rollback.
-- `synchronized` pass test một node nhưng hỏng khi scale-out.
+- Chấp nhận giữ chỗ nhiều hơn số lượng hàng tồn (bán âm kho).
+- Báo cáo dữ liệu (Projection) và bảng lịch sử (Audit) vênh nhau.
+- Viết lệnh UPDATE nhưng phớt lờ số dòng trả về (affected rows `0`), cứ ngỡ là cập nhật thành công và trả về Success cho khách!
+- Gọi Bulk DML trực tiếp nhưng lại vướng bộ đệm (stale managed entity) của JPA, để rồi lúc sau Hibernate gọi flush và ghi đè làm mất kết quả atomic vừa chạy.
+- Cho phép "Thử lại" (Retry) cùng một mã lệnh nhưng lại quên lưu lịch sử chống trùng (durable claim), dẫn đến bị trừ hàng nhiều lần.
+- Cố tình bắt lỗi hết hạn chờ khóa (lock timeout) rồi báo luôn là "Hết hàng" (OUT_OF_STOCK) để che giấu chuyện Server đang quá tải.
+- Gửi tin nhắn Kafka/RabbitMQ trước khi chốt sổ (commit), cuối cùng giao dịch lại bị Rollback, đẩy xuống hệ thống dưới một tin nhắn sai sự thật!
+- Dùng từ khóa `synchronized` của Java: Code chạy mượt trên máy bạn, nhưng khi đưa lên nhiều máy chủ (scale-out) thì toang toàn tập.
 
-## Khi nên dùng cách này
+## Lời khuyên: Khi nào nên áp dụng tuyệt chiêu này?
 
-Conditional atomic SQL phù hợp khi:
+SQL Cập nhật Nguyên tử cực kỳ phù hợp khi:
+- Dữ liệu bị trừ và điều kiện kiểm tra nằm chung trên đúng 1 dòng (dễ khoanh vùng).
+- Bạn có thể diễn đạt logic ràng buộc thành cụm `WHERE` và `SET` của SQL.
+- Kẻ chậm chân (loser) có thể ngậm ngùi nhận kết quả 0 dòng (affected-row `0`).
+- Ứng dụng không cần phải móc cả đống bảng (load aggregate graph) lên RAM để quyết định.
+- Bạn cần tốc độ: 1 câu lệnh ngắn gọn luôn nhanh hơn việc Mở khóa -> Tải lên -> Tính toán -> Ghi lại.
 
-- mutation và guard cùng nằm trên known row;
-- rule diễn đạt được trong `WHERE` và `SET`;
-- loser có outcome từ affected-row `0`;
-- application không cần load aggregate graph để quyết định;
-- short statement tốt hơn pre-lock/read round trip hoặc optimistic retry.
+Tuy nhiên, nếu quy trình duyệt đơn của bạn phức tạp phải check qua hàng chục bước, hãy xem xét dùng Khóa bi quan `PESSIMISTIC_WRITE` (Bài LOCK-003). Nếu ít khi đụng độ nhưng đối tượng rất to, hãy dùng Khóa lạc quan `@Version`. Và nếu quy tắc dính đến những dòng dữ liệu chưa tồn tại (missing rows), 1 câu lệnh UPDATE là không đủ.
 
-Nếu cần decision nhiều bước trên current state, dùng `PESSIMISTIC_WRITE` như
-`LOCK-003`. Nếu edit phức tạp và conflict hiếm, cân nhắc `@Version`. Nếu invariant
-bao phủ missing rows/predicate rộng, một conditional UPDATE trên một row không đủ.
+## Phạm vi tài liệu
 
-## Phạm vi
-
-Case tập trung invariant biểu diễn trong một mutation predicate trên known row.
-General lost update thuộc `DB-001`; lock mechanics thuộc `DB-007`; strategy dưới
-sustained high contention thuộc `LOCK-005`.
+Case study này chỉ tập trung vào việc biến điều kiện nghiệp vụ thành câu lệnh UPDATE có điều kiện trên một dòng đã biết.
+Về lỗi mất dữ liệu chung chung, hãy xem `DB-001`. Về cơ chế hoạt động của khóa, xem `DB-007`. Về chiến thuật sinh tồn khi bị ngập lụt truy cập liên tục, xem bài `LOCK-005`.

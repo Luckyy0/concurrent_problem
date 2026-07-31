@@ -1,189 +1,158 @@
-# Phân tích versioned update và optimistic conflict
+# Phân tích Chuyên sâu: Cập nhật Cột Version và Xung Đột Khóa Lạc Quan
 
-## Trạng thái ban đầu
+## 1. Bối cảnh Khởi động
 
-Offer `42`: price `100`, version `7`. A và B có transactions/persistence contexts
-riêng, cùng `READ COMMITTED`.
+Chúng ta có Sản phẩm `42`: giá đang là `100`, phiên bản `7`. Hai bạn nhân viên A và B có 2 luồng Giao dịch độc lập nhau, đang chạy chế độ `READ COMMITTED` (đọc dữ liệu đã chốt sổ).
 
-## Timeline có `@Version`
+## 2. Dòng Thời gian (Timeline) khi có `@Version`
 
-| Bước | Editor A | Editor B |
+| Bước | Nhóm của Editor A | Nhóm của Editor B |
 | ---: | --- | --- |
-| 1 | load `100/v7` | |
-| 2 | | load `100/v7` |
-| 3 | set `90` | set `80` |
-| 4 | `UPDATE ... version=7` → `1` | |
-| 5 | commit `90/v8` | |
-| 6 | | `UPDATE ... version=7` → `0` |
-| 7 | | optimistic exception, rollback |
+| 1 | Tải lên: `100 / v7` | |
+| 2 | | Tải lên: `100 / v7` |
+| 3 | Sửa giá thành `90` | Sửa giá thành `80` |
+| 4 | Bắn lệnh: `UPDATE ... version=7` → Sửa được `1` dòng | |
+| 5 | Chốt sổ (commit): Dữ liệu giờ là `90 / v8` | |
+| 6 | | Bắn lệnh: `UPDATE ... version=7` → Sửa được `0` dòng |
+| 7 | | DB văng lỗi Optimistic, Giao dịch bị Hủy (rollback) |
 
-Final state `90/v8`. Loser không được báo success và không có partial write.
+Kết quả cuối cùng dưới DB: `90 / v8`. Người thua cuộc (Editor B) sẽ không được báo thành công giả, cũng không có chuyện lưu được một nửa dữ liệu (partial write).
 
-> **Nói ngắn gọn:** expected version biến “ai ghi sau thắng” thành compare-and-set:
-> chỉ actor còn giữ revision hiện tại mới update được.
+> **Nói ngắn gọn:** Cái "expected version" (version mà mình kỳ vọng) đã biến quy luật cùi bắp "ai ghi sau kẻ đó thắng" thành một quy tắc sắt đá "so-sánh-rồi-mới-đặt": Chỉ có anh nào đang cầm đúng cái phiên bản hiện tại mới được phép cập nhật.
 
-## SQL contract
+## 3. Bản Hợp Đồng SQL (SQL contract)
 
 ```sql
 update product_offer
 set price = :newPrice,
     title = :title,
-    version = :nextVersion
+    version = :nextVersion       -- Tăng lên 1
 where offer_id = :offerId
-  and version = :expectedVersion;
+  and version = :expectedVersion; -- Phải đúng Version cũ
 ```
 
-Affected rows:
+Số dòng bị tác động (Affected rows) trả về từ Database:
 
-- `1`: version match, row mới được tạo và version tăng;
-- `0`: row bị xóa hoặc version đã đổi; Hibernate coi managed state là stale.
+- Trả về `1`: Chúc mừng, version khớp, dòng đã được tạo và version đã tăng.
+- Trả về `0`: Chia buồn, dòng dữ liệu đã bị ai đó xóa mất, HOẶC cái version đã bị ai đó đổi. Lúc này Hibernate sẽ kết luận trạng thái dữ liệu trên tay bạn đã "ôi thiu" (stale).
 
-Application không nên tự dựa vào message text. Jakarta Persistence signal là
-`OptimisticLockException`; Spring có thể translate thành
-`ObjectOptimisticLockingFailureException`.
+Lập trình viên không nên dò chữ trong message lỗi để xử lý. Hãy bắt cái tín hiệu chuẩn `OptimisticLockException` của Jakarta Persistence; Spring thì thường bọc nó lại thành `ObjectOptimisticLockingFailureException`.
 
-## PostgreSQL MVCC và row lock
+## 4. MVCC của PostgreSQL và Khóa Dòng (row lock)
 
-A/B plain SELECT cùng thấy committed tuple `v7`; `@Version` không khóa lúc read.
-Khi UPDATE:
+Cả A và B khi gọi lệnh `SELECT` chay thì đều nhìn thấy chung dòng `v7`; Khóa `@Version` **KHÔNG HỀ khóa dữ liệu lúc bạn đọc**.
+Khi có lệnh UPDATE bay xuống DB:
 
-- A acquire row lock, tạo tuple `v8`, commit;
-- nếu B đến khi A chưa commit, B có thể chờ row lock;
-- sau A commit, B command predicate `version=7` không match current row;
-- affected rows `0`, không overwrite.
+- A giật được khóa dòng (row lock), sửa thành `v8` và chốt sổ (commit).
+- Giả sử B bay xuống lúc A đang sửa nhưng chưa kịp chốt sổ: B sẽ bị bắt Đứng Chờ cái khóa dòng đó (chờ row lock).
+- Sau khi A chốt sổ xong xuôi mở khóa, lệnh của B mới được chạy, nhưng ngặt nỗi câu lệnh của B lại đòi `version=7` - thứ mà giờ đây không còn tồn tại trên dòng đó nữa.
+- Kết quả B nhận về `0` dòng thay đổi, không hề ghi đè bậy bạ.
 
-Vì vậy optimistic locking có thể vẫn gặp lock wait ngắn ở write phase. “Optimistic”
-nghĩa conflict được detect thay vì giữ long read lock, không nghĩa không có
-PostgreSQL row lock khi UPDATE.
+Như vậy, "Khóa Lạc Quan" vẫn có thể dính phải những pha Đứng Chờ Khóa Cứng (lock wait) chớp nhoáng ở khâu Lưu dữ liệu. Chữ "Lạc quan" ở đây ý nói là mình "phát hiện xung đột lúc lưu" thay vì phải bắt mọi người "xếp hàng chờ khóa từ lúc đọc", chứ không có nghĩa là lúc Lưu không xài Khóa (row lock) của PostgreSQL đâu nha!
 
-## Hibernate dirty checking và flush
+## 5. Hibernate rà soát thay đổi (dirty checking) và Xả lệnh (flush)
 
-Setter chỉ đổi managed Java object. SQL được phát khi:
+Bạn gán (Set) giá trị trong Java thì chỉ là đổi Object trên RAM. Câu lệnh SQL thực sự chỉ được nã xuống DB khi:
 
-- explicit `EntityManager.flush()`/`JpaRepository.flush()`;
-- auto-flush trước query liên quan;
-- transaction commit.
+- Bạn tự tay gọi hàm `EntityManager.flush()` hoặc `JpaRepository.flush()`.
+- Chế độ tự xả (auto-flush) chạy trước khi nó phải thực hiện một lệnh Query liên quan.
+- Tới lúc chốt Giao dịch (transaction commit).
 
-Exception timing phụ thuộc provider/flush path. Nếu service không explicit flush,
-method body có thể tạo result trước khi interceptor commit. Boundary ngoài proxy
-phải xử lý failure.
+Thời điểm Exception văng ra phụ thuộc vào việc xả (flush) lúc nào. Nếu bạn không tự tay gọi `flush`, Code trong hàm của bạn có khi vẫn chạy trơn tru đến phút cuối, rồi Proxy đứng bên ngoài lúc làm nhiệm vụ `commit` mới đạp trúng quả mìn Exception. Do đó, Ranh giới bên ngoài (API) phải luôn chuẩn bị tinh thần đón Lỗi.
 
-## Transaction và persistence context sau conflict
+## 6. Số phận của Giao dịch sau khi Xung Đột
 
-`OptimisticLockException` trong active joined transaction đánh dấu rollback.
-Managed entity loser vẫn có price `80`/version state trong memory nhưng không phải
-committed truth.
+Một khi `OptimisticLockException` văng ra, toàn bộ Giao Dịch hiện tại sẽ bị cắm cờ CHẾT (rollback-only). Cái Object (Entity) nằm trên RAM của kẻ thua cuộc (B) dù đang cầm giá trị `80`/`version=7` đi nữa thì cũng chỉ là thứ vô giá trị, không phải đồ thật dưới DB.
 
-Không:
+**Tuyệt đối KHÔNG ĐƯỢC:**
 
-- catch rồi dùng object để trả success;
-- gọi `clear()` rồi tiếp tục trong transaction cũ;
-- merge lại stale object mà không new transaction/revalidation.
+- Bắt (catch) lỗi xong ỉm đi rồi báo với Màn hình là Lưu Thành công.
+- Gọi hàm `clear()` bùa chú hòng cứu vãn và đòi code tiếp trong cái Giao Dịch đã chết.
+- Đem Object ôi thiu này đi lưu lại (`merge`) mà không thèm mở Giao Dịch mới hoặc kiểm tra lại Version.
 
-Rollback đóng attempt. Nếu domain cho retry, transaction/persistence context mới
-phải reload current aggregate; chi tiết policy thuộc `LOCK-002`.
+Rollback là đóng sập cửa. Nếu Business cho phép Thử Lại, bạn BẮT BUỘC phải mở một Giao Dịch mới tinh, tải (reload) dữ liệu thật nhất từ DB lên lại. (Đọc thêm ở `LOCK-002`).
 
-## Client version và database version giải quyết hai cửa sổ
+## 7. Version của Client và Version của Database giải quyết "Hai Cửa Sổ Hở"
 
-Có hai stale windows:
+Có tận hai cái "cửa sổ" rò rỉ dữ liệu ôi thiu:
 
-1. **Disconnected window:** user mở form v7; A commit v8 trước khi B request tới.
-2. **Transaction window:** service B đã load v8; C commit v9 trước B flush.
+1. **Cửa sổ Đứt kết nối (Disconnected window):** Khách B mở form tải v7, nhưng treo máy đi cafe; Trong lúc đó A vô sửa thành v8. B uống cafe xong bấm nút Lưu.
+2. **Cửa sổ Giao Dịch (Transaction window):** Backend của B vừa bốc được v8 từ DB lên; nhưng đúng tích tắc trước khi B xả (flush) UPDATE xuống DB, một ông C (luồng khác) đã nhanh tay chốt thành v9.
 
-Service compare `command.expectedVersion` với entity version giải quyết cửa sổ 1.
-Hibernate version predicate giải quyết cửa sổ 2. Bỏ một trong hai khiến stale
-intent vẫn có thể overwrite.
+Nếu bạn so sánh `command.expectedVersion` (Client truyền lên) với Entity Version trên RAM, bạn sẽ bịt được **Cửa sổ số 1**.
+Cái mệnh đề `version` mà Hibernate chèn vào SQL sẽ bọc lót cho bạn cái **Cửa sổ số 2**.
+Nếu bạn BỎ QUA 1 trong 2 cái này, Code của bạn kiểu gì cũng có ngày bị ghi đè dữ liệu.
 
-HTTP có thể dùng:
+Ở tầng HTTP API, người ta hay xài trò kẹp Version vào Header:
 
 ```text
-GET /offers/42 → ETag: "7"
-PUT /offers/42
-If-Match: "7"
+(Lúc tải) GET /offers/42 → ETag: "7"
+(Lúc lưu) PUT /offers/42 kèm Header If-Match: "7"
 ```
 
-Contract mapping `412 Precondition Failed` hay `409 Conflict` phải nhất quán;
-không gửi entity internals/sensitive fields trong conflict response.
+Nhớ bọc cái Response lỗi chuẩn chỉnh thành `412 Precondition Failed` hoặc `409 Conflict`. Đừng có đem nguyên cái Object hay mấy trường nhạy cảm xả ra cho Client xem lúc bắt lỗi.
 
-## Detached entity và `merge`
+## 8. Gắn Object ngoài ranh giới (`merge`) - Cẩn thận cái bẫy
 
-Persistence provider phải kiểm tra version của detached entity khi merge, nhưng
-timing vẫn có thể tới flush/commit. `merge()` trả một managed copy; detached input
-không tự trở thành managed.
+Dù Hibernate có trách nhiệm soi Version khi bạn đem 1 Object lạc trôi bên ngoài gán lại (merge), thì thời điểm nó soi vẫn có thể lùi tới tận lúc flush/commit. Hàm `merge()` nhả ra cho bạn 1 BẢN COPY đã được theo dõi, còn cái Object truyền vào thì vẫn lang thang ngoài rìa.
 
-Mapping DTO → current managed entity với explicit expected version thường rõ hơn
-merge graph lớn: tránh accidental cascade và over-posting. Dù chọn cách nào,
-version từ client không được bỏ.
+Cách an toàn nhất cho lính mới là: Tự tay Map (chuyển đổi) DTO của Client sang cái Entity Mới Vừa Tải (current managed entity) và So Sánh Version bằng tay. Làm vậy vừa rõ ràng, vừa tránh được mấy cái lỗi cascade ngớ ngẩn hoặc client cố tình update dư trường (over-posting). Dù chọn cách nào, **TUYỆT ĐỐI KHÔNG BỎ CÁI VERSION CỦA CLIENT**.
 
-## Aggregate boundary
+## 9. Ranh giới của một Khối (Aggregate boundary)
 
-Version column bảo vệ entity/aggregate root được update. Nếu business invariant
-trải trên nhiều independent rows:
+Cột Version sinh ra là để bảo vệ cái Bảng Gốc (aggregate root). Nếu logic của bạn trải dài nhiều bảng:
 
-- version từng row không tự phát hiện write skew;
-- child collection ownership/mapping quyết định root version có tăng hay không;
-- bulk JPQL/native UPDATE có thể bypass persistence context/version behavior nếu
-  không tự viết predicate/increment.
+- Version của từng dòng lẻ tẻ không thể tự nó ngăn chặn được lỗi Khớp Sai Tổng (write skew).
+- Bạn sửa các Collection con bên trong (List, Set) có làm tăng Version thằng Cha hay không là do bạn cấu hình (mapping).
+- Nếu bạn tự lấy tay viết SQL `UPDATE` hàng loạt (Bulk JPQL/Native), Hibernate sẽ mù màu không tăng Version cho bạn đâu. Nhớ tự tay cộng Version vào!
 
-Test phải cover exact mutation paths, kể cả collection/bulk operations.
+Làm mấy trò này thì phải Test thật kỹ mọi ngóc ngách!
 
-## Vì sao không auto-retry edit này?
+## 10. Thế tại sao không tự code Thử Lại (auto-retry) cho khỏe?
 
-Command “set price to 80 dựa trên v7” chứa user intent gắn với state cũ. Sau A
-commit `90/v8`, tự reload rồi set `80` làm retry thành overwrite có chủ ý mà user
-chưa review.
+Cái lệnh "Sửa thành giá 80" của ông B được gõ trong tâm thế ổng ĐANG NHÌN THẤY cái giá hiện tại (của Version 7). Giả sử A đã chốt thành `90 / v8`, mà Backend tự động nạp (reload) rồi âm thầm đè số `80` vào, thì khác nào Code đang lén lút thay mặt ông B phá hoại cái `90` của A mà B chẳng hề hay biết (chưa kịp Review)!
 
-Loser nên nhận conflict, current version và workflow reload/merge. Các command
-commutative/delta có thể retry, nhưng cần new attempt, backoff/deadline và
-idempotency ở `LOCK-002`.
+Người thua cuộc phải nhận lỗi Conflict, thấy được Dữ Liệu Hiện Tại (v8) để tự quyết định hợp nhất (merge) hay gõ lại. Nếu bạn update những thứ vô thưởng vô phạt mang tính Tích Lũy (như cộng điểm, đếm lượt xem), thì mới tự động Retry (Đọc kỹ `LOCK-002`).
 
-## Commit, rollback, timeout và crash
+## 11. Các Trạng thái Tai nạn (Commit, rollback, timeout, crash)
 
-- Winner commit: price/version visible atomically.
-- Loser conflict: whole transaction rollback; locks release.
-- Lock/statement timeout: khác optimistic conflict, không map thành stale edit.
-- Crash trước commit: PostgreSQL rollback attempted version/update.
-- Crash sau commit trước response: outcome ambiguous; command/audit ID giúp query.
-- Delete cạnh tranh: affected rows `0` có thể map not-found-versus-conflict theo
-  domain contract sau rollback/fresh read.
+- Kẻ Thắng Cuộc (Winner) chốt sổ: Giá/Version đồng thời hiện hình dưới DB.
+- Kẻ Thua Cuộc (Loser) đụng độ: Toàn bộ Giao dịch bị cuốn trôi; DB nhả mọi Khóa (lock).
+- Quá giờ chờ Khóa (Lock/statement timeout): Hoàn toàn khác với Đụng độ (Optimistic conflict), đừng bắt nhầm Exception.
+- Máy chủ sập TRƯỚC KHI chốt sổ: PostgreSQL lo dọn dẹp sạch sẽ. Mọi thứ xôi hỏng bỏng không.
+- Máy chủ sập SAU KHI chốt sổ nhưng CHƯA BÁO CHO CLIENT: Trạng thái không rõ ràng. Cần phải có Mã Lệnh (Command ID/Audit) để tra cứu xem lệnh đó đã vô DB chưa.
+- Hai người đua nhau XÓA: Ông đi sau sẽ vướng `affected rows 0`, nhưng thay vì chửi là Lỗi Đụng Độ thì phải tùy logic Business mà biến nó thành Lỗi Không Tìm Thấy (Not Found).
 
-## Multi-instance
+## 12. Chạy nhiều máy chủ (Multi-instance)
 
-Version predicate nằm tại PostgreSQL nên App-1/App-2 cùng được bảo vệ. JVM
-`synchronized` không cần cho correctness và không cover background/direct writers.
+Vì cái đuôi `version = ?` được xét thẳng dưới PostgreSQL nên dù bạn chạy App-1 hay App-2 thì đều được bảo vệ như nhau. Đừng có cố nhét từ khóa `synchronized` của Java vào hàm, nó vừa vô dụng (không đỡ được server bên cạnh) vừa làm giảm hiệu năng.
 
-Mọi writer phải duy trì version contract. Native SQL bỏ `version=version+1` hoặc
-predicate có thể làm JPA conflict detection sai. Giới hạn permissions và review
-migrations/batch jobs.
+Hãy bắt TẤT CẢ các bên tuân thủ Luật Version. Mấy ông viết SQL chay mà "lười" không chèn đoạn `version=version+1` vào lệnh UPDATE sẽ phá nát cơ chế phát hiện Lỗi của toàn hệ thống. Hãy siết quyền và Review kỹ các đoạn code tự viết SQL (migrations/batch jobs).
 
-## So với các cơ chế khác
+## 13. Bảng Phân hạng Vũ khí (So với các cơ chế khác)
 
-| Cơ chế | Loser behavior | Phù hợp |
+| Vũ khí / Cơ chế | Hình phạt cho Kẻ thua cuộc | Đất dụng võ |
 | --- | --- | --- |
-| `@Version` | affected-row `0`, fail/rollback | Aggregate edit, conflict hiếm |
-| Conditional SQL | affected-row theo business predicate | Counter/stock/delta |
-| `FOR UPDATE` | block/timeout | Decision cần serialize trước mutation |
-| `SERIALIZABLE` | `40001`, whole-Tx retry | Predicate/multi-row invariant |
+| **`@Version` (Khóa Lạc Quan)** | DB trả `0` dòng sửa, Văng lỗi, Rollback | Dùng cho Các màn hình Sửa Thông tin (Aggregate edit), ít khi tranh giành nhau |
+| Câu lệnh SQL có Điều Kiện | Báo lỗi hoặc không tùy Business đặt luật | Đếm số lượng / Trừ Tồn Kho |
+| Khóa Bi Quan `FOR UPDATE` | Bị Block đứng chờ hoặc Quá Giờ (timeout) | Cần bắt mọi người xếp hàng tuần tự trước khi được cập nhật |
+| Isolation `SERIALIZABLE` | Ném lỗi `40001`, bắt Code phải thử lại toàn bộ | Tính toán nhiều bảng phức tạp |
 
-## Nguyên nhân gốc theo layer
+## 14. Bảng Phân Tội theo Lớp (Layer)
 
-| Layer | Vai trò |
+| Tầng (Layer) | Trách nhiệm |
 | --- | --- |
-| Application/API | Có hoặc làm mất expected version/user intent |
-| Spring | Transaction boundary và exception translation |
-| Hibernate/JPA | Dirty checking, version predicate, affected-row check |
-| PostgreSQL | MVCC tuple, row lock và row-count result |
+| Màn hình / API | Không truyền Lên cái Version mà User đang xem. Làm mất "Dữ liệu kỳ vọng". |
+| Spring | Tạo Ranh giới Giao dịch ảo và Chế biến Exception. |
+| Hibernate / JPA | Theo dõi thay đổi, Sinh câu SQL có đuôi `version`, Kiểm tra số dòng sửa được. |
+| DB PostgreSQL | Cấp MVCC, Cấp Khóa dòng (Row Lock) và Trả về số Dòng đã tác động. |
 
-## Khả năng quan sát (`observability`)
+## 15. Kính lúp Quan Sát (Observability)
 
-Theo dõi:
+Khi đưa code lên Môi trường thật (Production), phải giám sát:
 
-- optimistic conflict theo entity/use case;
-- expected/current version trong structured debug log có kiểm soát;
-- conflict response và user reload/merge outcome;
-- transaction duration, flush location và SQL count;
-- retry rate/exhaustion khi case khác cho phép retry;
-- hot aggregate IDs trong sampled trace, không metric label high-cardinality.
-
-Alert khi conflict rate tăng sau deploy/bulk job; đó có thể là contention thật,
-client giữ form quá lâu hoặc writer bypass version increment.
+- Đếm số lần Xung đột Khóa Lạc Quan theo từng Màn hình/Bảng.
+- Ghi Log Đẹp (Structured) ra cái `expected version` và `current version` khi có lỗi.
+- Đếm xem trả về `409 Conflict` nhiều không và User có tải lại Form hay không.
+- Giao dịch sống được bao lâu, Gọi flush ở xó xỉnh nào và Tổng số câu SQL.
+- Nếu thấy Đụng Độ tự nhiên tăng phi mã sau một đợt Deploy hoặc chạy Bulk Job, khoan đổ lỗi cho mạng, coi chừng mấy ông viết SQL dạo Bypass cái luật Version rồi đó!

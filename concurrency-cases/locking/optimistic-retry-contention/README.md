@@ -1,118 +1,110 @@
-# LOCK-002 — Bounded optimistic retry dưới contention
+# LOCK-002 — Thử lại Có chừng mực (Bounded Retry) khi dùng Khóa Lạc quan
 
 ## Tóm tắt
 
-Nhiều command cộng reward points vào cùng wallet `@Version`. Mỗi command là delta
-trên fresh state nên có thể retry, nhưng immediate/unbounded retry làm losers cùng
-reload–flush, tiếp tục conflict và khuếch đại database load.
+Tưởng tượng có nhiều luồng (command) cùng lúc muốn cộng điểm thưởng (reward points) vào cùng một cái ví (wallet) đang được bảo vệ bằng `@Version` (Khóa Lạc Quan). 
+Vì bản chất của việc cộng điểm là lấy "số dư hiện tại + điểm mới", nên nếu một luồng bị báo lỗi do có người khác chen ngang (version conflict), luồng đó hoàn toàn có thể thử lại (retry). 
+Nhưng nếu bạn code vòng lặp thử lại vô tội vạ, chạy lại ngay lập tức không chớp mắt (immediate/unbounded retry), thì đám luồng bị rớt này sẽ lại lao vào, lại đụng độ, rồi lại văng ra... tạo ra một đợt "bão đụng độ" làm sập luôn database!
 
-Retry đúng:
-
-```text
-attempt Tx-N load current wallet + command record
-→ apply delta + flush
-→ conflict: rollback hoàn tất
-→ check attempt/deadline
-→ backoff có jitter ngoài transaction
-→ attempt Tx-(N+1) reload
-```
-
-> **Nói ngắn gọn:** `@Version` giữ correctness; bounded fresh retry giữ hệ thống
-> không biến conflict thành retry storm.
-
-## Actor và trạng thái dùng chung
-
-| Thành phần | Trạng thái |
-| --- | --- |
-| `reward_wallet` | wallet `77`, points `100`, version `10` |
-| C1…Cn | Unique command ID và positive point delta |
-| `reward_credit` | Durable idempotency/audit record theo command ID |
-| App-1…App-N | Concurrent Spring instances |
-
-Điểm tranh chấp là versioned UPDATE của cùng wallet row. Retry không giữ row lock
-trong backoff nhưng mỗi attempt vẫn dùng connection/query/flush.
-
-## Invariant
+Luồng thử lại (Retry) đúng chuẩn phải đi qua các bước sau:
 
 ```text
-Final points = initial points + tổng delta của các unique committed commands.
-
-Mỗi command ID tạo tối đa một reward_credit.
-
-Mỗi retry dùng transaction/persistence context mới và reload wallet.
-
-Retry dừng theo attempt cap hoặc overall deadline; exhaustion không báo success.
+Lần thử thứ N (Tx-N): Tải ví hiện tại + Lưu lịch sử lệnh
+→ Tính toán cộng điểm + Ghi xuống DB (flush)
+→ BÙM! Có thằng chen ngang (conflict): Hủy (rollback) sạch sẽ toàn bộ
+→ Kiểm tra xem đã thử quá số lần chưa / quá thời gian chưa
+→ Ra khỏi Giao dịch (transaction), đứng chờ một khoảng thời gian ngẫu nhiên (backoff có jitter)
+→ Bắt đầu lần thử thứ N+1 (Tx-N+1): Tải lại ví từ đầu
 ```
 
-## Ranh giới transaction
+> **Nói ngắn gọn:** `@Version` giúp dữ liệu không bị sai lệch; còn vòng lặp thử lại có giới hạn (bounded fresh retry) giúp hệ thống không bị nghẽn mạng vì bão đụng độ (retry storm).
 
-`RewardCreditCoordinator` không có transaction. Nó gọi
-`RewardCreditAttempt.creditOnce()` qua bean proxy. Attempt dùng
-`REQUIRES_NEW`, kiểm tra command replay, load wallet, apply delta, insert credit
-record, flush và commit/rollback.
+## Các "Diễn viên" và Dữ liệu dùng chung (Actor và trạng thái)
 
-Backoff chạy sau proxy rollback, nên không giữ connection. Caller chỉ nhận result
-sau successful commit.
-
-## Khi retry an toàn?
-
-Command `add 10 points` được tính lại trên current balance và cùng `commandId`, nên
-retry có thể an toàn. Không suy rộng sang absolute user edit như “set price=80”,
-remote side effect không idempotent hoặc business rejection.
-
-Mỗi attempt phải revalidate:
-
-- command đã commit chưa;
-- wallet còn active;
-- delta/policy còn hợp lệ;
-- deadline/cancellation còn cho phép.
-
-## Thuật ngữ cần biết
-
-| Thuật ngữ | Ý nghĩa trong case |
+| Thành phần | Trạng thái hiện tại |
 | --- | --- |
-| retry amplification | Một request tạo nhiều attempts/queries/writes |
-| retry storm | Nhiều losers retry đồng nhịp và tiếp tục conflict |
-| fresh attempt | Transaction, snapshot và persistence context mới |
-| bounded retry | Attempt cap cộng overall deadline |
-| exponential backoff | Delay tăng theo attempt |
-| jitter | Thành phần random làm actors bớt đồng nhịp |
-| starvation | Command liên tục thua tới exhaustion |
-| idempotency record | Durable row bảo đảm cùng command không cộng điểm lần hai |
-| exhaustion | Retry budget hết mà command chưa commit |
+| `reward_wallet` (Ví điểm) | Ví `77`, Điểm `100`, Phiên bản (version) `10` |
+| Các Lệnh C1…Cn | Mỗi lệnh có ID duy nhất và số điểm dương cần cộng thêm |
+| `reward_credit` (Lịch sử) | Bảng ghi nhận lịch sử cộng điểm chống trùng lặp theo ID Lệnh |
+| App-1…App-N | Các máy chủ Spring Boot chạy song song |
 
-## Điều hướng
+Điểm đánh nhau sứt đầu mẻ trán chính là câu lệnh UPDATE kiểm tra phiên bản trên cùng 1 dòng Ví. Khi vòng lặp đang trong thời gian nghỉ ngơi (backoff), nó KHÔNG ĐƯỢC ngâm khóa, nhưng mỗi lần tỉnh dậy để thử lại thì nó lại tốn 1 kết nối (connection) và 1 đợt truy vấn.
 
-- [Code retry sai và load amplification](broken-code.md)
-- [Timeline, rollback, fairness và crash](analysis.md)
-- [Coordinator/attempt, policy và backoff](solutions.md)
-- [PostgreSQL Testcontainers experiments](experiments.md)
-- [Optimistic locking và version conflict](../../concepts/optimistic-locking.md)
-- [Ranh giới transaction trong Spring](../../concepts/spring-transaction-boundaries.md)
-- [Kiểm thử đồng thời](../../concepts/concurrency-testing.md)
+## Các Luật Bất biến (Invariant)
 
-## Hậu quả trong production
+```text
+Điểm tổng cuối cùng = Điểm ban đầu + Tổng điểm của tất cả các Lệnh thành công hợp lệ (unique committed commands).
 
-- CPU/query/flush tăng nhanh hơn request rate;
-- connection pool bị chiếm bởi attempts liên tiếp;
-- tail latency và exhaustion tăng trên hot wallet;
-- same-transaction retry dùng rollback-only context và không tiến triển;
-- tạo command ID mới mỗi attempt làm duplicate credits;
-- retry đồng nhịp gây starvation cho một số command;
-- response mất sau commit tạo ambiguous outcome nếu không replay by command ID.
+Mỗi mã lệnh (command ID) chỉ được phép tạo ra tối đa MỘT dòng lịch sử reward_credit.
 
-## Hướng sửa khuyến nghị
+Mỗi lần thử lại (retry) PHẢI MỞ RA MỘT Giao dịch hoàn toàn mới (persistence context mới) và bắt buộc phải Tải lại Ví từ DB lên.
 
-1. Chỉ retry allowlisted optimistic conflict.
-2. Tách non-transactional coordinator và one-attempt worker bean.
-3. Mỗi attempt reload aggregate/command state.
-4. Giữ nguyên command ID và unique constraint.
-5. Dùng attempt cap, overall deadline, exponential backoff có jitter.
-6. Ghi attempts, success-after-retry, exhaustion và conflict rate.
-7. Khi contention cao bền vững, đổi strategy thay vì chỉ tăng attempts.
+Việc thử lại phải tự giác dừng khi hết số lần hoặc hết thời gian tối đa; Nếu cạn kiệt (exhaustion) thì không được báo thành công.
+```
 
-## Phạm vi
+## Ranh giới Giao dịch (Transaction Boundaries)
 
-Case dành cho low/moderate contention và retry-safe command. Detection cơ bản ở
-`LOCK-001`; strategy dưới high contention thuộc `LOCK-005`; Spring advisor
-ordering chi tiết ở `SPR-006`.
+Class chỉ huy `RewardCreditCoordinator` hoàn toàn KHÔNG CÓ `@Transactional`. Nó đứng ngoài để gọi vào Class lính đánh thuê `RewardCreditAttempt.creditOnce()` qua proxy của Spring. 
+
+Hàm của thằng lính này được gắn cờ `REQUIRES_NEW` (Bắt buộc mở Giao dịch mới). Trong đó, nó sẽ kiểm tra xem lệnh này chạy chưa, tải Ví lên, cộng điểm, lưu lịch sử, ép xả rác xuống DB (flush) và cuối cùng là Chốt sổ (commit) hoặc Hủy bỏ (rollback).
+
+Việc "Đứng chờ" (Backoff) nằm ở Class chỉ huy, sau khi hàm lính đánh thuê đã Hủy bỏ (rollback) xong xuôi, nhờ vậy hệ thống không bị ngâm kết nối Database một cách lãng phí vô ích. Người dùng gọi API chỉ nhận được kết quả cuối cùng sau khi Chốt sổ thành công.
+
+## Khi nào thì Thử lại (Retry) mới An Toàn?
+
+Cái lệnh kiểu `Cộng thêm 10 điểm` là tính toán dựa trên số dư mới nhất ở thời điểm hiện tại và không đổi mã `commandId`, nên cho dù có thử lại 100 lần thì vẫn an toàn. NHƯNG tuyệt đối không được áp dụng trò Thử lại cho những câu lệnh kiểu gán cứng `Gán giá bằng 80`, hoặc những lệnh có gọi API bên ngoài (remote side effect) không hỗ trợ chống trùng, hoặc những lỗi do vi phạm luật kinh doanh (ví dụ: cấm cộng điểm quá 1000).
+
+Mỗi lần thử lại, bạn bắt buộc phải kiểm chứng lại từ đầu:
+
+- Lệnh này thực ra đã chốt thành công chưa (lỡ lần trước chạy xong rớt mạng)?
+- Ví này có còn hoạt động hay bị khóa rồi?
+- Điểm cộng này còn hợp lệ theo policy không?
+- Đã quá hạn thời gian hay bị người dùng bấm Hủy (cancel) chưa?
+
+## Các Thuật ngữ dân trong nghề hay dùng
+
+| Thuật ngữ | Ý nghĩa trong ngữ cảnh này |
+| --- | --- |
+| Load amplification (Khuếch đại tải) | 1 request gửi lên nhưng sinh ra hàng chục lần vòng lặp thử lại/truy vấn/ghi |
+| Retry storm (Bão thử lại) | Quá nhiều luồng thất bại tự động thử lại CÙNG MỘT LÚC khiến database sụp đổ |
+| Fresh attempt (Thử lại sạch sẽ) | Tạo mới hoàn toàn Giao dịch, lấy ảnh chụp mới và bộ nhớ đệm (persistence context) mới |
+| Bounded retry (Thử lại có chừng mực) | Giới hạn số lần thử tối đa và tổng thời gian tối đa |
+| Exponential backoff (Chờ theo hàm mũ) | Lần thử sau phải chờ lâu hơn lần thử trước |
+| Jitter (Độ lệch ngẫu nhiên) | Cộng thêm thời gian chờ ngẫu nhiên để các luồng không ồ ạt thức dậy cùng 1 lúc |
+| Starvation (Chết đói) | Một lệnh đen đủi liên tục bị thằng khác tranh mất suất cho đến khi cạn kiệt |
+| Idempotency record (Lịch sử chống trùng) | Dòng dữ liệu lưu lại để đảm bảo 1 mã lệnh không cộng điểm 2 lần |
+| Exhaustion (Kiệt sức) | Hết số lần thử hoặc hết giờ mà lệnh vẫn chưa được chốt |
+
+## Sơ đồ Bản đồ (Điều hướng)
+
+- [Code viết sai và Thảm họa khuếch đại tải (load amplification)](broken-code.md)
+- [Phân tích Dòng thời gian, rollback, tính công bằng và sập nguồn (crash)](analysis.md)
+- [Mã nguồn Chỉ huy/Lính đánh thuê, luật và thời gian chờ (backoff)](solutions.md)
+- [Thực nghiệm bằng PostgreSQL Testcontainers](experiments.md)
+- [Khái niệm: Khóa Lạc quan (Optimistic locking) và đụng độ phiên bản](../../concepts/optimistic-locking.md)
+- [Khái niệm: Ranh giới giao dịch trong Spring](../../concepts/spring-transaction-boundaries.md)
+- [Khái niệm: Kiểm thử đồng thời (Concurrency testing)](../../concepts/concurrency-testing.md)
+
+## Hậu quả nếu code ẩu đưa lên Production
+
+- CPU, số lượng query, và lượt flush DB tăng vọt gấp nhiều lần số lượng Request đẩy vào;
+- Hồ bơi kết nối (connection pool) cạn kiệt vì bị đám luồng thử lại vây hãm;
+- Những ví nào hot sẽ gặp tình trạng giật lag kéo dài (tail latency) hoặc tỷ lệ lỗi "Kiệt sức" cao chót vót;
+- Đặt vòng lặp Thử lại NGAY TRONG GIAO DỊCH khiến bộ nhớ đệm bị đóng dấu `rollback-only`, thử bao nhiêu lần cũng phế;
+- Lỗi ngu ngốc: Mỗi lần thử lại tự tạo luôn mã Lệnh (command ID) mới, dẫn đến 1 giao dịch thành công nhiều lần;
+- Vòng lặp chờ đều răm rắp (đồng nhịp) khiến một vài lệnh bị "Chết đói";
+- Giao dịch xong, rớt mạng mất Response, client gửi lại mà không có chống trùng (replay by command ID) thì không biết đường nào mà lần.
+
+## Hướng sửa chữa Khuyến nghị
+
+1. CHỈ được phép Thử lại với lỗi đụng độ Khóa Lạc quan (optimistic conflict).
+2. TÁCH BIỆT Class Chỉ huy (KHÔNG dùng `@Transactional`) và Class Lính đánh thuê thực thi 1 lần (Có `@Transactional`).
+3. MỖI lần thử lại bắt buộc phải Tải lại đối tượng Ví và Lệnh từ DB.
+4. GIỮ NGUYÊN mã Lệnh (command ID) và lợi dụng Ràng buộc Duy nhất (unique constraint) của DB để chống trùng.
+5. SỬ DỤNG luật: Giới hạn số lần thử, Giới hạn tổng thời gian, Đứng chờ theo hàm mũ và CÓ TRỘN ĐỘ LỆCH NGẪU NHIÊN (jitter).
+6. PHẢI LOG lại số lần thử, báo cáo "Thành công sau N lần thử", báo "Kiệt sức", và tỷ lệ đụng độ để giám sát.
+7. Khi tranh chấp quá căng thẳng kéo dài, HÃY ĐỔI CHIẾN THUẬT (ví dụ dùng Hàng đợi) chứ đừng có mù quáng tăng số lần thử lại lên.
+
+## Phạm vi bài học
+
+Case này áp dụng cực ngon cho tình huống tỷ lệ tranh chấp Thấp/Vừa (low/moderate contention) và dành cho các Lệnh an toàn khi làm lại (retry-safe). Nếu bạn muốn xem cách bắt lỗi cơ bản, hãy xem bài `LOCK-001`. Nếu hệ thống tranh chấp cực kỳ khủng khiếp (high contention), hãy xem chiến thuật ở bài `LOCK-005`. Chi tiết về thứ tự xếp lớp của Spring Advisor, xem ở `SPR-006`.

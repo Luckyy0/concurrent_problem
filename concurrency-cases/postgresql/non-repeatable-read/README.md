@@ -1,46 +1,43 @@
-# DB-003 — Non-repeatable read làm sai business decision
+# Cạm Bẫy Đọc Đi Đọc Lại (DB-003): Non-repeatable read - Đem Râu Ông Nọ Cắm Cằm Bà Kia
 
-## Tóm tắt
+## 1. Tóm tắt câu chuyện (Lỗi gì đây?)
 
-Merchant `M-42` có chính sách tự động duyệt refund với giới hạn `100.00`, revision
-`7`. Transaction A đọc policy và quyết định refund `80.00` đủ điều kiện. Trước
-khi A ghi decision, transaction B hạ giới hạn xuống `50.00`, tăng revision thành
-`8` rồi commit.
+Hãy tưởng tượng bạn (Ông A) là hệ thống tự động hoàn tiền. Chính sách của cửa hàng `M-42` đang cho phép bạn duyệt tự động tối đa `100.00` (Phiên bản chính sách số `7`).
+Bạn liếc mắt vào chính sách, thấy số tiền khách yêu cầu là `80.00` đủ điều kiện (nhỏ hơn 100.00). Bạn tự tin gật gù: "Duyệt!".
 
-A chạy SELECT lần hai ở PostgreSQL `READ COMMITTED`. Statement snapshot mới thấy
-revision `8`, nhưng code vẫn giữ kết quả `approved` đã tính từ giới hạn `100.00`.
-Decision cuối cùng vì thế mang revision `8` dù amount `80.00` không được policy
-revision đó cho phép.
+Nhưng khoan! Đúng lúc bạn đang hì hục cắm cúi viết giấy chứng nhận "Đã duyệt", thì Sếp B (Ông B - Quản trị viên rủi ro) chạy ngang qua, đổi rẹt chính sách xuống còn `50.00`, tăng Phiên bản thành `8` rồi chốt sổ.
 
-Invariant:
+Bạn viết xong giấy duyệt, quay lên nhìn lại cơ sở dữ liệu để lấy số Phiên bản ghi vào giấy cho chắc ăn (SELECT lần hai). Mức cô lập mặc định của PostgreSQL (`READ COMMITTED`) cấp cho bạn một bức ảnh mới toanh (snapshot mới), bạn thấy Phiên bản hiện tại là `8`. Bạn hồn nhiên ghi `8` vào giấy chứng nhận.
+
+Kết quả? Tờ giấy của bạn ghi: "Hoàn tiền `80.00`, dựa theo Phiên bản `8`". Trong khi Phiên bản `8` chỉ cho phép tối đa `50.00`! Bạn vừa tạo ra một Chứng cứ giả mạo mà ở bất kỳ thời điểm nào trong lịch sử cũng không hề tồn tại. Đem râu ông nọ cắm cằm bà kia là đây!
+
+Nguyên tắc bắt buộc (Invariant):
 
 ```text
-Mỗi refund decision phải được đánh giá từ một policy snapshot nhất quán.
+Mỗi quyết định hoàn tiền phải dựa trên MỘT bức ảnh chính sách (snapshot) đồng nhất.
 
-Nếu decision = APPROVED:
-  amount <= autoRefundLimit của chính policyRevision được lưu cùng decision.
+Nếu quyết định = APPROVED (Duyệt):
+  Số tiền phải <= Hạn mức (autoRefundLimit) CỦA ĐÚNG CÁI PHIÊN BẢN (policyRevision) được lưu cùng quyết định đó.
 
-Không được:
-  quyết định bằng revision 7
-  nhưng ghi bằng chứng/audit là revision 8.
+KHÔNG ĐƯỢC PHÉP:
+  Lấy luật của Phiên bản 7 ra xét duyệt...
+  Nhưng lại điền Phiên bản 8 vào Sổ Nhật ký (Audit) để nộp lên sếp.
 ```
 
-> **Nói ngắn gọn:** hai SELECT trong cùng transaction `READ COMMITTED` không mặc
-> nhiên nói về cùng database snapshot; ghép dữ liệu của hai lần đọc có thể tạo
-> một decision chưa từng hợp lệ ở bất kỳ thời điểm nào.
+> **Nói ngắn gọn:** Đừng ngây thơ tin rằng hai câu lệnh SELECT trong cùng một Giao dịch (`READ COMMITTED`) sẽ tự động nhìn về cùng một bức ảnh! Việc bạn bóc dữ liệu của lần Đọc Trước ghép với lần Đọc Sau sẽ đẻ ra một con quái vật dữ liệu không bao giờ hợp lệ.
 
-## Actors và shared state
+## 2. Diễn viên và Đạo cụ (Actors và shared state)
 
 | Thành phần | Vai trò |
 | --- | --- |
-| Refund evaluator A | Đọc policy, chạy rule và lưu decision |
-| Risk administrator B | Thay đổi refund limit của merchant |
-| `merchant_refund_policy` | Authoritative current policy |
-| `refund_decision` | Audit record của kết quả đã công bố |
-| PostgreSQL MVCC | Cấp statement snapshot cho từng SELECT |
-| Spring transaction | Giữ hai SELECT và INSERT trong một physical transaction |
+| Ông A (Refund evaluator) | Đọc luật, xét duyệt và viết giấy hoàn tiền |
+| Ông B (Risk administrator) | Người chuyên đi thay đổi Hạn mức hoàn tiền |
+| `merchant_refund_policy` | Bảng Luật (chính sách hiện tại) |
+| `refund_decision` | Bảng Sổ Nhật ký (lưu lại bằng chứng quyết định) |
+| Chức năng MVCC của PostgreSQL | Quản gia chuyên phát "Ảnh chụp" (statement snapshot) cho mỗi lệnh SELECT |
+| Giao dịch của Spring | Kẻ bao bọc cả 2 lần SELECT và 1 lần INSERT của Ông A vào một Giao dịch duy nhất |
 
-Initial committed policy:
+Sổ Luật Ban Đầu (Đã chốt):
 
 ```text
 merchant_id       = M-42
@@ -49,7 +46,7 @@ active            = true
 revision          = 7
 ```
 
-Concurrent committed policy:
+Sổ Luật Mới bị Ông B sửa (Vừa chốt xong):
 
 ```text
 merchant_id       = M-42
@@ -58,104 +55,93 @@ active            = true
 revision          = 8
 ```
 
-Broken decision:
+Tờ Quyết định Thảm họa:
 
 ```text
 amount             = 80.00
 outcome            = APPROVED
-evaluated_limit    = 100.00
-policy_revision    = 8
+evaluated_limit    = 100.00  (Lấy từ lúc đầu)
+policy_revision    = 8       (Lấy từ lúc sau)
 ```
 
-## Transaction boundary và contention point
+## 3. Hiện trường vụ án (Transaction boundary và contention point)
 
-A đi qua Spring proxy:
+Ông A chạy qua Proxy của Spring:
 
 ```text
-BEGIN READ COMMITTED
-  SELECT policy                         -> limit=100, revision=7
-  decide APPROVED in Java
-  ... concurrent B commits ...
-  SELECT policy again for audit fields  -> limit=50, revision=8
-  INSERT refund_decision                -> APPROVED, revision=8
-COMMIT
+BẮT ĐẦU VỚI MỨC CÔ LẬP 'READ COMMITTED'
+  LẦN ĐỌC 1: Đọc Luật                           -> Thấy hạn mức=100, phiên bản=7
+  Trong RAM: Xét duyệt APPROVED (80 < 100)
+  ... Đùng một cái! Ông B thay đổi luật và chốt Sổ (COMMIT) ...
+  LẦN ĐỌC 2: Lại Đọc Luật để lấy Phiên bản điền Audit  -> Thấy hạn mức=50, phiên bản=8
+  GHI VÀO SỔ NHẬT KÝ (INSERT)                   -> Ghi: APPROVED, phiên bản=8
+CHỐT SỔ (COMMIT)
 ```
 
-B chạy trong independent transaction:
+Ông B chạy ở một Giao dịch độc lập khác hoàn toàn:
 
 ```text
-BEGIN
-  UPDATE merchant_refund_policy
+BẮT ĐẦU
+  CẬP NHẬT merchant_refund_policy
      SET auto_refund_limit=50, revision=8
-COMMIT
+CHỐT SỔ (COMMIT)
 ```
 
-Contention point là logical row `merchant_refund_policy(M-42)`. Hai plain SELECT
-của A không giữ row lock. B có thể update và commit giữa chúng; INSERT của A lại
-ghi row khác nên không có direct write conflict buộc PostgreSQL từ chối.
+Điểm tử huyệt ở đây là dòng dữ liệu của ông `merchant_refund_policy(M-42)`. Hai cú đọc SELECT chay của ông A KHÔNG HỀ giữ khóa (row lock) bảo vệ. Ông B thoải mái nhào vô sửa và chốt (commit) ngay giữa hai lệnh Đọc của A. Cuối cùng ông A ghi vào bảng Nhật ký (`refund_decision`) - một bảng khác hoàn toàn, nên DB chả thấy có va chạm Ghi Đè (write conflict) trực tiếp nào để mà PostgreSQL từ chối cả. Mọi thứ được duyệt cho qua lọt khe!
 
-## Expected và actual
+## 4. Ảo mộng và Đời thực (Expected và actual)
 
-| Bước | Broken assumption | PostgreSQL `READ COMMITTED` |
+| Bước | Ảo tưởng của bạn (Broken assumption) | Đời thực phũ phàng của PostgreSQL `READ COMMITTED` |
 | --- | --- | --- |
-| SELECT đầu của A | Policy ổn định tới hết transaction | Snapshot S1 thấy revision 7 |
-| B commit | A không bị ảnh hưởng | Revision 8 trở thành committed |
-| SELECT sau của A | Vẫn là cùng policy | Snapshot S2 thấy revision 8 |
-| A INSERT | Decision và evidence nhất quán | Decision rev7 bị gắn evidence rev8 |
-| Conflict signal | Có exception nếu policy đổi | Không có; A và B có thể cùng commit |
+| Lần đọc 1 của A | Luật lệ sẽ không đổi cho đến hết giao dịch này | Quản gia phát Bức Ảnh số 1 (thấy Phiên bản 7) |
+| Ông B chốt sổ | Việc của B không ảnh hưởng tới A | Phiên bản 8 chính thức có hiệu lực toàn cục |
+| Lần đọc 2 của A | Luật vẫn là luật ban nãy | Quản gia phát Bức Ảnh số 2 (thấy Phiên bản 8 mới tinh) |
+| Ông A ghi sổ (INSERT) | Quyết định và Bằng chứng luôn nhất quán | Gắn râu ông nọ (Phiên bản 8) vào cằm bà kia (Quyết định của Phiên bản 7) |
+| Tín hiệu Cảnh báo lỗi | Hệ thống sẽ báo lỗi văng Exception nếu luật bị đổi | Đâu có ai lỗi đâu, A và B cùng vui vẻ báo Thành công! |
 
-## Thuật ngữ cần biết
+## 5. Từ điển Bỏ túi (Thuật ngữ cần biết)
 
-| Thuật ngữ | Giải thích |
+| Thuật ngữ | Diễn giải dân dã |
 | --- | --- |
-| non-repeatable read | Cùng logical row được đọc lại và thấy committed value khác |
-| statement snapshot | Database view riêng của mỗi statement ở `READ COMMITTED` |
-| transaction snapshot | Stable view dùng xuyên transaction ở `REPEATABLE READ` |
-| coherent snapshot | Một bộ field cùng thuộc một policy version |
-| revalidation | Kiểm tra lại assumption ngay tại authoritative write boundary |
-| policy revision | Version nghiệp vụ xác định policy dùng để ra quyết định |
-| row lock | Lock giữ updater khác chờ tới commit hoặc rollback |
-| serialization order | Thứ tự tuần tự hợp lệ tương đương với concurrent execution |
+| non-repeatable read (Đọc không lặp lại được) | Vừa đọc xong quay lại đọc dòng đó thêm lần nữa thì thấy dữ liệu bị đứa khác sửa mất tiêu rồi |
+| statement snapshot (Ảnh chụp cho từng câu lệnh) | Bức ảnh toàn cảnh CSDL mà PostgreSQL phát riêng lẻ cho *mỗi* câu lệnh Đọc (nếu đang ở mức `READ COMMITTED`) |
+| transaction snapshot (Ảnh chụp cho toàn giao dịch) | Bức ảnh ổn định xài chung từ đầu tới cuối Giao dịch (nếu dùng mức Cô lập xịn hơn là `REPEATABLE READ`) |
+| coherent snapshot (Ảnh chụp Đồng nhất) | Tất cả các cột dữ liệu lấy ra phải thuộc về Cùng MỘT phiên bản luật |
+| revalidation (Xác nhận lại trước giờ G) | Kiểm tra lại lần chót các điều kiện ngay tại khoảnh khắc đặt bút Ghi dữ liệu |
+| policy revision (Phiên bản chính sách) | Con số định danh phiên bản của Luật dùng để ra quyết định |
+| row lock (Khóa Dòng) | Đặt chỗ cấm đứa khác sửa vào dòng này cho đến khi mình chốt sổ hoặc hủy bỏ (commit/rollback) |
+| serialization order (Thứ tự Tuần tự hóa) | Sắp xếp các giao dịch chạy song song sao cho ra kết quả giống hệt như bắt tụi nó chạy xếp hàng từng đứa một |
 
-## Điều hướng
+## 6. Đi đâu tiếp theo? (Điều hướng)
 
-- [Broken two-read decision](broken-code.md)
-- [Statement-snapshot analysis](analysis.md)
-- [Snapshot, validation and locking solutions](solutions.md)
-- [Deterministic PostgreSQL experiments](experiments.md)
+- [Đoạn Code Thảm Họa (Broken two-read decision)](broken-code.md)
+- [Mổ Xẻ Nguyên Nhân Tận Gốc (Statement-snapshot analysis)](analysis.md)
+- [Thuốc Đặc Trị: Chụp Ảnh, Xác Nhận Lại, và Khóa (Snapshot, validation and locking solutions)](solutions.md)
+- [Phòng Thí Nghiệm Đập Tan Ảo Tưởng (Deterministic PostgreSQL experiments)](experiments.md)
 - [PostgreSQL MVCC](../../concepts/postgresql-mvcc.md)
-- [Isolation levels](../../concepts/isolation-levels.md)
-- [Concurrency testing](../../concepts/concurrency-testing.md)
+- [Mức Độ Cô Lập (Isolation levels)](../../concepts/isolation-levels.md)
+- [Kiểm Thử Đồng Thời (Concurrency testing)](../../concepts/concurrency-testing.md)
 
-## Hậu quả production
+## 7. Hậu Quả Để Lại Cho Công Ty (Hậu quả production)
 
-- Audit record tham chiếu policy revision không thực sự authorize decision.
-- Refund vượt current limit vẫn được công bố là auto-approved.
-- Reconciliation không thể tái dựng lý do quyết định từ stored evidence.
-- Hai lần đọc có thể làm response, event và database row chứa các revision khác
-  nhau.
-- Lỗi không tạo exception nên dễ bị hiểu nhầm là business logic bug ngẫu nhiên.
-- Nhiều application instances làm cửa sổ interleaving rộng hơn; JVM-local lock
-  không bảo vệ row dùng chung.
+- Sổ Nhật ký (Audit) lưu lại bằng chứng giả: Trích dẫn Phiên bản Luật không hề cho phép quyết định đó.
+- Hoàn tiền lố tay nhưng lại được công bố là "Tự Động Duyệt Hợp Lệ".
+- Đối soát cuối tháng (Reconciliation) khóc thét vì không sao giải thích nổi lý do hoàn tiền từ Bằng chứng lưu trong DB.
+- Cùng một lệnh xử lý nhưng trả về cho người dùng (response), bắn sự kiện (event) và ghi log lại mang các Phiên bản khác nhau loạn xị ngầu.
+- Lỗi này chạy im re không hề quăng Exception, làm đội Dev cứ vò đầu bứt tai tưởng logic bị bug ngẫu nhiên.
+- Càng nhiều Server chạy (nhiều application instances) thì tỷ lệ dính chưởng càng cao. Dùng khóa trong RAM Java (JVM-local lock) hoàn toàn phế võ công vì không bảo vệ được dữ liệu xài chung dưới DB.
 
-## Hướng sửa khuyến nghị
+## 8. Hướng Chữa Cháy (Hướng sửa khuyến nghị)
 
-Trước tiên chọn semantics:
+Khoan vội gõ phím, hãy chọn chiến thuật trước:
 
-1. Nếu decision chỉ cần nhất quán với policy tại lúc đánh giá, đọc policy một lần,
-   truyền một immutable snapshot xuyên suốt và lưu đầy đủ revision/evidence.
-   Policy history nên immutable để revision cũ còn audit được.
-2. Nếu policy phải còn là current version tại lúc ghi decision, dùng conditional
-   validation ở database và xử lý affected-row `0` bằng một transaction mới.
-3. Nếu policy update không được phép vượt qua decision đang chạy, đọc row bằng
-   `FOR SHARE`/pessimistic read; updater phải chờ hoặc timeout.
-4. `REPEATABLE READ` loại non-repeatable read, nhưng không tự biến snapshot cũ
-   thành “latest policy at commit”.
+1. **Chụp 1 tấm ảnh duy nhất:** Nếu quyết định chỉ cần hợp lệ với luật "Tại thời điểm xét duyệt", thì hãy Đọc Bảng Luật đúng MỘT lần duy nhất. Giữ chặt cái kết quả đọc được đó (immutable snapshot) xài xuyên suốt và lưu đầy đủ thông tin vào Sổ Audit. Các phiên bản cũ của Luật nên được giữ lại (đừng xóa đi) để sau này còn có cái mà đối soát (audit).
+2. **Luật mới nhất mới chịu:** Nếu bắt buộc quyết định phải tuân theo Luật Tươi Mới nhất ngay tại lúc Ghi sổ, hãy dùng truy vấn kiểm tra điều kiện (conditional validation) ngay dưới database. Nếu báo về số dòng bị ảnh hưởng (affected-row) là `0` (tức là luật đổi rồi), thì lập tức mở một giao dịch mới làm lại từ đầu.
+3. **Chiếm khóa xếp hàng:** Nếu cấm tuyệt đối không cho ai đổi Luật khi bạn đang bận Xét duyệt, hãy dùng lệnh đọc chiếm khóa `FOR SHARE` (pessimistic read). Thằng nào muốn cập nhật luật (Updater) sẽ phải ngậm đắng nuốt cay chờ bạn chốt sổ xong hoặc bị timeout.
+4. **Tăng Cấp Cô Lập:** Mức `REPEATABLE READ` quả thật chặn đứng được lỗi Đọc Lại (non-repeatable read), nhưng NHỚ KỸ: Nó giữ nguyên Bức Ảnh Cũ Rích từ đầu chí cuối, chứ nó không tự biến Bức Ảnh cũ đó thành "Luật mới nhất ở thời điểm Chốt sổ" (latest policy at commit) đâu nha!
 
-Cơ chế phải khớp invariant, không chỉ làm hai SELECT trả về giống nhau.
+Cơ chế phải khớp với Nguyên tắc bắt buộc (invariant), không chỉ làm trò lừa tình để hai cú SELECT trả về kết quả giống nhau.
 
-## Phạm vi
+## 9. Phạm Vi Câu Chuyện (Phạm vi)
 
-Case này chỉ xét một logical row được đọc lại. Predicate query trả về tập row thay
-đổi là phantom và thuộc DB-004. Lost update thuộc DB-001; dirty-read expectation
-thuộc DB-002.
+Bài này chỉ bàn tới lỗi trên MỘT DÒNG DUY NHẤT (logical row) bị ai đó sửa khi bạn đọc lại. Nếu bạn dùng lệnh lọc (predicate query) quét cả Bảng và trả về tập kết quả bị thêm/bớt số lượng dòng, thì đó là Bóng Ma (phantom) của bài DB-004. Lỗi ghi đè (lost update) thuộc DB-001; Còn vụ mong chờ Đọc dữ liệu Tạm mà không ra (dirty-read expectation) nằm ở bài DB-002 nhé.

@@ -1,25 +1,23 @@
-# Deterministic predicate-capacity experiments
+# Buộc Tội Hiện Trường Tranh Gian Sức Chứa (Deterministic predicate-capacity experiments)
 
-## Mục tiêu
+## 1. Mục Tiêu Lên Thớt (Mục tiêu)
 
-Test suite phải chứng minh:
+Bộ Trảm Kiểm Tra (Test suite) Này Dựng Lên Cốt Găm Đinh Trọng Án Báo Rõ Rằng:
 
-1. repeated COUNT ở `READ COMMITTED` thấy committed phantom;
-2. hai count-then-insert attempts làm final active count `11`;
-3. `REPEATABLE READ` giữ snapshot nhưng vẫn không bảo vệ capacity;
-4. `SERIALIZABLE` abort một actor và giữ final count `10`;
-5. conditional counter chỉ có một winner;
-6. parent row lock có bounded loser behavior;
-7. `SKIP LOCKED` claim finite slot không cấp cùng unit cho hai actors;
-8. rollback không làm counter drift.
+1. Cuốc Cuốc Kháo Nhìn COUNT ở `READ COMMITTED` Mà Xem Thì Banh Mắt Mới Chọc Thấy Được Cái Bóng Kép Commit Kín.
+2. Quả Đấm Ngược Đếm-Xong-Nhét Hai Nhát Đủ Lực Thổi Dạt Giới Hạn Cứu (active count) Tốc Trần Lên `11`.
+3. Bọc Kéo `REPEATABLE READ` Ngậm Băng Tĩnh Ổn (snapshot) Đó Nhưng Ép Túng Sức Chứa (capacity) Dưới Chân Vẫn Lỏng Nát Khống Nổi.
+4. Trùm Cháy `SERIALIZABLE` Ốp Cửa Trảm Cắt Ngược Một Khách Nhả Chết Kịp Rớt Rành Nền Cho Ổn Số Dư `10`.
+5. Đóng Van Đếm Thần Thánh (conditional counter) Chỉ Tặng Duy Nhất Giải Vô Địch Winner Cho 1 Kẻ Tới Bờ!
+6. Bịt Ống Áp Sếp Khóa Ngực Bố Mẹ Parent Row Có Góc Góc Chờ Đầu Tử Loser Cắn Xích Chết Timeout Ế Rõ Ngon (bounded loser).
+7. Nắm Vé Giành Ghế Khóa Gõ `SKIP LOCKED` Thọc Ngực Lẻ Kép KHÔNG Sớt Cho Hai Kẻ Chung 1 Ghe Ghế Slot.
+8. Kẹp Phanh Xé Ruột Rollback KHÔNG Trôi Xoắn Cục Bộ Bơm Đếm Trôi Dốc Nào (counter drift).
 
-Dùng latch/barrier thay cho delay theo wall clock. Mọi `await` và `Future.get`
-đều có timeout.
+Ngâm Chốt Chờ Tĩnh Kép Ổn Định Gây Chết Sẽ Xài Barrier Nhé Đừng Ngu Chơi Đi Xài Đo Cáp Phút Chờ Hên Xui Đoán Đồng Hồ Gỗ Tích. Tất Bật `await` Lẫn Gọi Chóp Kép `Future.get` PHẢI Găm Timeout Bịt Đầu Đội Giới Trừ Sụt Đuôi Rớt Chờ Hoài.
 
-> **Nói ngắn gọn:** regression test phải assert `active <= capacity`, số winners
-> và side effects sau commit; chỉ assert exception type là chưa đủ.
+> **Sếp chốt lại:** Quật Test Kiện Bịt Vá Áo Lỗi Thì Dò Phải Tra Tận Tủy Cắm `active <= capacity`, Nhìn Kỹ Mấy Đứa Thắng Winner Cùng Hậu Tích Khắc Đá Án Vệt Cát Khói Commit Rõ Nhé; Chứ Soi Tìm Kéo Chặn Quát Tách Exception Độc Cụt Không Chút Thấm Án Gì Khỏi Ngộp Nước!!!
 
-## PostgreSQL Testcontainers
+## 2. Thùng Máy Kép Chứa Trạm Chọt Testcontainers (PostgreSQL Testcontainers)
 
 ```java
 @Testcontainers
@@ -126,9 +124,9 @@ class PhantomCapacityIntegrationTest {
 }
 ```
 
-Test methods không có outer transaction. Mỗi actor dùng connection riêng.
+Bãi Chạy Test Methods KHÔNG Thèm Mang Bọc Vỏ Tròn Ngoài (outer transaction). Bất Kỳ Ai Gọi Lính Cựa Kép Đều Cầm Súng Tựa Ống Nước Cắm Xoay Cuộc Tự Đích Ngôi Lên Chơi (connection riêng).
 
-## Coordination helpers
+## 3. Trấn Rào Giữ Cửa Cho Bọn Chơi Đều Góc (Coordination helpers)
 
 ```java
 final class BothCountedGate {
@@ -168,7 +166,7 @@ private static void await(CountDownLatch latch, String step) {
 }
 ```
 
-## JDBC helpers
+## 4. Bàn Tay Vàng Gọi Nghịch DB (JDBC helpers)
 
 ```java
 private static long activeCount(Connection connection) throws SQLException {
@@ -226,7 +224,7 @@ private static AttemptOutcome brokenAttempt(
 }
 ```
 
-## Experiment 1 — `READ COMMITTED` thấy committed phantom
+## 5. Màn Mổ Xẻ 1 — Kéo Vành Áo Chọt Bóng Ma Committed Ở `READ COMMITTED` (Experiment 1)
 
 ```java
 @Test
@@ -265,7 +263,7 @@ void laterReadCommittedStatementSeesNewMatchingRow() throws Exception {
 }
 ```
 
-## Experiment 2 — Broken race commits `11`
+## 6. Màn Mổ Xẻ 2 — Bể Đáy Rác Chốt Tổng Lên Cột Nhảy Đỉnh Bóp Trán `11` (Experiment 2)
 
 ```java
 @Test
@@ -301,9 +299,9 @@ void readCommittedCountThenInsertExceedsCapacity() throws Exception {
 }
 ```
 
-Broken regression cố ý assert violation để reproduction không phụ thuộc xác suất.
+Mấy Chú Bắt Bẻ Test Lỗi Bể Cái Rào Mà Đập Khẳng Định Ngang Xương Xảy Lỗi (assert violation) Mục Đích Để Éo Có Kêu Trở Lại Dựa Vào Trò Ngẫu Nhiên Xác Suất Gây Họa Hóc Mép Đi Lặng Đi Kép Kêu Gì Á (reproduction không phụ thuộc xác suất).
 
-## Experiment 3 — `REPEATABLE READ` vẫn vỡ capacity
+## 7. Màn Mổ Xẻ 3 — Sóng `REPEATABLE READ` Còn Cứng Đầu Xuyên Toạc Ngang Gãy Cánh Sức Chứa (Experiment 3)
 
 ```java
 @Test
@@ -339,10 +337,9 @@ void repeatableReadStableSnapshotsDoNotEnforceCapacity() throws Exception {
 }
 ```
 
-Test này không gọi kết quả là visible phantom; mỗi transaction không thấy row mới
-của actor kia trong stable snapshot. Assertion tập trung vào final invariant.
+Bản Test Này KHÔNG Gọi Điếm Result Đó Là Chọc Ma Trồi Lên Trông Lồi Mặt Ra Nào Khéo Nhé! (visible phantom). Lý Do Bóng Tối Thằng Kia Nó Cắt Ngang Có Được Cảm Thấy Khúc Dòng Mới Nhú Sờ Trong Cái Hộp Khung Cảnh Tĩnh Chết Tịch Đó Đâu Nào Á (stable snapshot). Trọng Án Bóp Còi Dọng Ép Assertion Nhấn Chú Mục Trúng Cái Luật Rốn Thủng Vỡ Toạc Kẹp Đầu Đuôi Sau Cuối Kìa (final invariant).
 
-## Experiment 4 — `SERIALIZABLE` abort một actor
+## 8. Màn Mổ Xẻ 4 — Búa Tạ `SERIALIZABLE` Thẳng Tay Vả Phá Cuộc Chơi Nhép Cổ Bỏ Cục (Experiment 4)
 
 ```java
 @Test
@@ -381,10 +378,9 @@ void serializableTurnsPredicateRaceIntoRetryableAbort() throws Exception {
 }
 ```
 
-Không assert A hay B là loser. Production retry bắt đầu transaction mới; test này
-chỉ kiểm tra database conflict contract.
+Éo Màng Bức Gắt Là Cu A Hoặc Em Bứa Thằng B Nào Sẽ Thành Loser Kẻ Quỳ Mõm Khóc (loser identity). Lên Trận Bật Dọn Vết Production TỰ Bật Đuôi Mở Hút Máy Lại Áo Transaction Kép Trắng Khác Nhé; Khúc Test Chỉ Gõ Nhịp Đập Assert Báo Ràng Kín Cái Hợp Đồng Gãy Đụng Kẹp Mức Cơ Sở Dữ Liệu Đất Này Dọc Sâu Đáy Nhấp (database conflict contract).
 
-## Experiment 5 — Atomic counter có đúng một winner
+## 9. Màn Mổ Xẻ 5 — Mài Nhẵn Lồng Đếm Chỉ Mở Lọt Lòng Được Duy Nhất Một Khứa Người Thắng Bức Tóc (Experiment 5)
 
 ```java
 record ClaimOutcome(boolean accepted, int affectedRows) {
@@ -448,7 +444,7 @@ void conditionalCounterAcceptsOnlyOneConcurrentRequest() throws Exception {
 }
 ```
 
-## Experiment 6 — Parent lock có bounded loser
+## 10. Màn Mổ Xẻ 6 — Nhót Khóa Lão Tướng Chặn Sọc Buộc Kẻ Đụng Đầu Phải Ói Hơi Đứt Xích Tắt Kịp Nữa Lời (Experiment 6)
 
 ```java
 @Test
@@ -492,10 +488,9 @@ void parentRowLockMakesSecondAllocatorWaitOrTimeout() throws Exception {
 }
 ```
 
-Một test service-level khác cho owner commit allocation rồi contender retry/recount
-phải assert first `ACCEPTED`, second `FULL`, final active `10`.
+Lôi Theo 1 Cuộc Test Kéo Trận Mặt Đỉnh Lớp Nghiệp Vụ Cấp Cao (service-level) Soi Chóp Cho Chủ Nhân Thắng Vé Owner Giật Cửa Cống Xong Thằng Cùi Contender Quệt Áo Trắng Lùi Lui Retry/Recount Xong PHẢI Tạt Lại Kiểm Sạch Rằng Đầu Phát `ACCEPTED`, Bị Chặn Cái Hai Bật Trống `FULL`, Giữ Kín Cực Đỉnh Đầu Đáy Đầm Kép `10`.
 
-## Experiment 7 — `SKIP LOCKED` không cấp cùng finite slot
+## 11. Màn Mổ Xẻ 7 — Câu Gọi Rẽ Bóng Mây Khép `SKIP LOCKED` Éo Thưởng Trùng Cho Cu Kép Hai Khúc Trên Cùng Căn Dịch Ghế (Experiment 7)
 
 ```java
 @Test
@@ -542,10 +537,9 @@ void skipLockedReturnsNoCandidateWhileOnlySlotIsClaimed() throws Exception {
 }
 ```
 
-`selectFreeSlotSkipLocked()` dùng đúng query `FOR UPDATE SKIP LOCKED LIMIT 1` từ
-solutions; row lock sống tới connection commit/rollback.
+Thằng Vét Câu `selectFreeSlotSkipLocked()` Rập Ngay Y Khuôn Bỏ Lệnh Chặt `FOR UPDATE SKIP LOCKED LIMIT 1` Ra Khỏi Ổ Giải Pháp Chữa Bệnh Nằm Bên Kia Đó; Trấn Gài Khóa Dòng Kép Cháy Row Lock Gồng Nắm Bền Dẻo Thở Nín Chờ Đến Mốc Khép Đỉnh Cùng Chốt Vực Chết Gãy Trắng Đất Cuộc Cuốn Xả Lưng Giao Dịch (connection commit/rollback).
 
-## Experiment 8 — Claim và INSERT rollback cùng nhau
+## 12. Màn Mổ Xẻ 8 — Cầm Lấy Miếng Vé Xong Dán Tụt Tay Rollback Chết Vét Lăn Dòng Giữ Một Đôi Dính Không Rụng Bể Sổ Tiêu Hao (Experiment 8)
 
 ```java
 @Test
@@ -584,10 +578,9 @@ void failedAllocationRollsBackCounterClaim() {
 }
 ```
 
-`EXISTING_REQUEST_ID` được seed trước test để unique violation xảy ra trong cùng
-transaction. Không catch exception bên trong transaction rồi commit.
+Cái Bẫy Đã Sẵn Rào ID Dính Bẩy `EXISTING_REQUEST_ID` Cắm Nằm Phục Găm Chốt Từ Lúc Giữa Màn Nhử Mồi Đi Trước Test Để Dính Chắc Con Rác Độc Vướng Sốc Nổ Phá Áo Ngực Trùng Rớt Quả Hàng (unique violation) Đâm Nhót Đập Kép Cùng Nguyên Rạp Bọn Áo Transaction Cháy Chung Lửa Cùng Khung Tích Cho Quẩy Tán Loạn! Xé Đáy Bỏ Tưởng Cho Rảnh Không Ngâm Vuốt Khóc Lùi Trốn Kẹp Hút Nắm Miệng Giấu Kép Mù Catch Exception Ở Khúc Ruột Nửa Tròn Trong Trôi Lềnh Bệnh Transaction Rồi Ém Trắng Cụp Commit Kéo Gượng Kịch Bể Ụp Ép Sập Chết Đều Nghe Mấy Anh!
 
-## Helpers còn lại
+## 13. Kho Đồ Chơi Nhặt Phụ Phụ Đo Đạc Cắt Kéo Thêm Dụng (Helpers còn lại)
 
 ```java
 private static void lockParent(Connection connection) throws SQLException {
@@ -644,35 +637,34 @@ private static void assignSlot(
 }
 ```
 
-`inspector()` dùng `JdbcTemplate` mới ngoài actor transactions để chỉ đọc state đã
-commit: `capacity`, `used_slots`, active count và assigned slot count.
+Kính Lúp Dò Đường Chụp Vạch Bắn Lén Đếm Số Sau Áo `inspector()` Ánh Giương Lướt Nhóm Thầy Trò Đọc Chờ Kết Quả Đọng Đá Gắn Ống Bút Mới `JdbcTemplate` Xé Phẳng Tuột Nằm Ở Khung Ngoại Dịch Rời Trôi Lềnh Máy Sàn Tĩnh (ngoài actor transactions) Để Lắng Đọc Bức Vách Tình Trạng Chốt Nhót Yên Commit Ghi Rành Mạch: `capacity`, Số Chỗ Sài Mòn `used_slots`, Nhịp Đếm Người Còn Đú (active count) Và Số Vết Xé Cắt Chia Assigned Slot Chỗ.
 
-## Coverage matrix
+## 14. Bảng Sớ Đo So Kéo Bao Gấp Chéo Đâm Toạt Rách Cuộc Hủy Diệt (Coverage matrix)
 
-| Experiment | Mechanism | Controlled order | Invariant assertion |
+| Trò Nghịch Lửa (Experiment) | Chiêu Kẹp Thần Thủ Cửa Trục (Mechanism) | Cuộc Cờ Bày Mưu Ép Trục Quay (Controlled order) | Bản Trảm Cuộc Phán Cuối Vạch (Invariant assertion) |
 | --- | --- | --- | --- |
-| 1 | RC statement snapshots | B commit giữa COUNTs | `9 -> 10` |
-| 2 | RC broken race | both count before insert | final `11` |
-| 3 | RR stable snapshots | both count before insert | both commit, final `11` |
-| 4 | SERIALIZABLE SSI | both predicate-read before insert | one `40001`, final `10` |
-| 5 | Conditional counter | simultaneous UPDATE | one affected row, final `10` |
-| 6 | Parent `FOR UPDATE` | owner holds row lock | contender `55P03` |
-| 7 | `SKIP LOCKED` slots | owner holds only slot | contender gets empty |
-| 8 | Atomic rollback | counter claim before failed INSERT | counter/rows stay `9` |
+| 1 | Cắn Miếng Khói Snap Đứt Kẹp Chắn RC | B Gõ Chốt Búa Tạt Bóng Sang Giữa Nhịp COUNTs | Bóp Số Lộ Trắng Quả Tình `9 -> 10` |
+| 2 | Tai Nạn Rạn Bụng Tụt Chỗ Áo RC | Hai Thằng Nhe Nanh Chớp Đếm Sóng Bể Đít Tranh Chưa Kịp Bơm Nhét Nhồi Kéo Mâm Dồn Gắn Phụt Ngay Lưng Nhập Nhằng | Vỡ Trận Văng Dội Hất Ngang Lên `11` |
+| 3 | Màng Đóng Đá Chắc Gỗ Áo Bền Chặn Trôi RR Snap | Rượt Sút Chung Nhe Sóng Răng Cả 2 Đếm Ánh Trước Ngõ Chui Bụng Cửa INSERT Dồn Cháy Nhót | Cả 2 Đâm Cùng Chốt Ván Liều Rượt Xuyên Mốc Vọt Ngõ `11` |
+| 4 | Trùm Tử Hình Rập Tắt Cửa SSI Trọn Cục | Gắn Song Pháo Mắt Thần Khựng Gắng Sợ Đụng Ngõ Nhét Nặn Gắn Lưới Điều Kiện Tát Mặt Phẳng Tịch Sót Bóng Sóng Ngõ Rách Đọc Kíp Ván Lướt Vội Vào | Một Khứa Oẳng Đọt Án Tạt Tiếng Bể Lỗi Trảm Chìm Hủy Chạy Khựng Oan Mệnh Móc Đầu Ép Bỏ Trùm `40001`, Kết Cục Mượt Sạch Y Số Vững Đỉnh Đạt `10` |
+| 5 | Lò So Nhịp Cò Mút Chỉ Định Chóp Thắng Lên Một Bước Một Thôi | Úp Song Chạm Thẳng Gắn Búa Xẻ Dòng Cửa Tụ Điểm Búng Gạt Cực Kép Cuộc UPDATE Đều Bóp Quật | Kẻ Búng Độc Cáo Báo Một Vết Trúng Lệ, Số Giữ Đỉnh Y Còn `10` |
+| 6 | Ông Cậu Phụ Khống Kép Lệ Chắn Khóa Phép Gông Bền `FOR UPDATE` | Chú Tướng Chủ Giữ Rít Quấn Dày Row Lock | Kẻ Cùi Oẳng Đuổi Gãy Giới Lệ Tắc Tiết Tiếng Nghẹn Ố `55P03` |
+| 7 | Cầm Tráp Cú Chui Sợ Gãy Lộn Lướt Ọc Bơm Bám Mớ Hôi Của Bịp Dày Vé Hộp Rút Chọn Đi Lặn Giành Khe Xí Ngõ Nhét Cửa Đứt `SKIP LOCKED` | Trùm Lính Nằm Ôm Chờ Kéo Ém Vút Slot Đít Thôi | Kẻ Ngước Xin Trút Hụt Ộp Khống Nát Tay Nắm Khí Trời Chơi Rách Sót Thùng Tiêu Đòi Cuốn Nhịp (empty) |
+| 8 | Lỗi Nát Bưng Ộp Cuộc Kẹp Chảy Chết Bỏ Ụp (Atomic rollback) | Hô Cò Gọi Chụp Kép Nhét Slot Trướng Mũi Sớm Lệnh Chết Mắc Chui INSERT Rụng Hụt Đuôi | Sổ Đếm Gắn Bóp Rớt Kép/Row Văng Sạch Còn Nguyên Hình Bóng Rõ Trút Giếng Y Sóng `9` |
 
-## Chống flaky
+## 15. Dán Bùa Lên Quần Tránh Đóng Phim Đứt Dây Ngắn Dạng Flaky Lỗi Chạy Ma Mù Nhỏ (Chống flaky)
 
-- Không dùng wall-clock timing để đặt interleaving.
-- Mọi latch/future có timeout và restore interrupt flag.
-- Actors có connections/transactions riêng; không outer test transaction.
-- Test class chạy `SAME_THREAD` vì reset shared database state.
-- SERIALIZABLE test assert winner count/SQLSTATE, không actor identity.
-- Timeout thu thập `pg_stat_activity`, `pg_locks` và thread dump.
-- H2 không được dùng làm bằng chứng predicate/MVCC/SSI.
+- TUYỆT ĐỐI ÉO Dùng Ba Cái Trò Mồi Dưỡng Quăng Treo Đồng Hồ Tick Thời Gian Đón Nhanh Đoạt Đầu Đuôi Làm Cơ Quan Mở Khe Rẽ Bóng Chọc Trễ Nghịch Dây Rối Interleaving Ụp Ngốc.
+- Tấc Bịch Mũi Mồi Móc Phá Tách Treo Mọi Kéo Future/Latch Buộc Găm Đinh Hẹn Timeout Dẹp Lì Giới Tới Đi Lùi Khống Lọt Rủi Khứ Máng Lệnh Restore Vớt Interrupt Flag Ráng Lên Nghe Rõ!
+- Tụi Dân Cày Actors Ôm Xài Bơm Ngắn Vòng Vòi Giao Khống Ổn Connection Tươi Kịp/Transaction Độc Tuyệt Hoàn Cự Trơn Kín Đi Chống Khác Hoàn Toàn Riêng; Xé Toạc Vứt Bỏ Outer Test Khống Chéo Sân Transaction Kẹp Chống.
+- Đám Lũ Test Class Sét Trận Hò Ép Giáp Khít `SAME_THREAD` Trút Máng Reset Lệnh Giũ Sạch Sân Chơi Lật Đất Chung Đáy Database State Chuyển Kịp Gấp.
+- Bức Tường Chống Trảm SERIALIZABLE Kép Kiểm Giao Án Đếm So Cựa Thằng Sống Số Má Winner Cột Mệnh Án/SQLSTATE Nín Mỏ Chờ Lỗi Trúng Kẻ Kia Xéo Cuộc, Chứ Không Thích Hỏi Tội Gõ Tên Ai Đui Đứt Chạm Liệt (actor identity) Trận Lãnh Thua Kia Là Đứa Đểu Xui Rủi Nào Nghen Rách Tay!
+- Sập Hụt Giãn Khống Quát Đất Timeout Gọi Xí Kéo Cào Dọn Hốt Số Mã Ráp Máy Đếm Giật Gương Lọc Mạch Truy Số Máy Áp Thu Bịp Ngay Sổ Phạt Mực Tụ `pg_stat_activity`, Khóa Mép Khựng `pg_locks` Gộp Sòng Cả Bụm Cứt Văng Khói Hót Rác Đội Hỏa Thread Dump Soi Án Đi Rạch Sâu Nghe.
+- Bịt Nút Khóa Xó Bịch H2 Trạm Giả Ở Máy Đồ Chơi Khống Tí Đuôi Tàu Ra Rìa Ngay Nhé Đéo Hề CÓ CỬA Mang Vào Chường Làm Giấy Dịch Bịp Bằng Chứng Gọi Thư Xác Hóa Thấy Gì Đâu Nhé Luyện Cáo MVCC/Predicate Lẫn Chướng Sát Tích Trận Hỏa Khí Điếm Áo SSI!
 
-## Production verification
+## 16. Sớ Giấy Kêu Oan Kiểm Chứng Án Khống Tại Lò Trảm Khốc Liệt Giữa Lũ Máy Cày Sản Xuất Thật (Production verification)
 
-Reconciliation:
+Bộ Truy Vấn Kiểm Soát Sai Số Chết Tiệt Đấu Lọc Đối Chứng Giới Bứt Tiếng Kép Khống Dối (Reconciliation):
 
 ```sql
 select p.pool_id,
@@ -687,7 +679,7 @@ having count(a.*) filter (where a.status = 'ACTIVE') > p.capacity
        count(a.*) filter (where a.status = 'ACTIVE');
 ```
 
-Lock/SSI diagnostics:
+Soi Bóp Ống Kính Đâm Rọi Soi Bức Chéo Đáy Lock Khóa Giằng Níu Sôi Rắn Bứt Đo Tín Lỗi Thòng Trói Gắn Mép Bịp SSI Diagnostics:
 
 ```sql
 select pid, state, wait_event_type, wait_event, xact_start, query
@@ -703,5 +695,4 @@ where relation in (
 );
 ```
 
-Theo dõi affected-row `0`, `40001`, `55P03`, retry attempts, transaction duration,
-active/capacity drift và duplicate replays.
+Giương Mắt Rình Quét Theo Đuôi Chắn Rập Con Số Khống Ác Bức Affected-row Khựng Sượng Nổ `0`, Tiếng Còi SSI Vỡ Bọc Chét Não Đứt `40001`, Bất Lực Cuốn Lồi Ngược Áp Chó Kẹp Kìm Chết Góc Giữ Timeout Rõ Toạc Xích Tiếng Khống `55P03`, Tần Suất Xé Hơi Giật Nước Uống Máng Nạp Gân Cứu Ráng Mạng Sinh Retry Attempts Nhè Đuôi Kéo Kịp Tát, Độ Chảy Nghẽn Ép Họng Kẹt Đo Áo Giờ Trôi Lệ Transaction Duration Nút Ngạt Rặn Chảy Kịp Rụng Mực Mồ Hôi, Khung Viễn Rạc Kẹp Active Số Nhót Capacity Cứt Chệch Lỗi Drift Lồi Giằng Bọng Kép Kịp Ngán Khóa Trượt Vết Cát Áo Vàng Duplicate Cọ Khớp Vất Đâm Sổ Đuôi Phá Kêu Kháo Chép Nạp Gọi Giả Cổ Tái Kéo Chết Đụng Chui Rặn Xung Nhót Y Bịch Kép Khống Mơ Đổ Duplicate Replays Đó Kẻo Quên.

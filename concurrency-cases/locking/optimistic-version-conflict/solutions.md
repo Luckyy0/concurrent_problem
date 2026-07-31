@@ -1,17 +1,19 @@
-# Giải pháp `@Version` và explicit expected-version contract
+# Giải pháp Chuẩn mực: Dùng `@Version` và Hợp Đồng Ký Kết (Expected-version)
 
-## Entity versioned
+## 1. Nâng cấp Class Entity (Có cột Version)
 
-Migration:
+Đầu tiên, phải chạy kịch bản (migration) sửa Database:
 
 ```sql
 alter table product_offer add column version bigint;
+-- Nhét số 0 vào mấy dòng cũ cho khỏi lỗi
 update product_offer set version = 0 where version is null;
 alter table product_offer alter column version set not null;
 ```
 
-Triển khai migration theo chiến lược tương thích old/new application; writer cũ
-không increment version sẽ phá protocol.
+(Nhớ là khi đang chuyển giao Code Cũ và Code Mới, ông Code Cũ nào viết SQL mà không tự tăng `version` là vỡ mồm cả lũ đấy nhé).
+
+Tiếp theo, cập nhật Class Entity:
 
 ```java
 @Entity
@@ -27,31 +29,33 @@ public class ProductOffer {
     @Column(nullable = false)
     private String title;
 
-    @Version
+    @Version // Bùa hộ mệnh đây rồi!
     @Column(nullable = false)
     private long version;
 
     protected ProductOffer() {
     }
 
+    // Chỉ viết hàm LẤY (get), TUYỆT ĐỐI KHÔNG VIẾT HÀM GÁN (set) cho version!
     public long version() {
         return version;
     }
 
     public void changePrice(BigDecimal newPrice) {
         if (newPrice == null || newPrice.signum() < 0) {
-            throw new IllegalArgumentException("invalid price");
+            throw new IllegalArgumentException("Giá bị âm kìa ba");
         }
         price = newPrice;
     }
 }
 ```
 
-Chỉ persistence provider cập nhật `version`.
+Từ giờ, việc tăng `version` hãy để Hibernate (Quản gia) tự lo.
 
-## Command mang expected version
+## 2. Ép Client phải mang "Dữ liệu Kỳ vọng" (Expected Version) lên
 
 ```java
+// Bắt buộc Client phải truyền lên cái version mà nó đang nhìn thấy
 public record ChangeOfferPrice(
         long offerId,
         long expectedVersion,
@@ -61,7 +65,7 @@ public record ChangeOfferPrice(
 }
 ```
 
-Service:
+Và đây là cách Service phòng thủ:
 
 ```java
 @Service
@@ -80,30 +84,29 @@ public class OfferEditor {
                         new OfferNotFoundException(command.offerId())
                 );
 
+        // Chặn cửa sổ thứ 1 (Form của Client đã ôi thiu)
         if (offer.version() != command.expectedVersion()) {
             throw new StaleOfferEditException(
                     command.offerId(),
-                    command.expectedVersion(),
-                    offer.version()
+                    command.expectedVersion(), // Client nghĩ là...
+                    offer.version()            // Nhưng DB lại đang là...
             );
         }
 
         offer.changePrice(command.newPrice());
         offers.flush();
+        // Lệnh UPDATE sẽ có thêm cái đuôi WHERE version=? chặn Cửa sổ thứ 2
         return OfferView.from(offer);
     }
 }
 ```
 
-Explicit check phát hiện client đã stale trước transaction. Versioned UPDATE tiếp
-tục phát hiện concurrent commit sau load.
+> **Nói ngắn gọn:** Bạn check `expectedVersion` để đỡ đạn cho việc "Client treo máy đi cafe". Còn `@Version` của Hibernate giúp đỡ đạn cho trường hợp "Hai Request lao vào DB cùng 1 mili-giây". Thiếu một trong hai là nát bét.
 
-> **Nói ngắn gọn:** request version bảo vệ disconnected edit; `@Version` bảo vệ
-> race trong database transaction.
-
-## SQL và loser
+## 3. Quăng Exception cho Kẻ Thua Cuộc
 
 ```sql
+-- Dưới gầm DB nó chạy câu này
 update product_offer
 set price = :price,
     title = :title,
@@ -112,26 +115,25 @@ where offer_id = :id
   and version = :version;
 ```
 
-Affected rows `0` làm Hibernate ném `OptimisticLockException`; Spring thường
-translate thành `ObjectOptimisticLockingFailureException`. Exception phải thoát
-transaction method để rollback.
+Ai chạy chậm, trả về `0` dòng -> Hibernate lập tức quăng `OptimisticLockException` (Spring thường bọc lại thành `ObjectOptimisticLockingFailureException`). Cái Exception này bắt buộc phải văng ra khỏi ranh giới hàm (thoát transaction) để Giao Dịch được dọn dẹp sạch sẽ (rollback).
 
-## API mapping
+## 4. Báo cho Client bằng mã Lỗi chuẩn (API mapping)
 
 ```java
 @RestControllerAdvice
 public class OfferConflictAdvice {
 
+    // Bắt một lượt cả 2 loại Lỗi Đụng Độ
     @ExceptionHandler({
             StaleOfferEditException.class,
             ObjectOptimisticLockingFailureException.class
     })
     ResponseEntity<ProblemDetail> conflict(RuntimeException failure) {
         ProblemDetail problem = ProblemDetail.forStatus(
-                HttpStatus.PRECONDITION_FAILED
+                HttpStatus.PRECONDITION_FAILED // Trả mã 412
         );
-        problem.setTitle("Offer changed since it was read");
-        problem.setProperty("reloadRequired", true);
+        problem.setTitle("Có người nhanh tay sửa mất rồi!");
+        problem.setProperty("reloadRequired", true); // Báo Client tải lại màn hình
         return ResponseEntity
                 .status(HttpStatus.PRECONDITION_FAILED)
                 .body(problem);
@@ -139,59 +141,52 @@ public class OfferConflictAdvice {
 }
 ```
 
-Nếu API dùng ETag, map `If-Match` thất bại thành `412`; `409` cũng có thể đúng cho
-domain command conflict. Không trả stale entity như committed result.
+Đừng bao giờ nhổ toẹt cái Object ôi thiu trả về như thể là thao tác đã thành công nhé! Nếu Client xài Header `If-Match` thì trả mã `412 Precondition Failed` là đẹp nhất. Mã `409 Conflict` cũng hợp lý tùy Gu của công ty.
 
-## Flush và outer boundary
+## 5. Ranh giới Xả (Flush) và Chốt (Commit)
 
-Explicit `flush()` giúp conflict xuất hiện trong attempt method, nhưng commit vẫn
-là boundary cuối. Controller gọi qua proxy và advice xử lý exception sau rollback.
-Không catch/continue cùng persistence context.
+Gọi `flush()` ngay trong hàm giúp bạn tóm được Exception sớm. Nhưng nhớ là hàm đó chạy xong, chui ra đến cửa cái Proxy thì DB mới thực sự gọi lệnh Chốt (Commit). Việc `catch` lỗi Đụng Độ bắt buộc phải nằm ở vòng ngoài cùng (Controller hoặc Advice), chứ ĐỪNG thọc tay `catch` bên trong Transaction và cố chấp chạy tiếp.
 
-## Detached merge
+## 6. Tránh xài `merge` với DTO ngoài đường (Detached merge)
 
-Có thể merge detached entity có version, nhưng DTO + explicit field allowlist và
-expectedVersion thường an toàn hơn:
+Thay vì bốc nguyên cái cục DTO của Client ép thành Entity rồi ném vào hàm `merge()`:
 
-- tránh mass assignment;
-- không cascade graph ngoài ý muốn;
-- domain validation chạy trên current managed entity;
-- conflict response dễ map.
+- Rất dễ dính đòn "Cập nhật lố" (mass assignment - Client gửi bậy id/role cũng bị sửa).
+- Vô tình đụng tới những Object con lằng nhằng (cascade).
+- Lỗi khó bắt hơn vì Hibernate delay việc kiểm tra.
 
-## Bulk/native writers
+Hãy Mapping bằng tay (DTO -> Managed Entity đang nằm trên RAM) và so sánh Version rành rọt. Viết code dài hơn 3 dòng nhưng đổi lại Giấc ngủ ngon.
 
-Nếu bắt buộc native update:
+## 7. Pháp Sư chơi hệ SQL thuần (Bulk/native writers)
+
+Bắt buộc phải xài SQL chay à? Cứ việc, nhưng phải tuân thủ Luật Chơi:
 
 ```sql
 update product_offer
 set price = :newPrice,
-    version = version + 1
+    version = version + 1 -- Phải tự cộng!
 where offer_id = :id
-  and version = :expectedVersion;
+  and version = :expectedVersion; -- Phải tự Check!
 ```
 
-Phải kiểm tra affected rows và clear/refresh persistence context phù hợp.
-JPQL bulk update bypass dirty checking của managed instances; không chạy cạnh
-entity writes mà không có protocol/test rõ.
+Chạy xong nhớ tự bắt `affected rows == 0` rồi dội Exception. Khuyến cáo không nên chạy mấy lệnh kiểu này song song với các luồng xài JPA thông thường nếu không Test kỹ.
 
-## Không auto-retry user edit
+## 8. CẤM tự động Thử Lại (Auto-retry) Hành vi của User
 
-Outcome khuyến nghị:
+Quy trình vàng cho Màn hình nhập liệu (User edit):
 
 ```text
-winner → commit, return new version
-loser  → rollback, return conflict/reload-required
+Kẻ đến trước (Winner) → Chốt sổ thành công (commit), trả về version mới.
+Kẻ đến sau (Loser)  → Dọn dẹp phế tích (rollback), báo lỗi bắt User tự F5 tải lại form.
 ```
 
-Nếu command là commutative/deterministic trên fresh state, bounded retry có thể
-đúng nhưng phải dùng transaction mới, reload, backoff/jitter, deadline và
-idempotency. Đó là scope `LOCK-002`.
+Trừ khi bạn cập nhật mấy cái thứ như "Đếm View", "Cộng Trừ Điểm Tích Lũy" (thứ mà kết quả không phụ thuộc vào trạng thái cũ), thì mới được phép thiết kế vòng lặp Retry tự động. (Muốn code Retry an toàn, đọc thêm `LOCK-002`).
 
-## Phương án khác
+## 9. Những Binh Khí Khác (Phương án thay thế)
 
-### Conditional compare-and-set
+### Cập nhật chèn điều kiện (Conditional compare-and-set)
 
-Khi không dùng managed entity:
+Nếu không xài Entity Manager của JPA:
 
 ```sql
 update product_offer
@@ -199,55 +194,52 @@ set price = :price,
     version = version + 1
 where offer_id = :id
   and version = :expectedVersion
-returning version;
+returning version; -- Lấy luôn version mới nhét vào log
 ```
 
-Cùng correctness contract, mapping thủ công hơn nhưng SQL rõ.
+Nó hoàn toàn tương đương Khóa Lạc Quan, chỉ khác là bạn phải tự gõ SQL.
 
-### Pessimistic `FOR UPDATE`
+### Khóa Bi Quan `FOR UPDATE`
 
-Lock trước read khiến editor sau block rồi thấy current state. Vẫn cần client
-expected version để biết form cũ; giữ lock dài hơn và cần timeout/deadlock policy.
+Nghĩa là "Khóa ngay từ lúc Đọc". Kẻ đến sau sẽ bị Block treo máy đợi kẻ trước làm xong. Dùng trò này bạn vẫn phải bắt Client truyền cái `expected version` lên để biết nó có bấm form cũ hay không. Dùng cẩn thận coi chừng quá giờ (timeout) và Khóa chéo (deadlock).
 
-### Atomic domain SQL
+### Cập nhật "Tương đối" (Atomic domain SQL)
 
-Với “increase price by 5%” hoặc counter, atomic relative update có thể compose
-intent tốt hơn absolute set. Không dùng user-edit example để suy rộng mọi mutation.
+Thay vì SET thẳng giá = 90, bạn cập nhật kiểu "Tăng giá cũ thêm 5%" (`price = price * 1.05`). Cách này rất đỉnh cao cho một số Logic đặc thù, nhưng không xài được cho các màn hình Admin Form nhập liệu.
 
-### `SERIALIZABLE`
+### Chế độ `SERIALIZABLE`
 
-Có thể abort transaction nhưng nặng hơn version predicate cho known aggregate;
-application vẫn cần `40001` retry. Không thay client version contract.
+Bật chế độ này thì DB lo hết rủi ro. Tuy nhiên, hiệu năng sẽ bị bóp nghẹt và code của bạn lúc nào cũng phải chực chờ DB dội lỗi `40001` (Serialization Failure) để... chạy lại toàn bộ luồng từ đầu.
 
-## Failure behavior
+## 10. Bảng Sinh Tử (Failure behavior)
 
-| Outcome | Database | API/application |
+| Tình Huống | Ở dưới Database | Trên API / Ứng Dụng |
 | --- | --- | --- |
-| Version match | affected `1`, version tăng | Success + new version |
-| Client expected stale | Không UPDATE | `412/409`, reload |
-| Race sau load | affected `0`, rollback | Optimistic conflict |
-| Lock/statement timeout | Transaction rollback | Technical timeout, không gọi stale |
-| Delete cạnh tranh | affected `0` | Domain policy not-found/conflict |
-| Crash trước commit | Rollback | Retry/query command status |
-| Response mất sau commit | Update durable | Command/audit id để resolve |
+| Version khớp ngon lành | Chỉnh `1` dòng, version tăng | Gửi Success + kèm Version Mới Nhất |
+| Client mang data thiu | SQL UPDATE bị chặn không chạy | Trả mã `412/409`, xúi Client F5 đi |
+| Đua nhau sát nút (Race) | Chỉnh `0` dòng, Rollback ráo | Báo Lỗi Xung đột Lạc Quan |
+| Quá giờ chờ (Timeout) | Rollback Giao Dịch | Báo Lỗi Kỹ Thuật (Đừng xúi Client F5) |
+| Thằng Sửa đụng Thằng Xóa | Chỉnh `0` dòng | Báo lỗi Không Tìm Thấy (Not Found) / Conflict |
+| Máy chủ sập trước lúc chốt | DB dọn dẹp (Rollback) | Lệnh chưa vào, có thể thử lại |
+| Sập sau chốt, chưa kịp báo | Lệnh đã vô DB | Phải có Mã Request ID để tra cứu xem xong chưa |
 
-## Trade-off
+## 11. Bảng Cân Nhắc Lợi Hại (Trade-off)
 
-| Cách | Correctness | Contention | Latency | Retry/work waste | Multi-instance |
-| --- | --- | --- | --- | --- | --- |
-| `@Version` | Detect stale aggregate write | Không lock lúc read | Conflict muộn | Có khi conflict | Có |
-| Conditional CAS | Tương đương cho explicit SQL | Không lock lúc read | Conflict ở statement | Thấp/explicit | Có |
-| `FOR UPDATE` | Serialize trước decision | Blocking | Wait/timeout | Ít wasted work | Có |
-| JVM lock | Chỉ local | Local serialization | Không cover DB | Không đáng tin | Không |
+| Binh Khí | Sự Đúng Đắn | Mức Kẹt Xe (Contention) | Độ Trễ (Latency) | Khả năng chạy Đa Server |
+| --- | --- | --- | --- | --- |
+| **`@Version` (Lạc Quan)** | Phát hiện Ghi Đè cực tốt | **Đọc thoải mái không Lock** | Nổ lỗi vào phút chót | Ngon lành |
+| SQL Có Điều Kiện (CAS) | Tương đương @Version | Nhẹ nhàng y chang | Nổ lỗi ở từng câu lệnh | Ngon lành |
+| Khóa Bi Quan `FOR UPDATE` | Ép người ta xếp hàng | **Gây kẹt xe, dội bom DB** | Phải đứng chờ (Wait) | Ngon lành |
+| Khóa Nhốt `synchronized` | Chỉ lừa trẻ con | Ai gọi trúng máy mình thì đợi | Không bảo vệ được DB | **Tạch** |
 
-## Checklist trước production
+## 12. Bùa Chú Trước Khi Lên Môi Trường Thật (Checklist Production)
 
-- [ ] Version column `NOT NULL`, mapping `@Version`, không application setter.
-- [ ] API/command mang expected version hoặc ETag.
-- [ ] Generated SQL có version predicate và increment.
-- [ ] Bulk/native writers duy trì cùng protocol.
-- [ ] Conflict catch nằm ngoài failed transaction.
-- [ ] User edit không auto-retry mù.
-- [ ] Response chỉ success sau commit.
-- [ ] Conflict metrics không chứa high-cardinality entity ID.
-- [ ] PostgreSQL Testcontainers assert affected-row conflict và final version.
+- [ ] Cột Version dưới DB đã gắn cờ `NOT NULL`, Class Entity dùng đúng `@Version`, và KHÔNG có hàm gán (setter).
+- [ ] API đã bắt Client nộp thuế (truyền lên cái Expected Version / ETag).
+- [ ] Soi thử câu SQL chạy ra thấy có cái đuôi kiểm tra và cộng Version.
+- [ ] Các thanh niên viết SQL chay (batch/native) đã bị gõ đầu phải nhét logic tăng Version vào code của chúng nó.
+- [ ] Block try/catch Xung Đột nằm LỚP NGOÀI CÙNG, chứ không dính dáng gì đến cái Giao Dịch đã sập hầm.
+- [ ] Không có cái tính năng ngu xuẩn nào tự động Retry bắt Code thay mặt User gõ phím.
+- [ ] Gửi Response Thành Công chỉ khi Database gật đầu cái rụp (Commit).
+- [ ] Mấy cái Đồ Thị (Metrics) log lỗi không được chứa High-Cardinality (ví dụ: cấm log mã sản phẩm vào Label của Prometheus làm nổ RAM).
+- [ ] Code Test chạy bằng PostgreSQL thật (Testcontainers) và moi được Dữ liệu cuối cùng ra đối chiếu.

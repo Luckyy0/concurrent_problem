@@ -1,155 +1,130 @@
-# LOCK-003 — Pessimistic write lock với `FOR UPDATE`
+# LOCK-003: "Xin Lỗi, Ghế Này Đã Có Chủ!" - Khóa Bi Quan với `FOR UPDATE`
 
-## Tóm tắt
+## 1. Tóm tắt câu chuyện
 
-Hai khách đồng thời giữ cùng ghế `A-10` của một suất chiếu. Quyết định không chỉ
-là giảm một counter: hệ thống phải đọc trạng thái ghế, kiểm tra policy, tạo
-`seat_hold` và cập nhật chủ sở hữu. Nếu cả hai transaction đọc `AVAILABLE` bằng
-plain `SELECT`, cả hai có thể cùng quyết định chấp nhận trước khi writer đầu tiên
-commit.
+Tưởng tượng hai vị khách (A và B) cùng nhắm trúng cái ghế "VIP A-10" ở rạp chiếu phim. Nếu bạn chỉ cho hệ thống bốc dữ liệu lên kiểm tra một cách ngây thơ (xài lệnh `SELECT` chay), thì ở cùng một tích tắc, cả A và B đều thấy ghế đang `AVAILABLE` (còn trống). Hệ quả là cả 2 cùng nhấn nút Đặt Ghế, hệ thống báo thành công, thế là rạp phim phải ăn "cú phốt" bán 1 ghế cho 2 người.
 
-Với khóa ghi bi quan (`pessimistic write lock`), transaction khóa đúng
-`show_seat` row trước khi quyết định:
+Đó là lúc Khóa Bi Quan (Pessimistic Write Lock) xuất trận! Hệ thống sẽ khóa chặt cái ghế đó lại ngay từ cái nhìn đầu tiên:
 
 ```text
-Tx-A: SELECT seat FOR UPDATE → validate → create hold A → COMMIT
-Tx-B: SELECT same seat FOR UPDATE → wait
-      → A commits → B đọc trạng thái mới HELD → reject
+Khách A: Tải ghế và KHÓA LẠI (SELECT FOR UPDATE) → Kiểm tra → Báo đặt thành công (COMMIT)
+Khách B: Cũng tải đúng ghế đó và ĐÒI KHÓA → BỊ HỆ THỐNG BẮT ĐỨNG CHỜ!
+         → Đợi A chốt sổ xong → B mới được đọc lại trạng thái → Thấy HELD (Đã bán) → Đi về mâm!
 ```
 
-> **Nói ngắn gọn:** row lock biến hai quyết định cạnh tranh trên cùng ghế thành
-> hai lượt tuần tự; actor thứ hai phải quyết định lại trên trạng thái đã commit.
+> **Nói ngắn gọn:** "Khóa Dòng" (Row Lock) ép 2 kẻ đang giành nhau chung một nguồn tài nguyên phải ngoan ngoãn xếp hàng 1-1. Kẻ đến sau bắt buộc phải đưa ra quyết định dựa trên kết quả mà kẻ đến trước vừa chốt sổ.
 
-## Actor và trạng thái dùng chung
+## 2. Dàn diễn viên và Đạo cụ (Actor và trạng thái)
 
-| Thành phần | Trạng thái |
+| Thành phần | Vai trò |
 | --- | --- |
-| `show_seat` | Suất `42`, ghế `A-10`, trạng thái `AVAILABLE` |
-| Request A | Customer `501`, command `hold-a`, chạy trên App-1 |
-| Request B | Customer `902`, command `hold-b`, chạy trên App-2 |
-| `seat_hold` | Lịch sử durable của hold đã được chấp nhận |
-| PostgreSQL | Nơi authoritative state và row lock cùng tồn tại |
+| Dữ liệu `show_seat` | Cái ghế `A-10` suất `42`, đang để trạng thái `AVAILABLE`. |
+| Request của Khách A | Khách mã `501`, gọi lệnh `hold-a`, đang chạy bên Server 1. |
+| Request của Khách B | Khách mã `902`, gọi lệnh `hold-b`, đang chạy bên Server 2. |
+| Dữ liệu `seat_hold` | Cuốn sổ ghi lại lịch sử ghế này đã thuộc về ai. |
+| Quản gia PostgreSQL | Nơi lưu dữ liệu gốc và cầm cái chìa khóa để phân bua. |
 
-Điểm tranh chấp (`contention point`) là locking query trên khóa chính
-`(show_id, seat_no)`. Đây là một row đã tồn tại và được biết trước; application
-không khóa một predicate mở như “bất kỳ ghế trống nào”.
+Điểm nóng tranh chấp ở đây chính là câu truy vấn khóa cái Khóa Chính `(show_id, seat_no)`. Lưu ý: Chúng ta đang khóa **Một cái ghế cụ thể đã tồn tại**, chứ không phải khóa khơi khơi kiểu "cấm ai mua bất kỳ ghế trống nào".
 
-## Invariant
+## 3. Những Định Luật Thép (Invariant)
 
 ```text
-Tại một thời điểm, mỗi show seat có tối đa một ACTIVE hold.
-
-show_seat.hold_id phải trỏ tới đúng ACTIVE seat_hold của ghế.
-
-Một command ID chỉ tạo tối đa một seat_hold.
-
-Caller chỉ nhận HELD sau khi transaction đã commit.
+- Tại mọi thời điểm, mỗi ghế chỉ được có tối đa 1 người Gắn Trạng Thái ĐANG GIỮ (ACTIVE hold).
+- Cột hold_id của ghế phải khớp với đúng người đang giữ ghế đó trong sổ lịch sử.
+- Một lệnh đặt chỗ không được phép lỡ tay sinh ra 2 dòng lịch sử giữ ghế.
+- Khách hàng chỉ được thông báo "Đặt xong rồi" KHI VÀ CHỈ KHI Database đã chốt sổ (Commit).
 ```
 
-Khóa row bảo vệ read–decide–write trên ghế. Unique constraint của `command_id`
-bảo vệ duplicate command; hai cơ chế giải quyết hai invariant khác nhau.
+Khóa dòng sẽ bảo vệ chu trình: Đọc -> Quyết Định -> Lưu. Còn cái luật Ràng buộc Duy nhất (Unique constraint) dưới DB sẽ chặn đứng việc khách spam Click 2 lần vào 1 lệnh. Mỗi vũ khí trị một bệnh khác nhau!
 
-## Ranh giới transaction
+## 4. Xây Ranh Giới Giao Dịch (Transaction)
 
-`SeatHoldCoordinator` không mở transaction. Nó gọi `SeatHoldTx.execute()` qua
-Spring proxy. Một attempt duy nhất bao gồm:
+Người điều phối lệnh (`SeatHoldCoordinator`) sẽ KHÔNG tự mở Giao Dịch, mà nó sai vặt một thằng cu Proxy của Spring (`SeatHoldTx`) đi làm việc đó. Một kịch bản chuẩn sẽ như sau:
 
-1. đặt PostgreSQL `lock_timeout` cục bộ cho transaction;
-2. load `show_seat` bằng `PESSIMISTIC_WRITE`;
-3. sau khi acquire lock, kiểm tra command replay và trạng thái ghế;
-4. tạo `seat_hold`, cập nhật `show_seat`, rồi flush;
-5. commit hoặc rollback trước khi trả kết quả qua proxy.
+1. Đặt đồng hồ đếm ngược (`lock_timeout`) cho Giao Dịch (Quá thời gian là đuổi).
+2. Tải cái ghế lên và KHÓA (`PESSIMISTIC_WRITE`).
+3. Nếu giật được Khóa, bắt đầu kiểm tra trạng thái ghế.
+4. Ghi tên khách vào sổ `seat_hold`, đổi trạng thái ghế rồi Xả (`flush`).
+5. Chốt sổ (Commit) hoặc Xóa sổ (Rollback) trước khi báo kết quả ra ngoài.
 
-Timeout/deadlock được bắt ở coordinator, sau khi transaction lỗi đã rollback.
-Remote I/O, user interaction và backoff không nằm trong transaction giữ lock.
+Nhớ là: Những trò như Gọi qua mạng (Remote I/O) hay Chờ khách trả lời tuyệt đối KHÔNG ĐƯỢC nhét vào trong cái vòng Giao Dịch này, nó sẽ làm kẹt cả hệ thống.
 
-## Lock acquisition và lifetime
+## 5. Cuộc đời của một chiếc Khóa
 
-Spring Data JPA gắn `LockModeType.PESSIMISTIC_WRITE` vào query. Hibernate dùng
-locking clause phù hợp với PostgreSQL; SQL tương đương về ý nghĩa là:
+Khi bạn gõ từ khóa `LockModeType.PESSIMISTIC_WRITE` trong Spring Data JPA, Hibernate sẽ tự dịch nó sang câu SQL có đính kèm chữ `FOR UPDATE` thần thánh:
 
 ```sql
 select show_id, seat_no, state, hold_id, hold_until
 from show_seat
 where show_id = :showId
   and seat_no = :seatNo
-for update;
+for update; -- Khóa lại cho tôi!
 ```
 
-Transaction acquire lock khi statement chạy, không phải khi method được gọi.
-Lock tồn tại đến transaction commit/rollback, kể cả khi Java code không còn
-chạm entity. Một competitor cần incompatible lock trên cùng row sẽ wait,
-fail-fast hoặc timeout theo policy.
+Giao dịch sẽ giật Khóa **Ngay lúc câu lệnh SQL này chạy dưới DB**, chứ không phải lúc bạn gọi hàm Java.
+Và cái Khóa này sẽ tồn tại cho đến khi Giao Dịch Chốt Sổ (commit) hoặc Bị Hủy (rollback). Bất kỳ ông nào đòi giật Khóa trên cùng một ghế sẽ phải Đứng Nhìn, Bỏ Cuộc, hoặc Bị Đuổi (Timeout).
 
-Plain MVCC reader không tự động bị chặn bởi row lock này; nó vẫn có thể đọc
-committed version phù hợp với snapshot của statement.
+(Lưu ý: Mấy hàm `SELECT` bình thường để xem danh sách ghế sẽ không bị kẹt bởi cái Khóa này đâu, chúng vẫn thấy dữ liệu cũ bình thường).
 
-## Actor thua cuộc nhận gì?
+## 6. Người Thua Cuộc Sẽ Về Đâu?
 
-| Outcome của holder | Outcome của waiter |
+| Số phận kẻ nắm Khóa (A) | Số phận kẻ phải Chờ (B) |
 | --- | --- |
-| Holder commit `HELD` | Waiter thức dậy, đọc `HELD`, trả `ALREADY_HELD` |
-| Holder rollback | Waiter acquire lock, đọc `AVAILABLE`, có thể tạo hold |
-| Wait vượt `lock_timeout` | Statement lỗi, transaction rollback, trả `BUSY` |
-| Deadlock victim | Transaction rollback; chỉ retry nếu policy cho phép |
-| Mất connection/crash | PostgreSQL rollback session transaction và release lock |
+| A chốt sổ `HELD` thành công | B tỉnh dậy, đọc thấy ghế đã `HELD`, văng lỗi `ALREADY_HELD` |
+| A đổi ý, Rollback (Hủy) | B tỉnh dậy, giật được Khóa, thấy ghế vẫn `AVAILABLE` -> Mua được! |
+| Thời gian chờ vượt quá `lock_timeout` | Lệnh của B nổ tung, tự Rollback và báo `BUSY` (Hệ thống đang bận) |
+| Vướng lỗi Khóa Chéo (Deadlock victim) | Lệnh tự Hủy (Rollback), chỉ cho làm lại nếu quy trình cho phép. |
+| Mất mạng / Chết App giữa chừng | PostgreSQL thấy đứt kết nối liền tự Hủy kết quả của A và nhả Khóa. |
 
-Blocking không đồng nghĩa sẽ thành công. Sau khi wait, actor luôn phải revalidate
-business state.
+Bài học: Xếp hàng xong không có nghĩa là được mua! Sau khi tỉnh dậy từ hàng chờ, bạn LUÔN PHẢI KIỂM TRA LẠI trạng thái kinh doanh.
 
-## Thuật ngữ cần biết
+## 7. Bách Khoa Toàn Thư Thuật Ngữ
 
-| Thuật ngữ | Ý nghĩa trong case |
+| Thuật ngữ | Ý nghĩa dân dã |
 | --- | --- |
-| pessimistic locking | Giả định conflict có khả năng cao và reserve row trước quyết định |
-| `PESSIMISTIC_WRITE` | JPA lock mode yêu cầu explicit database write lock |
-| `FOR UPDATE` | PostgreSQL locking read chặn writer/locking reader cạnh tranh |
-| lock holder | Transaction đang giữ incompatible lock |
-| waiter | Transaction đang chờ acquire lock |
-| lock lifetime | Từ lúc acquire đến transaction end |
-| `lock_timeout` | Giới hạn thời gian chờ một database lock |
-| revalidation | Kiểm tra lại business state sau khi acquire lock |
-| lock ordering | Thứ tự ổn định khi một operation khóa nhiều rows |
+| Khóa Bi quan (Pessimistic locking) | Tính đa nghi. Cho rằng kiểu gì cũng có kẻ giành giật nên "Xí chỗ" trước rồi tính sau. |
+| `PESSIMISTIC_WRITE` | Cờ của JPA, dịch ra là: Bắt thằng DB khóa lại để tôi ghi dữ liệu. |
+| `FOR UPDATE` | Đuôi SQL của PostgreSQL để thực hiện việc khóa dòng đó. |
+| Người giữ khóa (Lock holder) | Ông Giao dịch đang giữ cái ghế và không cho ai đụng tới. |
+| Kẻ chờ khóa (Waiter) | Ông Giao dịch đến sau phải đứng chầu chực. |
+| Tuổi thọ khóa (Lock lifetime) | Sống từ lúc xin được Khóa đến lúc Giao dịch kết thúc. |
+| `lock_timeout` | Đứng chờ quá 3 giây thì dẹp đi, đừng chờ nữa. |
+| Tái thẩm định (Revalidation) | Nhận được ghế rồi thì phải check xem nó còn trống không (Lỡ ông trước mua mất). |
+| Thứ tự Khóa (Lock ordering) | Muốn khóa 5 cái ghế thì phải xếp từ nhỏ tới lớn để tránh kẹt xe chéo nhau. |
 
-## Điều hướng
+## 8. Bản Đồ Kho Báu (Điều hướng)
 
-- [Code read–decide–write bị hỏng](broken-code.md)
-- [Timeline, snapshot, timeout và recovery](analysis.md)
-- [Spring/JPA solution và các lựa chọn khác](solutions.md)
-- [PostgreSQL Testcontainers experiments](experiments.md)
-- [Pessimistic locking](../../concepts/pessimistic-locking.md)
-- [PostgreSQL locks và lock lifetime](../../concepts/postgresql-locks.md)
-- [Kiểm thử đồng thời](../../concepts/concurrency-testing.md)
-- [DB-007 — Row/table lock lifecycle](../../postgresql/row-table-lock-lifecycle/README.md)
+- [Code đọc-quyết-ghi bị hỏng như thế nào?](broken-code.md)
+- [Soi Time-line và các vụ kẹt xe](analysis.md)
+- [Tuyệt chiêu code JPA](solutions.md)
+- [Đập thử bằng Testcontainers](experiments.md)
+- [Tổng quan Khóa Bi Quan](../../concepts/pessimistic-locking.md)
+- [Các loại Khóa của PostgreSQL](../../concepts/postgresql-locks.md)
+- [Cách test đa luồng](../../concepts/concurrency-testing.md)
+- [DB-007 — Vòng đời Khóa Dòng/Bảng](../../postgresql/row-table-lock-lifecycle/README.md)
 
-## Hậu quả trong production nếu dùng sai
+## 9. Hậu Quả Kinh Hoàng Nếu Code Ẩu
 
-- Hai customer nhận hai hold hợp lệ về mặt application cho cùng ghế.
-- `show_seat` chỉ giữ customer ghi cuối nhưng `seat_hold` còn hai ACTIVE rows.
-- Lock transaction dài tạo wait queue, giữ connection và tăng tail latency.
-- Không có timeout làm request chờ vượt client deadline.
-- Catch lock error bên trong cùng transaction rồi tiếp tục gây lỗi “transaction
-  is aborted”.
-- Khóa nhiều ghế theo input order khác nhau tạo deadlock.
-- `synchronized` có vẻ đúng ở một instance nhưng hỏng sau scale-out.
+- 2 khách cùng cầm vé vào rạp tranh nhau 1 cái ghế A-10.
+- Lịch sử đặt ghế đẻ ra 2 dòng hợp lệ cho cùng 1 ghế.
+- Viết hàm Transaction chạy quá lâu làm hàng ngàn người phía sau phải xếp hàng, kéo sập cả cái App.
+- Chờ quá lâu mà không cấu hình Timeout, làm màn hình điện thoại người dùng quay mòng mòng.
+- `Catch` lỗi Khóa bên trong Transaction rồi chạy tiếp lôm côm làm vỡ toàn bộ dữ liệu.
+- Giật Khóa hàng loạt ghế mà không xếp thứ tự làm 2 Giao Dịch kẹt chết cứng nhau (Deadlock).
+- Dùng `synchronized` của Java. Rất ngầu nhưng chỉ chạy đúng khi có 1 Server, deploy lên 2 Server là toang!
 
-## Khi nên dùng cách này
+## 10. Khi Nào Nên Lôi Món Này Ra Xài?
 
-`PESSIMISTIC_WRITE` phù hợp khi:
+Xài `PESSIMISTIC_WRITE` (Khóa Bi Quan) khi:
 
-- resource row đã tồn tại và biết chính xác;
-- quyết định cần nhiều bước nhưng phải dựa trên state mới nhất;
-- conflict đủ thường xuyên để optimistic retries tạo wasted work;
-- critical section trong database ngắn và có bounded wait;
-- loser có domain outcome rõ như `ALREADY_HELD` hoặc `BUSY`.
+- Bạn đã trỏ đích danh một Dòng Dữ Liệu có thật.
+- Quyết định thay đổi cần chạy qua 7749 bước kiểm tra phức tạp dựa trên Dữ liệu Mới Nhất.
+- Tranh giành nhau đánh lộn xảy ra NHƯ CƠM BỮA (nếu dùng Khóa Lạc Quan thì suốt ngày văng lỗi).
+- Đoạn code xử lý chỉ tốn 1 chớp mắt, không làm hàng chờ dồn ứ.
+- Kẻ đến sau văng Lỗi có ý nghĩa kinh doanh (Ví dụ báo: "Xin lỗi, ghế vừa có người đặt").
 
-Nếu invariant diễn đạt được bằng một conditional `UPDATE`, cách đó thường nhỏ
-hơn và thuộc `LOCK-004`. Nếu invariant bao phủ rows chưa tồn tại hoặc một
-predicate rộng, row lock trên một row không đủ; cần constraint, guard row hoặc
-`SERIALIZABLE`.
+(Lưu ý nhỏ: Nếu bài toán chỉ đơn giản là trừ đi 1 số lượng tồn kho, hãy dùng `UPDATE` kèm điều kiện - cái này nằm ở `LOCK-004`).
 
-## Phạm vi
+## 11. Giới Hạn Của Bài Viết
 
-Case chỉ xử lý known-row selection với `PESSIMISTIC_WRITE`/`FOR UPDATE`.
-`SKIP LOCKED` cho work claiming thuộc `DB-010`; opposite-order deadlock thuộc
-`DB-008`; strategy dưới sustained high contention thuộc `LOCK-005`.
+Phần này chỉ nói về chuyện Tóm Cổ 1 Dòng Dữ Liệu Rõ Ràng bằng `FOR UPDATE`. Các môn phái khác như Xài `SKIP LOCKED` cho hàng đợi (Worker) thì xem `DB-010`; Đụng độ Deadlock xếp ngược thì đọc `DB-008`; hoặc tối ưu hóa khi Server quá rát thì xem `LOCK-005`.

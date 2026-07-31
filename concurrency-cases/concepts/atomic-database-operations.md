@@ -1,299 +1,174 @@
-# Phép toán nguyên tử trong cơ sở dữ liệu và cập nhật có điều kiện
+# Cập nhật dữ liệu an toàn với điều kiện trực tiếp trong SQL (Conditional Atomic Update)
 
-## Mục đích
+## Tại sao cần dùng cách này?
 
-Phép cập nhật nguyên tử có điều kiện (`conditional atomic update`) đặt điều kiện
-nghiệp vụ và thao tác thay đổi dữ liệu trong cùng một câu lệnh SQL. Cách làm này
-phù hợp khi quy tắc cần bảo vệ có thể diễn đạt bằng các cột của dòng hiện tại,
-không cần đọc dữ liệu về Java rồi mới quyết định.
+Thay vì bạn phải `SELECT` dữ liệu lên code Java (ví dụ: lấy số lượng hàng tồn kho), kiểm tra điều kiện (còn đủ hàng không), rồi mới gọi lệnh `UPDATE` để lưu lại... thì bạn có thể gộp tất cả việc kiểm tra và cập nhật này vào trong duy nhất một câu lệnh SQL. 
 
-## Thuật ngữ cần biết
+Cách làm này rất hiệu quả khi bạn chỉ cần kiểm tra dữ liệu của chính cái dòng bạn đang muốn cập nhật. Nó giúp tránh được lỗi khi có nhiều luồng (thread) hoặc nhiều yêu cầu (request) cùng sửa một dòng dữ liệu cùng lúc.
 
-| Cách gọi trong tài liệu | Tên tiếng Anh hoặc API | Giải thích |
-| --- | --- | --- |
-| cập nhật có điều kiện | conditional `UPDATE` | Chỉ cập nhật khi mệnh đề `WHERE` còn đúng |
-| số dòng bị ảnh hưởng | affected-row count | Số dòng thực sự được câu lệnh thay đổi |
-| kiểm tra lại điều kiện | predicate recheck | PostgreSQL đánh giá lại `WHERE` sau khi phải chờ giao dịch khác |
-| phiên bản hiện tại của dòng | current row version | Dữ liệu mới nhất mà câu lệnh cập nhật được phép xử lý |
-| không thay đổi dữ liệu | no-op | Câu lệnh chạy thành công nhưng không cập nhật dòng nào |
-| trả lại dữ liệu sau cập nhật | `RETURNING` | PostgreSQL trả các giá trị của dòng vừa được cập nhật |
-| phép cộng hoặc trừ có điều kiện | guarded delta | Thay đổi một lượng trên giá trị hiện tại, kèm điều kiện giới hạn |
-| DML hàng loạt | bulk DML | Câu lệnh cập nhật trực tiếp trong cơ sở dữ liệu, không đi qua cơ chế phát hiện thay đổi (`dirty checking`) của thực thể (`entity`) |
+## Các từ khóa quan trọng cần nhớ
 
-## Mẫu cơ bản
+| Từ khóa | Giải thích |
+| --- | --- |
+| Cập nhật có điều kiện (conditional `UPDATE`) | Chỉ cập nhật dữ liệu nếu thỏa mãn điều kiện ở mệnh đề `WHERE` của câu SQL. |
+| Số dòng bị ảnh hưởng (affected-row count) | Số lượng dòng dữ liệu thực tế đã được cập nhật thành công sau khi chạy câu lệnh. |
+| Kiểm tra lại điều kiện (predicate recheck) | Nếu cơ sở dữ liệu (như PostgreSQL) phải chờ một luồng khác chạy xong mới đến lượt nó, nó sẽ kiểm tra lại điều kiện `WHERE` một lần nữa để đảm bảo dữ liệu mới nhất vẫn thỏa mãn điều kiện. |
+| Trả lại dữ liệu sau cập nhật (`RETURNING`) | Cơ sở dữ liệu sẽ trả về ngay dữ liệu mới nhất vừa được cập nhật xong (thay vì bạn phải gọi thêm một câu `SELECT` nữa để lấy). |
+
+## Cách viết code cơ bản
+
+Ví dụ bạn muốn trừ đi số lượng hàng trong kho (`quantity`):
 
 ```sql
-update inventory_item
-set available_quantity = available_quantity - :quantity,
+UPDATE inventory_item
+SET available_quantity = available_quantity - :quantity,
     reserved_quantity = reserved_quantity + :quantity
-where product_id = :productId
-  and :quantity > 0
-  and available_quantity >= :quantity;
+WHERE product_id = :productId
+  AND :quantity > 0
+  AND available_quantity >= :quantity; -- Điều kiện quan trọng: số lượng tồn phải lớn hơn hoặc bằng số lượng cần trừ
 ```
 
-Quy ước kết quả:
+**Cách đọc kết quả:**
+- **Số dòng bị ảnh hưởng = 1**: Câu lệnh đã thành công, hàng đã được trừ.
+- **Số dòng bị ảnh hưởng = 0**: Không có dòng nào bị thay đổi. Điều này có nghĩa là điều kiện `WHERE` không thỏa mãn (ví dụ: hết hàng) hoặc sản phẩm không tồn tại.
 
-```text
-Số dòng bị ảnh hưởng = 1 → yêu cầu đã được áp dụng.
-Số dòng bị ảnh hưởng = 0 → không có dữ liệu nào bị thay đổi.
+**Lưu ý cực kỳ quan trọng:** Code của bạn BẮT BUỘC phải kiểm tra số lượng dòng bị ảnh hưởng này. Nếu bạn bỏ qua nó, dữ liệu có thể không được cập nhật thành công nhưng hệ thống của bạn vẫn báo là thành công, dẫn đến lỗi thất thoát dữ liệu.
+
+## Hãy cộng/trừ trực tiếp trong SQL, đừng tính toán ở Java rồi mới lưu
+
+**Tuyệt đối tránh cách làm này:**
+```sql
+-- Lấy dữ liệu cũ ở Java, tính toán ra con số cuối cùng rồi gửi xuống SQL. Rất dễ bị sai lệch khi chạy đồng thời!
+UPDATE inventory_item
+SET available_quantity = :valueCalculatedFromOldRead 
+WHERE product_id = :productId;
 ```
 
-Ứng dụng phải xử lý cả hai trường hợp. Nếu bỏ qua kết quả trả về, cơ sở dữ liệu
-có thể từ chối cập nhật đúng cách nhưng API vẫn báo thành công hoặc vẫn ghi tác
-dụng phụ.
+**Nên làm theo cách này:**
+```sql
+-- Bảo SQL tự lấy giá trị hiện tại trừ đi số lượng cần thiết
+UPDATE inventory_item
+SET available_quantity = available_quantity - :quantity
+WHERE product_id = :productId
+  AND available_quantity >= :quantity;
+```
+Khi bạn làm cách này, cơ sở dữ liệu sẽ khóa dòng dữ liệu lại, tự tính toán trừ đi và lưu lại. Không có khoảng thời gian hở nào để các yêu cầu khác chen ngang vào làm sai lệch số liệu.
 
-> **Nói ngắn gọn:** `WHERE` là điều kiện nghiệp vụ tại đúng thời điểm ghi; số
-> dòng bị ảnh hưởng là câu trả lời bắt buộc phải xử lý.
+## Cơ sở dữ liệu xử lý việc nhiều luồng cùng cập nhật như thế nào?
 
-## Gửi ý định thay đổi, không gửi giá trị tính từ dữ liệu cũ
+Giả sử có 2 yêu cầu (gọi là A và B) cùng muốn cập nhật một dòng dữ liệu tại cùng một thời điểm:
+1. Yêu cầu A đến trước, thấy điều kiện đúng nên khóa dòng đó lại và bắt đầu cập nhật.
+2. Yêu cầu B đến sau, cũng muốn sửa dòng đó nên phải đứng chờ yêu cầu A làm xong.
+3. Nếu A cập nhật thành công (commit), thì B sẽ nhận được dữ liệu mới nhất do A vừa sửa, sau đó B sẽ tự động kiểm tra lại điều kiện `WHERE` (xem có còn đủ hàng không).
+4. Nếu A bị lỗi và hủy bỏ (rollback), thì B sẽ lấy dữ liệu ban đầu chưa bị A sửa để kiểm tra.
+5. Cuối cùng, B có thể cập nhật thành công hoặc không làm gì cả, tùy thuộc vào điều kiện `WHERE` có còn đúng hay không.
 
-Không nên gửi một giá trị tuyệt đối đã được tính từ lần đọc trước:
+## Dùng `RETURNING` để lấy kết quả ngay lập tức
 
 ```sql
-update inventory_item
-set available_quantity = :valueCalculatedFromOldRead
-where product_id = :productId;
-```
-
-Nên gửi trực tiếp ý định cần thực hiện:
-
-```sql
-update inventory_item
-set available_quantity = available_quantity - :quantity
-where product_id = :productId
-  and available_quantity >= :quantity;
-```
-
-Phép trừ sử dụng giá trị hiện tại trong cơ sở dữ liệu. Điều kiện kiểm tra và thao
-tác thay đổi nằm trong cùng một câu lệnh nên không có khoảng trống để giao dịch
-khác chen vào giữa hai bước.
-
-## Cách PostgreSQL xử lý tại `READ COMMITTED`
-
-Hai câu lệnh `UPDATE` cùng nhắm tới một dòng vẫn sử dụng khóa mức dòng:
-
-1. Giao dịch A thấy điều kiện đúng, khóa dòng và cập nhật.
-2. Giao dịch B cũng nhắm tới dòng đó nên phải chờ A.
-3. Nếu A chốt giao dịch (`commit`), B xử lý phiên bản mới của dòng và đánh giá
-   lại `WHERE`.
-4. Nếu A hoàn tác giao dịch (`rollback`), thay đổi của A biến mất và B xử lý dữ
-   liệu ban đầu.
-5. B cập nhật một dòng hoặc không cập nhật dòng nào tùy kết quả kiểm tra lại.
-
-Cơ chế này phù hợp với điều kiện đơn giản trên một dòng đã biết trước. Với điều
-kiện phức tạp dựa trên nhiều dòng, `READ COMMITTED` không bảo đảm mọi dữ liệu mà
-câu lệnh nhìn thấy đều thuộc cùng một ảnh chụp nhất quán.
-
-`lock_timeout`, bế tắc (`deadlock`) và lỗi tuần tự hóa
-(`serialization failure`) vẫn có thể xảy ra. Đây là lỗi của câu lệnh hoặc giao
-dịch, không phải trường hợp “số dòng bị ảnh hưởng bằng 0”.
-
-## Dùng `RETURNING` khi cần giá trị sau cập nhật
-
-```sql
-update inventory_item
-set available_quantity = available_quantity - :quantity,
+UPDATE inventory_item
+SET available_quantity = available_quantity - :quantity,
     revision = revision + 1
-where product_id = :productId
-  and available_quantity >= :quantity
-returning available_quantity, revision;
+WHERE product_id = :productId
+  AND available_quantity >= :quantity
+RETURNING available_quantity, revision; -- Lấy luôn giá trị sau khi cập nhật
 ```
+Nhờ `RETURNING`, bạn biết chắc chắn cập nhật thành công hay không (có dòng trả về là thành công, không có là thất bại) và có luôn dữ liệu mới nhất mà không cần viết thêm lệnh `SELECT`.
+*(Lưu ý: Nếu dùng Spring Data JPA với `@Modifying`, nó chỉ trả về số lượng dòng bị ảnh hưởng. Nếu muốn hứng dữ liệu từ `RETURNING`, bạn nên dùng thư viện JDBC hoặc jOOQ sẽ dễ hơn).*
 
-Một dòng được trả về nghĩa là cập nhật đã thắng; không có dòng nào được trả về
-nghĩa là không có thay đổi. `RETURNING` giúp lấy đúng giá trị sau cập nhật từ
-chính câu lệnh đó, thay vì chạy thêm một `SELECT` rồi suy đoán.
+## Xử lý khi kết quả không như ý muốn (Cập nhật 0 dòng)
 
-Spring Data `@Modifying` phù hợp khi chỉ cần số dòng bị ảnh hưởng. Nếu cần ánh
-xạ các cột do `RETURNING` trả về, JDBC, jOOQ hoặc một lớp truy cập dữ liệu viết
-SQL trực tiếp thường thể hiện ý định rõ hơn.
+Khi bạn cập nhật theo 1 ID cụ thể, kết quả trả về chỉ có thể là 1 (thành công) hoặc 0 (không có gì thay đổi). Nếu kết quả trả về lớn hơn 1, tức là code của bạn đang bị lỗi logic.
 
-## Giới hạn số dòng được cập nhật
+Nếu kết quả là `0`, trong Java bạn phải xác định được tại sao lại bằng 0:
+- Do trong kho không còn đủ hàng?
+- Do ID sản phẩm không tồn tại?
+- Do dữ liệu đầu vào bị sai?
 
-Với một yêu cầu nhắm tới khóa duy nhất, kết quả mong đợi là:
+Đừng gom tất cả các trường hợp báo `0` thành một lỗi chung chung, hãy phân biệt rõ để báo lỗi chính xác cho người dùng.
 
-```text
-Số dòng bị thay đổi ∈ {0, 1}
-```
+## Gói gọn mọi thứ vào một giao dịch (Transaction)
 
-Nếu kết quả lớn hơn `1`, truy vấn hoặc ranh giới của đối tượng nghiệp vụ đang sai. Nếu kết quả
-bằng `0`, ứng dụng phải biết điều kiện nào có thể đã không thỏa:
+Thường thì khi trừ tiền hoặc trừ kho, bạn còn phải làm nhiều việc khác nữa (như lưu lịch sử giao dịch). Tất cả các thao tác ghi vào cơ sở dữ liệu này PHẢI được đặt trong cùng một giao dịch (dùng `@Transactional` trong Spring Boot). 
+Nếu một bước phía sau bị lỗi, toàn bộ giao dịch sẽ bị hoàn tác (rollback), dữ liệu kho sẽ được trả lại như cũ. Tuy nhiên, việc gọi ra các hệ thống bên ngoài (gọi API khác) không được tính vào giao dịch này.
 
-- không còn đủ số lượng;
-- dòng cần cập nhật không tồn tại;
-- trạng thái hoặc đơn vị sở hữu dữ liệu (`tenant`) không khớp;
-- mã kiểm soát (`token`) đã cũ;
-- dữ liệu đầu vào chưa hợp lệ.
+## Các lưu ý khi dùng Spring Data JPA
 
-Không nên ánh xạ mọi kết quả `0` thành cùng một lỗi nghiệp vụ nếu câu lệnh SQL
-không bảo đảm ý nghĩa đó.
-
-## Đặt toàn bộ thay đổi liên quan trong cùng giao dịch
-
-Một câu lệnh chỉ nguyên tử trong phạm vi của chính nó. Một nghiệp vụ hoàn chỉnh
-thường còn nhiều bước:
-
-```text
-Giành quyền xử lý mã yêu cầu (command ID)
-→ cập nhật có điều kiện
-→ lưu kết quả và dữ liệu kiểm toán (audit)
-→ ghi bản ghi hộp thư đi (outbox) chờ phát
-→ chốt giao dịch (commit)
-```
-
-Các bước ghi vào cơ sở dữ liệu phải dùng cùng một giao dịch. Nếu bước sau cập
-nhật thất bại, việc hoàn tác phải hoàn nguyên cả bộ đếm và các bản ghi liên quan.
-Lời gọi ra hệ thống ngoài hoặc việc phát thông điệp không tự tham gia giao dịch
-PostgreSQL; dùng mẫu hộp thư đi (`outbox`) hoặc quy trình xử lý phù hợp.
-
-Khóa do `UPDATE` lấy vẫn được giữ đến khi giao dịch kết thúc. Vì vậy, gọi dịch vụ
-từ xa sau câu lệnh cập nhật vẫn kéo dài thời gian giữ khóa.
-
-## Chống xử lý lặp không thay thế an toàn cập nhật
-
-Tính lũy đẳng (`idempotency`) ngăn cùng một yêu cầu bị áp dụng nhiều lần. Cập
-nhật có điều kiện lại ngăn nhiều yêu cầu khác nhau cùng vượt quá giới hạn tài
-nguyên.
-
-Một bản ghi duy nhất dùng để giành quyền xử lý mã yêu cầu có thể trả lại kết quả
-đã lưu khi yêu cầu bị gửi trùng. Tuy nhiên, bản ghi này không ngăn hai yêu cầu
-khác nhau cạnh tranh cùng một dòng. Ngược lại, điều kiện tồn kho không nhận ra
-cùng một yêu cầu đang được gửi lại khi dữ liệu vẫn còn đủ.
-
-Hệ thống cần cả hai cơ chế nếu phải bảo vệ cả hai quy tắc.
-
-## Ràng buộc là lớp bảo vệ bổ sung
-
-```sql
-check (available_quantity >= 0)
-check (reserved_quantity >= 0)
-check (available_quantity + reserved_quantity = on_hand_quantity)
-```
-
-Các ràng buộc (`constraint`) chặn giá trị không hợp lệ từ mọi đường ghi.
-PostgreSQL `CHECK` chỉ nên dựa trên dữ liệu của chính dòng đang được kiểm tra,
-không dùng như một khẳng định trải qua nhiều bảng.
-
-Ràng buộc không thay thế giao dịch nguyên tử giữa bộ đếm và dữ liệu kiểm toán.
-Hệ thống vẫn cần đối soát (`reconciliation`) để phát hiện hai nguồn dữ liệu bị lệch.
-
-## Lưu ý với Spring Data JPA
-
-Phương thức trong lớp truy cập dữ liệu (`repository`) có thể trả trực tiếp số dòng bị ảnh hưởng:
-
+Nếu bạn viết hàm cập nhật trực tiếp như sau:
 ```java
 @Modifying
 @Query(value = """
-        update inventory_item
-        set available_quantity = available_quantity - :quantity
-        where product_id = :productId
-          and available_quantity >= :quantity
+        UPDATE inventory_item
+        SET available_quantity = available_quantity - :quantity
+        WHERE product_id = :productId
+          AND available_quantity >= :quantity
         """, nativeQuery = true)
 int reserveIfEnough(long productId, int quantity);
 ```
+Bạn cần nhớ rằng: Lệnh này cập nhật thẳng xuống cơ sở dữ liệu, bỏ qua bộ nhớ đệm (cache/persistence context) của JPA.
+Do đó, nếu bạn đang lấy đối tượng (entity) đó ra trước đó, dữ liệu của entity trong code Java lúc này sẽ là dữ liệu cũ, không khớp với cơ sở dữ liệu nữa.
 
-Câu lệnh DML hàng loạt hoặc SQL viết trực tiếp cập nhật thẳng cơ sở dữ liệu,
-không tự đồng bộ thực thể đang được quản lý:
+**Cách giải quyết:** 
+- Đừng tải entity đó lên trước khi gọi lệnh cập nhật này trong cùng một giao dịch.
+- Nếu phải dùng, hãy xóa sạch bộ nhớ đệm sau khi cập nhật bằng cấu hình `clearAutomatically = true` trong `@Modifying`, buộc JPA phải đọc lại dữ liệu mới nếu cần thiết.
 
-- ngữ cảnh lưu trữ (`persistence context`) có thể vẫn giữ thực thể với dữ liệu cũ;
-- một lần `flush()` hoặc `merge()` sau đó có thể ghi đè kết quả vừa cập nhật;
-- hàm gọi lại của thực thể (`entity callback`) và cơ chế phát hiện thay đổi
-  (`dirty checking`) thông thường không đại diện cho câu lệnh này.
+## Chốt giao dịch, hủy bỏ và thử lại (Retry)
 
-Có ba cách thiết kế an toàn:
-
-1. Không nạp thực thể đích trong cùng giao dịch.
-2. `flush()` các thay đổi đang chờ trước câu lệnh và `clear()` sau đó nếu lớp dịch
-   vụ sở hữu toàn bộ ngữ cảnh lưu trữ.
-3. `refresh()` đúng thực thể nếu vẫn cần dùng thực thể đó.
-
-`clearAutomatically` và `flushAutomatically` là công cụ quản lý vòng đời ngữ
-cảnh lưu trữ, không thay thế một ranh giới giao dịch rõ ràng.
-
-## Chốt giao dịch, hoàn tác và thử lại
-
-| Kết quả | Ý nghĩa |
+| Kết quả thực thi | Ý nghĩa thực tế |
 | --- | --- |
-| Một dòng bị thay đổi, rồi chốt giao dịch | Thay đổi đã bền vững |
-| Không có dòng bị thay đổi, rồi chốt giao dịch | Không có thay đổi; có thể lưu kết quả từ chối |
-| Một dòng bị thay đổi, sau đó hoàn tác | Thay đổi bị hoàn nguyên |
-| SQLSTATE `55P03` | Chờ khóa thất bại; giao dịch phải hoàn tác |
-| SQLSTATE `40P01` | Giao dịch bị chọn làm nạn nhân của bế tắc |
-| SQLSTATE `40001` | Giao dịch gặp lỗi tuần tự hóa |
+| Sửa được 1 dòng, rồi `commit` | Cập nhật đã được lưu chắc chắn vào Database. |
+| Sửa 0 dòng, rồi `commit` | Không có gì thay đổi; thường dùng để lưu lại lịch sử báo lỗi (từ chối). |
+| Sửa được 1 dòng, rồi bị lỗi `rollback` | Dữ liệu được trả lại y như cũ trước khi cập nhật. |
+| Lỗi SQL `55P03` | Không chờ được để khóa (lock) dữ liệu; giao dịch bắt buộc phải hủy (`rollback`). |
+| Lỗi SQL `40P01` | Lỗi bế tắc (Deadlock); Database tự chọn giao dịch này để hủy giải cứu hệ thống. |
+| Lỗi SQL `40001` | Lỗi tuần tự hóa (Serialization failure), thường xảy ra ở các mức cách ly cao. |
 
-Chỉ thử lại (`retry`) lỗi kỹ thuật khi yêu cầu có thể phát lại an toàn. Mỗi lần
-thử phải dùng giao dịch mới, có giới hạn số lần, thời hạn tổng và khoảng chờ
-hữu hạn. Không tự động thử lại một kết quả từ chối nghiệp vụ.
+- Chỉ tự động thử lại (retry) khi gặp lỗi kỹ thuật như các mã lỗi SQL ở trên. 
+- Không được tự động thử lại nếu lỗi do logic nghiệp vụ (ví dụ: lỗi hết tiền, hết hàng) vì nó sẽ mãi mãi lỗi.
+- Mỗi lần thử lại phải mở một giao dịch (`Transaction`) hoàn toàn mới, và nhớ đặt giới hạn số lần thử.
 
-## Cập nhật nhiều dòng
+## Cập nhật nhiều dòng cùng lúc
 
-Một câu lệnh `UPDATE` có thể thay đổi nhiều dòng, nhưng khi đó cần phân tích thêm:
+Nếu câu lệnh `UPDATE` của bạn ảnh hưởng tới nhiều dòng dữ liệu, hãy cẩn thận vì nó phức tạp hơn:
+- Dễ sinh ra bế tắc (deadlock) do Database tự động khóa từng dòng một theo thứ tự ngẫu nhiên.
+- Số lượng dòng bị ảnh hưởng không còn chắc chắn là `0` hay `1` nữa. Bạn phải kiểm tra cẩn thận xem số dòng cập nhật thành công có đúng với số lượng bạn mong muốn không.
+- Nếu bạn cần tất cả các dòng phải thành công 100%, hãy lấy số dòng bị ảnh hưởng so sánh trực tiếp với tổng số dòng bạn dự định cập nhật.
 
-- thứ tự lấy khóa và nguy cơ bế tắc (`deadlock`);
-- số dòng bị ảnh hưởng không còn chỉ là `0` hoặc `1`;
-- ý nghĩa nghiệp vụ nếu chỉ một phần các dòng thỏa điều kiện;
-- `UPDATE ... FROM` phải không nối nhiều dòng nguồn vào cùng một dòng đích;
-- thứ tự dữ liệu trả về không tự được bảo đảm.
+## Dòng dữ liệu không tồn tại và các điều kiện phức tạp
 
-Nếu nghiệp vụ yêu cầu toàn bộ một tập dòng đã biết phải cùng thành công hoặc cùng
-thất bại, giao dịch vẫn bảo đảm tính nguyên tử nhưng ứng dụng phải so số dòng
-bị ảnh hưởng với số dòng mong đợi.
+Câu `UPDATE` không thể tự tạo mới dữ liệu nếu nó chưa tồn tại, và cũng không khóa được một thứ không có thật.
+Nếu logic của bạn yêu cầu kiểm tra điều kiện trên nhiều bảng hoặc nhiều dòng khác nhau cùng lúc (ví dụ: tổng tiền các hóa đơn không vượt quá mức cho phép), câu `UPDATE` đơn giản sẽ không đủ an toàn. 
 
-## Dòng không tồn tại và quy tắc trải trên nhiều dòng
+Lúc này bạn cần:
+- Dùng các ràng buộc (Constraint) như `UNIQUE`, `CHECK` trong Database.
+- Có một bảng hoặc một dòng riêng dùng để đếm số (bộ đếm).
+- Cân nhắc chuyển sang dùng khóa bi quan (Pessimistic locking - `SELECT ... FOR UPDATE`).
 
-Câu lệnh `UPDATE` có điều kiện không tạo mới hoặc khóa một dòng không tồn tại.
-Nó cũng không tự bảo vệ quy tắc “không có dòng nào thỏa điều kiện” hoặc giới hạn
-được tính từ nhiều dòng con, trừ khi hệ thống có một dòng kiểm soát hoặc bộ đếm
-ổn định làm nguồn dữ liệu có thẩm quyền.
+## Chạy nhiều server cùng lúc (Multi-instance)
 
-Với các quy tắc như vậy, cần cân nhắc:
+Khi ứng dụng của bạn chạy trên nhiều server (ví dụ: có 5 con server Spring Boot cùng chạy), đừng lo lắng. Tất cả các lệnh `UPDATE` đều sẽ đẩy về chung một Database chính (Primary PostgreSQL). 
+Bản thân Database sẽ tự sắp xếp hàng đợi và khóa dòng dữ liệu lại một cách an toàn. Bạn KHÔNG CẦN phải dùng khóa trên code Java (như `synchronized` hay các thư viện Lock phân tán) cho trường hợp này.
 
-- `UNIQUE`, `CHECK` hoặc ràng buộc loại trừ (`exclusion constraint`);
-- một dòng kiểm soát hoặc bộ đếm ổn định;
-- mức cô lập `SERIALIZABLE`;
-- quy ước khóa bi quan (`pessimistic locking`);
-- thiết kế lại lược đồ dữ liệu.
+Tuy nhiên, nếu có quá nhiều server cùng đập vào một dòng dữ liệu (dữ liệu quá "hot"), Database sẽ bị quá tải ở hàng đợi khóa. Lúc này hệ thống sẽ chậm đi, bạn cần theo dõi thời gian chờ và tình trạng kết nối.
 
-## Nhiều phiên bản ứng dụng
+## Tóm lại: Khi nào nên dùng cách này?
+Đây là cách đơn giản và rất mạnh mẽ khi:
+- Bạn biết rõ ID của dòng cần cập nhật.
+- Điều kiện kiểm tra chỉ phụ thuộc vào dữ liệu của chính dòng đó.
+- Thao tác là cộng, trừ số lượng hoặc đổi trạng thái đơn giản.
+- Khối lượng công việc cập nhật và giữ khóa (lock) ngắn.
 
-Trong mô hình nhiều phiên bản chạy song song (`multi-instance`), mọi yêu cầu đều
-gửi điều kiện và phép cập nhật tới cùng máy chủ PostgreSQL chính (`primary`).
-Khóa dòng, dữ liệu hiện tại và số dòng bị ảnh hưởng đều nằm tại nguồn dữ liệu có
-thẩm quyền, nên khóa loại trừ lẫn nhau (`mutex`) trong từng JVM không cần tham
-gia bảo vệ quy tắc này.
+*(Nếu bạn cần lấy rất nhiều dữ liệu về Java xử lý tính toán phức tạp rồi mới lưu thì hãy nghĩ tới dùng từ khóa `FOR UPDATE` hoặc dùng khóa lạc quan `@Version` thay thế).*
 
-Tính đúng đắn giữa nhiều máy không đồng nghĩa thông lượng luôn tốt. Một dòng quá
-nóng có thể tạo hàng đợi khóa; cần theo dõi thời gian chờ, áp lực lên vùng kết
-nối (`connection pool`) và tỷ lệ câu lệnh không thay đổi dữ liệu.
+## Những thông số cần theo dõi (Monitoring)
 
-## Khi nên dùng cách này
+Để đảm bảo hệ thống khỏe mạnh, bạn nên theo dõi (log/metric) các chỉ số sau:
+- Tỉ lệ cập nhật thành công (1 dòng) so với thất bại (0 dòng).
+- Các mã lỗi báo kẹt khóa hay deadlock: `55P03`, `40P01`, `40001`.
+- Thời gian phải chờ để lấy được khóa và thời gian chạy xong một giao dịch.
+- Nhớ đừng bao giờ in các thông tin nhạy cảm (như mật khẩu, số thẻ) ra log. 
 
-SQL cập nhật nguyên tử có điều kiện thường là lựa chọn gọn nhất khi:
-
-- dòng đích đã tồn tại và được biết trước;
-- điều kiện chỉ dựa trên dữ liệu của dòng đó;
-- thay đổi là phép cộng, trừ hoặc chuyển trạng thái;
-- ứng dụng ánh xạ được trường hợp số dòng bị ảnh hưởng bằng `0`;
-- phần công việc giữ khóa cần ngắn.
-
-Dùng `FOR UPDATE` khi Java cần đọc nhiều dữ liệu rồi mới quyết định. Dùng
-`@Version` khi chỉnh sửa đối tượng nghiệp vụ phức tạp và xung đột hiếm. Dùng
-ràng buộc khi cơ sở dữ liệu có thể biểu diễn trực tiếp quy tắc cần bảo vệ.
-
-## Những gì cần theo dõi
-
-- số lần cập nhật một dòng và số lần không cập nhật dòng nào;
-- tỷ lệ `RETURNING` không trả dòng;
-- SQLSTATE `55P03`, `40P01`, `40001`;
-- thời gian chờ khóa và thời lượng giao dịch;
-- kết quả đối soát giữa bộ đếm và dữ liệu kiểm toán;
-- số yêu cầu được phát lại và số dấu vân tay yêu cầu (`fingerprint`) không khớp;
-- lỗi do ngữ cảnh lưu trữ giữ thực thể cũ.
-
-Không ghi nhật ký giá trị tham số nhạy cảm. Nên ghi chỉ số đo lường (`metric`) cho
-cả kết quả nghiệp vụ và kết quả của câu lệnh SQL để phát hiện mã nguồn bỏ qua số
-dòng bị ảnh hưởng.
-
-## Liên kết
+## Liên kết tài liệu tham khảo
 
 - [LOCK-004 — Conditional atomic UPDATE](../locking/conditional-atomic-update/README.md)
 - [DB-001 — Lost update dưới MVCC](../postgresql/lost-update-mvcc/README.md)
