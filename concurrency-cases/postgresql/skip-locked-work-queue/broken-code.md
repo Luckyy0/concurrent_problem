@@ -1,4 +1,4 @@
-# Code lỗi — duplicate claim và lock convoy
+# Code lỗi — Duplicate claim và lock convoy
 
 ## Schema
 
@@ -24,7 +24,7 @@ create index ix_work_job_claim
     where status = 'READY';
 ```
 
-## Lỗi 1 — `SELECT` rồi xử lý
+## Lỗi 1 — `SELECT` rồi mới xử lý
 
 ```java
 public interface WorkJobRepository extends JpaRepository<WorkJob, UUID> {
@@ -64,14 +64,11 @@ public class BrokenPollingWorker {
 }
 ```
 
-A và B có thể đọc cùng committed READY rows trước khi actor nào update. Entity
-object/local thread khác nhau không tạo ownership. Cả hai gọi external processor,
-sau đó cùng ghi `DONE`.
+Ở đây, Worker A và Worker B có thể cùng đọc được những dòng dữ liệu đang ở trạng thái `READY` trước khi bất kỳ ai kịp cập nhật (update). Các object hoặc luồng (thread) lưu trữ cục bộ không thể giúp ta thiết lập quyền sở hữu (ownership). Hậu quả là cả hai worker sẽ cùng gọi dịch vụ bên ngoài, và cuối cùng đều ghi đè trạng thái `DONE`.
 
-Thêm `@Transactional` quanh `poll()` không sửa plain SELECT; nó còn giữ connection
-qua remote I/O.
+Ngay cả khi bạn thêm `@Transactional` bao quanh hàm `poll()` thì cũng không giải quyết được vấn đề vì bản chất nó vẫn là một truy vấn `SELECT` thông thường. Hơn nữa, việc này còn khiến kết nối cơ sở dữ liệu bị giữ chặt suốt quá trình gọi I/O ra dịch vụ bên ngoài.
 
-## Lỗi 2 — `FOR UPDATE` nhưng mọi worker xếp hàng
+## Lỗi 2 — `FOR UPDATE` nhưng mọi worker lại phải xếp hàng
 
 ```java
 @Lock(LockModeType.PESSIMISTIC_WRITE)
@@ -87,14 +84,11 @@ qua remote I/O.
 List<WorkJob> lockReady(int batchSize);
 ```
 
-Nếu Worker A giữ oldest row, B/C đều chọn cùng row theo snapshot/order rồi block.
-Chúng không tự “nhảy” sang job kế tiếp. Queue có 1.000 jobs vẫn có thể bị convoy
-sau job đầu.
+Giả sử Worker A đang giữ dòng công việc cũ nhất, thì Worker B và C khi truy vấn cũng sẽ chọn đúng dòng đó (do cùng điều kiện và thứ tự sắp xếp) rồi bị chặn lại (block). Chúng không thể tự động "nhảy" sang công việc tiếp theo. Hàng đợi có 1.000 công việc vẫn có thể bị kẹt cứng (convoy) chỉ vì công việc đầu tiên đang bị khóa.
 
-> **Nói ngắn gọn:** `FOR UPDATE` loại duplicate trong transaction nhưng không tạo
-> parallel claiming; `SKIP LOCKED` mới cho poller đi qua row đang bận.
+> **Nói ngắn gọn:** `FOR UPDATE` giúp loại bỏ việc lấy trùng công việc (duplicate) trong giao dịch, nhưng nó không cho phép các worker lấy việc song song (parallel claiming); `SKIP LOCKED` mới chính là cơ chế cho phép worker lướt qua những dòng đang bận để lấy việc tiếp theo.
 
-## Lỗi 3 — giữ lock qua external work
+## Lỗi 3 — Giữ lock xuyên suốt quá trình gọi external work
 
 ```java
 @Transactional
@@ -108,11 +102,9 @@ public void pollAndProcess() {
 }
 ```
 
-Row locks chỉ release tại commit/rollback. Remote latency giữ database connection,
-locks và transaction snapshot. Process crash rollback status nhưng không hoàn tác
-external effect đã thành công; job sẽ chạy lại.
+Khóa dòng (Row locks) chỉ được giải phóng (release) khi giao dịch hoàn tất (commit/rollback). Bất kỳ sự chậm trễ nào từ mạng (remote latency) cũng sẽ giữ chặt kết nối cơ sở dữ liệu, các khóa và cả trạng thái của giao dịch (transaction snapshot). Nếu tiến trình bị sập (crash), trạng thái công việc sẽ được rollback, nhưng tác vụ ở hệ thống bên ngoài thì đã thành công rồi; kết quả là khi hệ thống chạy lại, công việc đó sẽ bị xử lý lại từ đầu.
 
-## Lỗi 4 — claim hai bước không atomic
+## Lỗi 4 — Lấy việc bằng hai bước không atomic
 
 ```java
 @Transactional
@@ -123,12 +115,9 @@ public List<WorkJob> claim(String workerId, int batchSize) {
 }
 ```
 
-`SELECT` không khóa. Hai transactions có thể chọn cùng IDs trước khi dirty
-checking flushes `UPDATE`. Nếu không có `@Version`, later update không báo
-conflict; có `@Version` thì conflict chỉ lộ ở flush nhưng external work có thể đã
-bắt đầu nếu caller không chờ commit.
+Lệnh `SELECT` bình thường không hề tạo khóa. Hai giao dịch khác nhau có thể cùng chọn ra những ID giống hệt nhau trước khi tiến trình kiểm tra (dirty checking) đẩy lệnh `UPDATE` xuống cơ sở dữ liệu. Nếu không dùng cơ chế kiểm soát phiên bản (như `@Version`), lệnh update sau sẽ âm thầm ghi đè mà không báo lỗi xung đột; còn nếu dùng `@Version`, lỗi xung đột chỉ lộ ra ở thời điểm lưu (flush), trong khi tác vụ bên ngoài có thể đã bị thực thi mất rồi nếu ứng dụng không cẩn thận chờ commit.
 
-## Lỗi 5 — status không có recovery ownership
+## Lỗi 5 — Trạng thái không đi kèm khả năng khôi phục ownership
 
 ```sql
 update work_job
@@ -138,14 +127,11 @@ where job_id = :jobId
   and status = 'READY';
 ```
 
-Affected-row check ngăn duplicate claim cho một row, nhưng process crash để job
-`PROCESSING` vĩnh viễn. Nếu sweeper chỉ đổi status về READY, worker cũ hồi phục
-có thể complete sau worker mới và ghi đè kết quả.
+Mặc dù việc kiểm tra số dòng bị ảnh hưởng (affected-row) có thể ngăn hai worker cùng lấy một dòng, nhưng nếu hệ thống sập (crash), công việc đó sẽ kẹt vĩnh viễn ở trạng thái `PROCESSING`. Nếu chúng ta chỉ dùng một tiến trình dọn dẹp để đặt lại trạng thái về `READY`, worker cũ khi tỉnh lại vẫn có thể hoàn thành công việc sau worker mới, dẫn đến ghi đè kết quả.
 
-Cần `lease_until` và claim token mới cho mỗi ownership epoch. Completion phải
-conditional theo token.
+Để giải quyết, chúng ta cần `lease_until` (thời hạn thuê) và một thẻ định danh (claim token) mới cho mỗi chu kỳ sở hữu. Bất kỳ thao tác hoàn thành nào cũng phải có điều kiện bắt buộc đi kèm với token này.
 
-## Lỗi 6 — `SKIP LOCKED` nhưng không có `ORDER BY`
+## Lỗi 6 — Dùng `SKIP LOCKED` nhưng không dùng `ORDER BY`
 
 ```sql
 select job_id
@@ -155,23 +141,17 @@ for update skip locked
 limit 10;
 ```
 
-Không có `ORDER BY`, PostgreSQL được phép trả subset theo plan thuận tiện. Không
-có fairness contract, priority/SLA không thể kiểm chứng và plan change có thể đổi
-hành vi.
+Nếu không có `ORDER BY`, PostgreSQL có quyền trả về một tập con bất kỳ sao cho tiện nhất với kế hoạch thực thi (plan) của nó. Điều này có nghĩa là bạn sẽ không có sự công bằng (fairness contract), không thể kiểm chứng được độ ưu tiên hay SLA, và một sự thay đổi nhỏ trong query plan có thể làm thay đổi hoàn toàn hành vi của hệ thống.
 
-Ngay cả có `ORDER BY`, `SKIP LOCKED` không bảo đảm strict FIFO: row đầu đang lock
-bị bỏ qua để giữ progress.
+Tuy nhiên, ngay cả khi bạn dùng `ORDER BY`, `SKIP LOCKED` vẫn không đảm bảo thứ tự vào trước ra trước tuyệt đối (strict FIFO): một dòng ưu tiên nhất nếu đang bị khóa sẽ bị bỏ qua để nhường chỗ cho dòng tiếp theo nhằm duy trì tiến độ chung.
 
-## Lỗi 7 — tưởng `SKIP LOCKED` không bao giờ chờ
+## Lỗi 7 — Ảo tưởng rằng `SKIP LOCKED` không bao giờ chờ
 
-`SKIP LOCKED` chỉ áp dụng cho row-level locks. Query vẫn acquire table-level
-`ROW SHARE` theo cách thông thường và có thể chờ incompatible DDL/table lock,
-connection pool, I/O hoặc statement resource khác.
+`SKIP LOCKED` chỉ áp dụng đối với các khóa cấp độ dòng (row-level locks). Truy vấn của bạn vẫn cần yêu cầu khóa cấp độ bảng (`ROW SHARE`) giống như thông thường, và nó hoàn toàn có thể bị kẹt lại bởi các lệnh thay đổi cấu trúc bảng (DDL), cạn kiệt connection pool, chậm trễ I/O hoặc xung đột tài nguyên.
 
-Không bỏ `statement_timeout`, application deadline và migration coordination chỉ
-vì có `SKIP LOCKED`.
+Tuyệt đối không nên gỡ bỏ các giới hạn an toàn như `statement_timeout`, giới hạn thời gian chạy của ứng dụng, hay bỏ qua việc phối hợp khi thực hiện thay đổi cấu trúc bảng (migration) chỉ vì bạn nghĩ `SKIP LOCKED` đã lo liệu hết.
 
-## Lỗi 8 — complete không kiểm tra owner
+## Lỗi 8 — Hoàn thành (complete) mà không kiểm tra người sở hữu
 
 ```java
 @Modifying
@@ -183,18 +163,18 @@ vì có `SKIP LOCKED`.
 int complete(UUID jobId);
 ```
 
-Timeline:
+Hãy hình dung diễn biến sau:
 
 ```text
-A claim token-A → pause quá lease
-sweeper requeue
-B claim token-B → process
-A resume → complete chỉ theo jobId
+Worker A lấy việc với token-A → bị khựng lại quá thời hạn thuê
+Tiến trình quét đưa công việc về lại hàng đợi
+Worker B lấy việc đó với token-B → bắt đầu xử lý
+Worker A tỉnh lại → gọi hàm complete CHỈ KIỂM TRA jobId
 ```
 
-A là stale worker nhưng vẫn ghi `DONE`. Nếu B đang retry/fail, A phá state machine.
+Lúc này, Worker A đã trở thành một worker "ôi thiu" (stale worker) nhưng vẫn ngang nhiên ghi nhận `DONE`. Nếu Worker B đang xử lý lỗi và cần thử lại, hành động của A đã phá hỏng hoàn toàn luồng trạng thái (state machine) của hệ thống.
 
-## Self-invocation làm transaction không đúng
+## Lỗi 9 — Gọi hàm nội bộ (Self-invocation) làm hỏng transaction
 
 ```java
 public void poll() {
@@ -207,25 +187,25 @@ public List<ClaimedJob> claimBatch() {
 }
 ```
 
-Call nội bộ không qua Spring proxy. Claim/commit boundary có thể không tồn tại như
-code review tưởng. Claimer phải là bean riêng hoặc dùng `TransactionTemplate`.
+Trong Spring, việc gọi một hàm nội bộ từ trong cùng một class sẽ không đi qua proxy. Do đó, ranh giới lấy việc và commit (Claim/commit boundary) mà bạn tưởng tượng sẽ không hề tồn tại. Để giải quyết, hàm lấy việc phải được đặt ở một Bean riêng biệt, hoặc bạn phải sử dụng `TransactionTemplate`.
 
-## Điều kiện tái hiện
+## Điều kiện tái hiện để kiểm thử
 
-- ít nhất hai physical PostgreSQL connections;
-- nhiều committed READY jobs có deterministic order;
-- barrier sau plain SELECT để tái hiện duplicate;
-- holder giữ first row để chứng minh convoy/skip;
-- `Future.get(timeout)` và `statement_timeout` để test không treo;
-- Testcontainers PostgreSQL, không dùng H2 cho lock semantics.
+Để tái hiện các vấn đề này trong môi trường kiểm thử, bạn cần:
+- Ít nhất hai kết nối vật lý (physical connections) độc lập đến PostgreSQL.
+- Dữ liệu `READY` có thứ tự cố định (deterministic order) đã được commit.
+- Một rào chắn (barrier) đặt ngay sau lệnh SELECT thông thường để tái hiện tình trạng lấy trùng (duplicate).
+- Một connection giữ dòng dữ liệu đầu tiên để chứng minh hiện tượng kẹt (convoy) hoặc bỏ qua (skip).
+- Sử dụng `Future.get(timeout)` và `statement_timeout` để đảm bảo test không bị treo mãi mãi.
+- Phải dùng Testcontainers PostgreSQL, tuyệt đối không dùng H2 vì H2 không có cơ chế xử lý khóa (lock semantics) tương đồng.
 
-## Các cách sửa chưa đủ
+## Các cách sửa chưa đủ hoặc sai lầm
 
-- `synchronized`: chỉ bảo vệ một JVM.
-- Tăng worker threads/pool: tăng duplicate/lock wait/database load.
-- `FOR UPDATE` không `SKIP LOCKED`: correctness có thể tốt hơn nhưng convoy.
-- `SKIP LOCKED` rồi xử lý trước commit: lock lifetime vẫn dài.
-- Status `PROCESSING` không lease/token: crash và stale worker chưa được giải quyết.
-- Retry external call không idempotency key: duplicate effect.
-- Batch không giới hạn: transaction/lock footprint lớn.
-- Chỉ monitor queue depth: không thấy oldest age, expired leases và starvation.
+- Dùng `synchronized`: Chỉ có tác dụng bảo vệ bên trong một máy ảo Java (JVM) duy nhất.
+- Tăng số lượng worker/threads: Chỉ làm trầm trọng thêm tình trạng lấy trùng, chờ khóa và tăng tải cho database.
+- Dùng `FOR UPDATE` không có `SKIP LOCKED`: Có thể giải quyết tính đúng đắn nhưng lại rước về hiện tượng kẹt hàng đợi (convoy).
+- Dùng `SKIP LOCKED` rồi xử lý tác vụ trước khi commit: Tuổi thọ của khóa vẫn bị kéo dài không cần thiết.
+- Cập nhật trạng thái `PROCESSING` mà không có thẻ token/lease: Hệ thống sập và worker quá hạn vẫn là bài toán chưa có lời giải.
+- Thử lại tác vụ bên ngoài mà không có idempotency key: Sẽ gây ra việc xử lý trùng lặp.
+- Lấy một lô (batch) mà không giới hạn: Phạm vi của giao dịch và khóa sẽ bị phình to quá mức.
+- Chỉ theo dõi độ sâu hàng đợi (queue depth): Sẽ không thể nhận biết được các công việc đã bị ngâm quá lâu, các trường hợp quá hạn thuê hay công việc bị kẹt vĩnh viễn (starvation).

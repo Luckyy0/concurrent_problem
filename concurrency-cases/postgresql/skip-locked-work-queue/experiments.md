@@ -2,16 +2,15 @@
 
 ## Mục tiêu
 
-- Plain SELECT cho hai workers cùng IDs.
-- Blocking `FOR UPDATE` tạo one-way wait/`55P03`.
-- `SKIP LOCKED` đi qua locked J1 và lấy J2.
-- Concurrent batch claims không giao nhau.
-- Rollback/crash release claim locks.
-- Expired lease có thể reclaim; stale token complete affected-row `0`.
-- Business assertion gồm ownership, status, attempt và idempotent effect.
+- Dùng lệnh `SELECT` thông thường cho thấy hai worker có thể lấy cùng một ID công việc.
+- Kiểm chứng `FOR UPDATE` không có `SKIP LOCKED` sẽ tạo ra tắc nghẽn một chiều (one-way wait/`55P03`).
+- Kiểm chứng `SKIP LOCKED` thực sự bỏ qua dòng J1 đang bị khóa và chuyển sang lấy J2.
+- Việc lấy một lô công việc song song (concurrent batch claims) không bao giờ bị giao nhau (disjoint).
+- Khi có sự cố (Rollback/crash), các khóa lấy việc sẽ tự động được giải phóng.
+- Các công việc hết hạn thuê (Expired lease) có thể được lấy lại để xử lý tiếp; một worker quá hạn nếu báo hoàn thành sẽ nhận về số dòng bị ảnh hưởng là `0`.
+- Đảm bảo tính nhất quán qua các yếu tố: quyền sở hữu (ownership), trạng thái, số lần thử và tính lũy đẳng (idempotent effect).
 
-> **Nói ngắn gọn:** test phải chứng minh disjoint ownership và recovery, không chỉ
-> chứng minh query có chứa chuỗi `SKIP LOCKED`.
+> **Nói ngắn gọn:** Các kịch bản kiểm thử phải chứng minh được việc phân tách quyền sở hữu độc lập (disjoint ownership) và khả năng phục hồi sau sự cố, chứ không chỉ đơn thuần là kiểm tra xem câu truy vấn có chứa chuỗi `SKIP LOCKED` hay không.
 
 ## PostgreSQL Testcontainers fixture
 
@@ -109,8 +108,7 @@ static void await(CountDownLatch latch, String description) {
 }
 ```
 
-Mọi session đặt `statement_timeout`, test dùng `Future.get(timeout)` làm outer
-watchdog.
+Tất cả các kết nối (session) đều phải đặt `statement_timeout`. Mã kiểm thử dùng `Future.get(timeout)` làm hàng rào bảo vệ (watchdog) bên ngoài để ngăn test bị treo.
 
 ## Thí nghiệm 1 — Plain SELECT trả duplicate IDs
 
@@ -142,8 +140,7 @@ void plainSelectDoesNotClaim() throws Exception {
 
 ## Thí nghiệm 2 — Blocking `FOR UPDATE` tạo convoy
 
-Holder lock J1. Waiter chạy ordered `LIMIT 1 FOR UPDATE` với
-`lock_timeout='200ms'`:
+Chúng ta dùng một giao dịch giữ khóa công việc J1 (Holder). Sau đó một worker khác (Waiter) chạy truy vấn `LIMIT 1 FOR UPDATE` có sắp xếp và kèm theo `lock_timeout='200ms'`:
 
 ```java
 assertThat(waiter.get(5, TimeUnit.SECONDS)).isEqualTo("55P03");
@@ -152,8 +149,7 @@ releaseHolder.countDown();
 holder.get(5, TimeUnit.SECONDS);
 ```
 
-Wait graph chỉ có waiter → holder, không có cycle. Test không gọi outcome này là
-deadlock.
+Biểu đồ chờ khóa (Wait graph) lúc này chỉ có Waiter đang chờ Holder, không hề có vòng lặp (cycle) nào. Do đó, đây không phải là lỗi deadlock, mà đơn thuần là sự tắc nghẽn chờ tài nguyên.
 
 ## Thí nghiệm 3 — `SKIP LOCKED` lấy row kế tiếp
 
@@ -226,12 +222,11 @@ void concurrentClaimBatchesNeverOverlap() throws Exception {
 }
 ```
 
-Service calls phải đi qua Spring proxy để returned batches chỉ được dùng sau
-commit.
+Các lời gọi thông qua Service bắt buộc phải đi qua Spring proxy, đảm bảo rằng lô công việc trả về chỉ có thể được sử dụng SAU KHI giao dịch đã được commit.
 
 ## Atomic claim helper SQL test
 
-Raw JDBC version map `UPDATE RETURNING`:
+Sử dụng JDBC thuần túy để ánh xạ lệnh `UPDATE RETURNING`:
 
 ```java
 static List<ClaimedJob> claim(
@@ -275,8 +270,7 @@ static List<ClaimedJob> claim(
 
 ## Thí nghiệm 5 — Rollback làm job claimable lại
 
-Một connection chạy claim SQL nhưng rollback thay commit. Sau rollback, second
-connection claim:
+Một kết nối thực thi câu lệnh SQL lấy việc nhưng sau đó lại gọi `rollback` thay vì `commit`. Ngay sau đó, một kết nối thứ hai tiến hành lấy việc:
 
 ```java
 assertThat(firstUncommittedIds).containsExactly(jobId(1));
@@ -285,21 +279,20 @@ assertThat(job(jobId(1)).status()).isEqualTo("PROCESSING");
 assertThat(job(jobId(1)).attemptCount()).isEqualTo(1);
 ```
 
-Attempt increment của rolled-back claim không tồn tại. Connection close không
-commit cũng cho cùng cleanup outcome.
+Lưu ý rằng số lần thử (attempt increment) của lần lấy việc bị rollback xem như không hề tồn tại. Nếu bạn đóng kết nối (connection close) mà không commit, kết quả dọn dẹp hệ thống cũng sẽ hoàn toàn giống như vậy.
 
 ## Thí nghiệm 6 — Stale completion bị từ chối
 
 ```text
-A claim J1/token-A
-test set lease_until vào quá khứ
-sweeper requeue J1
-B claim J1/token-B
-A complete(token-A) → 0
-B complete(token-B) → 1
+Worker A lấy J1, nhận token-A
+Test can thiệp chỉnh sửa lease_until lùi về quá khứ
+Tiến trình quét (sweeper) trả J1 lại hàng đợi
+Worker B lấy J1, nhận token-B
+Worker A gọi complete(token-A) → trả về 0 (thất bại)
+Worker B gọi complete(token-B) → trả về 1 (thành công)
 ```
 
-Assertions:
+Xác nhận qua mã kiểm thử (Assertions):
 
 ```java
 assertThat(complete(jobId(1), tokenA)).isZero();
@@ -308,20 +301,19 @@ assertThat(job(jobId(1)).status()).isEqualTo("DONE");
 assertThat(job(jobId(1)).attemptCount()).isEqualTo(2);
 ```
 
-Không dùng system sleep để chờ lease; test update `lease_until` có kiểm soát hoặc
-inject database clock abstraction.
+Chúng ta không dùng lệnh `sleep` của hệ thống để đợi hết hạn thuê; thay vào đó, mã kiểm thử sẽ chủ động cập nhật `lease_until` một cách có kiểm soát, hoặc dùng cơ chế giả lập đồng hồ cơ sở dữ liệu (database clock abstraction).
 
 ## Thí nghiệm 7 — External effect idempotent sau crash
 
-Fake sink lưu unique `effect_key = job_id`:
+Một điểm cuối giả lập (Fake sink) lưu giữ một khóa duy nhất `effect_key = job_id`:
 
 ```text
-B claim J1 → sink apply(J1) → simulate crash trước complete
-expire/reclaim → C process J1 → sink apply(J1) replay
-C complete current token
+Worker B lấy J1 → gọi sink apply(J1) → giả lập sự cố (crash) trước khi báo hoàn thành
+Hết hạn thuê/Bị lấy lại → Worker C lấy J1 → gọi sink apply(J1) thêm lần nữa
+Worker C báo hoàn thành thành công với token hiện tại
 ```
 
-Assert:
+Xác nhận:
 
 ```java
 assertThat(sink.deliveryAttempts(jobId(1))).isEqualTo(2);
@@ -329,32 +321,26 @@ assertThat(sink.committedEffects(jobId(1))).isEqualTo(1);
 assertThat(job(jobId(1)).status()).isEqualTo("DONE");
 ```
 
-Fake sink phải model atomic unique claim; một in-memory list không đồng bộ không
-phải bằng chứng idempotency.
+Điểm cuối giả lập (Fake sink) phải thiết kế mô phỏng được việc kiểm tra lấy việc độc nhất (atomic unique claim); việc chỉ dùng một danh sách trên bộ nhớ (in-memory list) không được đồng bộ sẽ không đủ để chứng minh tính lũy đẳng (idempotency).
 
 ## Thí nghiệm 8 — Table lock vẫn có thể chặn
 
-Session DDL:
+Mở một phiên giao dịch (Session) thực hiện DDL:
 
 ```sql
 lock table work_job in access exclusive mode;
 ```
 
-Poller `FOR UPDATE SKIP LOCKED` vẫn cần relation `ROW SHARE`, nên nhận `55P03`
-theo bounded `lock_timeout`. Test này khóa nuance: skip chỉ áp dụng row-level
-locks.
+Dù worker gọi `FOR UPDATE SKIP LOCKED`, lệnh này vẫn yêu cầu khóa `ROW SHARE` trên toàn bảng. Do đó, truy vấn vẫn sẽ bị chặn và báo lỗi `55P03` khi hết giới hạn `lock_timeout`. Bài kiểm thử này làm rõ một chi tiết quan trọng: cơ chế bỏ qua (skip) chỉ có tác dụng đối với các khóa ở cấp độ dòng (row-level locks) mà thôi.
 
 ## Thí nghiệm 9 — Fairness và starvation
 
-Hai tests riêng:
+Chúng ta thực hiện hai kịch bản kiểm thử riêng biệt:
 
-1. Không contention: claim từng batch size 1 và assert order theo
-   `priority DESC, available_at, job_id`.
-2. Holder giữ oldest row: N bounded polls claim later rows; oldest không xuất hiện
-   khi locked. Sau release/rollback, next poll phải claim oldest.
+1. Khi không có tắc nghẽn (contention): Lấy việc từng lô một (batch size = 1) và đảm bảo thứ tự lấy ra luôn tuân theo `priority DESC, available_at, job_id`.
+2. Khi một giao dịch (Holder) cố tình giữ dòng cũ nhất: Nhiều lần lấy việc liên tiếp sẽ đành phải lấy các công việc mới hơn; công việc cũ nhất sẽ không thể xuất hiện trong kết quả. Tuy nhiên, ngay sau khi Holder thả khóa hoặc rollback, lần lấy việc tiếp theo BẮT BUỘC phải lấy được công việc cũ nhất đó.
 
-Không assert strict FIFO dưới contention. Stress test hữu hạn thêm priority mix,
-ghi oldest-ready age và bảo đảm mọi job cuối cùng DONE/DEAD trong deadline.
+Chúng ta tuyệt đối không mong chờ thứ tự "vào trước ra trước" (strict FIFO) một cách cứng nhắc khi hệ thống đang tắc nghẽn. Thay vào đó, trong các bài stress test, bạn nên thêm các độ ưu tiên khác nhau, ghi nhận lại độ tuổi của công việc cũ nhất (oldest-ready age) và phải đảm bảo rằng trong thời gian giới hạn (deadline), mọi công việc cuối cùng đều sẽ được hoàn thành (DONE) hoặc hủy (DEAD).
 
 ## Core helpers
 
@@ -385,31 +371,28 @@ static List<UUID> selectReady(
 }
 ```
 
-Production code không build SQL từ untrusted input; helper chỉ chọn constant test
-clauses.
+Lưu ý rằng mã trên môi trường thực tế (Production code) tuyệt đối không được phép ghép chuỗi SQL từ đầu vào của người dùng. Hàm trợ giúp này chỉ dùng riêng cho các tham số hằng số của môi trường kiểm thử.
 
 ## Ma trận bao phủ
 
-| Thí nghiệm | Cơ chế | Business assertion |
+| Thí nghiệm | Cơ chế kiểm tra | Yêu cầu logic (Business assertion) |
 | --- | --- | --- |
-| 1 | Plain SELECT barrier | Duplicate IDs, state vẫn READY |
-| 2 | Blocking row lock | `55P03`, convoy không phải deadlock |
-| 3 | `SKIP LOCKED` | J1 locked, worker lấy J2 |
-| 4 | Atomic concurrent claim | Hai disjoint batches, unique tokens |
-| 5 | Rollback/connection close | Same job claimable, attempt không tăng giả |
-| 6 | Lease + token | Stale complete `0`, current owner `1` |
-| 7 | Idempotent sink | Hai deliveries, một effect |
-| 8 | `ACCESS EXCLUSIVE` | Skip không bỏ qua table lock |
-| 9 | Order/starvation | Stable preference, eventual claim sau release |
+| 1 | Lỗi SELECT thông thường | Trả về ID trùng lặp, trạng thái vẫn là READY |
+| 2 | Khóa dòng chặn luồng (Blocking row lock) | Phát sinh `55P03`, kẹt xe (convoy) không phải deadlock |
+| 3 | Lách khóa `SKIP LOCKED` | Bỏ qua J1 đang khóa, worker lấy ngay J2 |
+| 4 | Lấy việc song song nguyên tử | Nhận về hai lô riêng biệt, token định danh độc nhất |
+| 5 | Giao dịch bị Rollback/Đóng kết nối | Cùng công việc vẫn có thể được lấy lại, số lần thử không tăng |
+| 6 | Thẻ định danh và thời hạn thuê | Hoàn thành trễ báo `0`, chủ sở hữu mới báo `1` |
+| 7 | Đích đến lũy đẳng (Idempotent sink) | Hai lần thử giao, nhưng chỉ ghi một kết quả |
+| 8 | Khóa độc quyền `ACCESS EXCLUSIVE` | Lách khóa (Skip) không thể vượt qua khóa bảng (table lock) |
+| 9 | Thứ tự / Chống chết đói (starvation) | Duy trì tính ưu tiên ổn định, sau khi nhả khóa sẽ lấy được việc |
 
 ## Chống flaky và xác minh production
 
-- Barrier/latches đặt sau exact lock/read point.
-- `lock_timeout < statement_timeout < Future` watchdog.
-- Không dùng fixed sleep; mọi wait bounded.
-- Rollback/close connections và shutdown executor trong cleanup.
-- Khi timeout, thu `pg_stat_activity`, `pg_locks`, `pg_blocking_pids`.
-- Theo dõi claim latency, empty poll, oldest READY age, expired lease, reclaim,
-  stale completion, DEAD và downstream dedupe.
-- Query plan/index được kiểm tra với volume gần production; không tạo benchmark
-  numbers từ Testcontainers laptop.
+- Đặt rào chắn (barrier/latches) ngay sau điểm khóa/đọc dữ liệu chính xác.
+- Đặt rào bảo vệ theo thứ tự `lock_timeout < statement_timeout < Future`.
+- Tuyệt đối không dùng thời gian ngủ cố định (fixed sleep); mọi thao tác chờ đều phải có giới hạn.
+- Đảm bảo thực hiện rollback, đóng kết nối và tắt tiến trình thực thi (executor) trong phần dọn dẹp hệ thống (cleanup).
+- Nếu gặp lỗi hết giờ (timeout), phải tự động thu thập `pg_stat_activity`, `pg_locks`, `pg_blocking_pids` để tiện gỡ lỗi.
+- Liên tục theo dõi độ trễ lấy việc, tần suất truy vấn rỗng, độ tuổi lớn nhất của trạng thái READY, số lần quá hạn thuê, số lần lấy lại công việc, số lần hoàn thành trễ, tỷ lệ bị DEAD và tính năng chống trùng lặp của hệ thống phía sau.
+- Kế hoạch thực thi truy vấn (query plan) và chỉ mục (index) bắt buộc phải được thử nghiệm với khối lượng dữ liệu gần với môi trường production; tuyệt đối không lấy chỉ số benchmark từ môi trường Testcontainers trên máy tính cá nhân!

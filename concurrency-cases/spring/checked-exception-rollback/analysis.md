@@ -1,6 +1,6 @@
-# Rollback classification analysis
+# Phân tích việc phân loại rollback (Rollback classification analysis)
 
-## Initial state
+## Trạng thái ban đầu
 
 ```text
 payout_request:
@@ -15,15 +15,14 @@ wallet_account:
   available_balance = 1000
 
 ledger_entry:
-  no PAYOUT_HOLD for P-42
+  không có PAYOUT_HOLD nào cho P-42
 ```
 
-Dispatcher chỉ lấy payout có `status = PROCESSING`. Beneficiary registry đã chứa
-`B-BLOCKED`, nên policy chắc chắn ném `BeneficiaryRejectedException`.
+Tiến trình điều phối (Dispatcher) chỉ tiến hành lấy các giao dịch chi trả có `status = PROCESSING`. Do danh sách người thụ hưởng bị cấm (Beneficiary registry) đã chứa ID `B-BLOCKED`, chính sách kiểm tra chắc chắn sẽ ném ra ngoại lệ `BeneficiaryRejectedException`.
 
-## Expected versus actual
+## Kỳ vọng so với Thực tế
 
-Expected khi method ném declared business rejection:
+Kỳ vọng khi phương thức ném ra sự từ chối nghiệp vụ (business rejection) đã khai báo:
 
 ```text
 payout.status       = RECEIVED
@@ -33,7 +32,7 @@ dispatchable        = false
 transaction outcome = ROLLED_BACK
 ```
 
-Broken actual:
+Lỗi thực tế (Broken actual):
 
 ```text
 payout.status       = PROCESSING
@@ -44,118 +43,98 @@ transaction outcome = COMMITTED
 caller outcome      = BeneficiaryRejectedException
 ```
 
-Hai outcomes cuối mâu thuẫn nhau. Caller nhìn control-flow failure; các node khác
-nhìn durable success state.
+Hai kết quả (outcomes) cuối cùng lại mâu thuẫn hoàn toàn với nhau. Caller chỉ nhìn thấy luồng điều khiển thất bại (control-flow failure); trong khi các máy chủ khác lại nhìn thấy trạng thái thành công bền vững trong cơ sở dữ liệu (durable success state).
 
-## Timeline hai actor
+## Trình tự thời gian của hai tác nhân (Timeline hai actor)
 
-| Bước | Request A — App node 1 | Dispatcher B — App node 2 |
-| --- | --- | --- |
-| T0 | Proxy mở Tx-A | Poll chưa thấy P-42 |
-| T1 | Lock payout và wallet rows | |
-| T2 | Set `PROCESSING`, balance `1000 -> 700`, persist hold | |
-| T3 | Policy ném checked exception | |
-| T4 | Spring rollback rule trả `false`; Hibernate flush nếu cần | |
-| T5 | Tx-A commit, release row locks | |
-| T6 | | Query mới thấy P-42 `PROCESSING` |
-| T7 | Proxy rethrow exception; caller nhận rejected | Claim/dispatch P-42 |
+| Bước | Yêu cầu A (Request A) — App node 1 | Tiến trình điều phối B (Dispatcher B) — App node 2 |
+| ---: | --- | --- |
+| T0 | Proxy mở giao dịch Tx-A | Truy vấn (poll) nhưng chưa thấy P-42 |
+| T1 | Khóa các dòng payout và wallet | |
+| T2 | Đặt `PROCESSING`, giảm balance `1000 -> 700`, lưu hold | |
+| T3 | Chính sách ném ngoại lệ có kiểm tra | |
+| T4 | Spring rollback rule đánh giá và trả về `false`; Hibernate có thể đẩy SQL (flush) nếu cần | |
+| T5 | Tx-A commit thành công, giải phóng khóa dòng (row locks) | |
+| T6 | | Truy vấn mới nhìn thấy P-42 đang `PROCESSING` |
+| T7 | Proxy ném lại ngoại lệ ra ngoài; caller nhận kết quả rejected | Tiến hành lấy và điều phối P-42 |
 
-T6 có thể xảy ra trước khi caller xử lý T7 vì commit nằm bên trong interceptor,
-trước exception được rethrow ra ngoài proxy.
+Sự kiện ở mốc T6 hoàn toàn có thể xảy ra trước khi caller kịp xử lý mốc T7. Nguyên nhân là do thao tác commit nằm ẩn bên trong trình chặn (interceptor) và hoàn tất trước khi ngoại lệ được đẩy lại ra bên ngoài proxy.
 
-> **Nói ngắn gọn:** database visibility mở ra ở commit, còn caller chỉ nhận checked
-> exception sau commit; dispatcher có thể hành động trên state trái với API outcome.
+> **Nói ngắn gọn:** Dữ liệu mới sẽ hiển thị cho mọi người ngay tại thời điểm commit, trong khi caller chỉ nhận được ngoại lệ sau khi thao tác commit này đã xong; tiến trình điều phối có thể hành động trên một trạng thái hoàn toàn trái ngược với kết quả mà API trả về.
 
-## Root cause chính xác ở Spring layer
+## Cội nguồn vấn đề nằm ở tầng Spring
 
-`@Transactional` dùng một rollback rule để quyết định outcome khi method ném
-throwable. Default convention:
+Chú thích `@Transactional` sử dụng một quy tắc rollback (rollback rule) để quyết định kết quả cuối cùng khi phương thức ném ra một ngoại lệ. Theo quy ước mặc định của Spring:
 
-- rollback với `RuntimeException` và subclass;
-- rollback với `Error` và subclass;
-- không rollback với checked `Exception` theo mặc định.
+- Giao dịch sẽ rollback nếu gặp `RuntimeException` và các lớp con của nó;
+- Giao dịch sẽ rollback nếu gặp `Error` và các lớp con của nó;
+- **Giao dịch sẽ không rollback với ngoại lệ có kiểm tra `Exception` theo mặc định.**
 
-`BeneficiaryRejectedException extends Exception`, nên default rule xem nó là
-exception không yêu cầu rollback. Transaction interceptor đi vào commit path rồi
-rethrow original exception.
+Do lớp `BeneficiaryRejectedException extends Exception`, quy tắc mặc định xem đây là một ngoại lệ không đòi hỏi phải rollback. Trình chặn giao dịch (Transaction interceptor) cứ thản nhiên đi tiếp vào luồng commit rồi mới ném lại ngoại lệ gốc ra ngoài.
 
-Java compiler rule về `throws` và Spring transaction rule là hai hệ thống độc lập.
-`throws` chỉ buộc caller handle/declare checked exception; nó không mang metadata
-“rollback transaction”.
+Quy tắc của trình biên dịch Java (compiler rule) về từ khóa `throws` và quy tắc giao dịch của Spring là hai hệ thống hoàn toàn độc lập. Từ khóa `throws` chỉ bắt buộc người gọi (caller) phải xử lý hoặc khai báo ngoại lệ có kiểm tra đó; nó không hề mang theo dữ liệu siêu mô tả (metadata) rằng "hãy rollback giao dịch này đi".
 
-## Physical transaction và logical scope
+## Giao dịch vật lý và Phạm vi logic (Physical transaction và logical scope)
 
-Khi `prepare()` không có outer transaction, proxy tạo physical transaction và tự
-commit nó sau checked exception.
+Khi hàm `prepare()` không nằm trong một giao dịch bên ngoài (outer transaction), proxy sẽ tạo ra một giao dịch vật lý thực sự và tự động commit nó sau khi gặp ngoại lệ có kiểm tra.
 
-Khi `prepare()` join outer transaction bằng `REQUIRED`, outcome phụ thuộc toàn bộ
-call chain:
+Khi hàm `prepare()` tham gia (join) vào một giao dịch bên ngoài bằng chính sách `REQUIRED`, kết quả cuối cùng sẽ phụ thuộc vào toàn bộ chuỗi gọi hàm (call chain):
 
-- inner không có `rollbackFor`: checked exception không đánh dấu rollback-only;
-- outer để cùng checked exception thoát ra với default rule: outer cũng commit;
-- outer catch/swallow exception: outer tiếp tục và có thể commit;
-- inner có `rollbackFor`: participating transaction được đánh dấu rollback-only;
-- outer catch exception rồi cố commit: thường nhận `UnexpectedRollbackException`.
+- Nếu hàm bên trong (inner) không có `rollbackFor`: ngoại lệ có kiểm tra sẽ không đánh dấu cờ rollback-only;
+- Nếu hàm bên ngoài (outer) để cùng loại ngoại lệ có kiểm tra này thoát ra theo quy tắc mặc định: hàm bên ngoài cũng sẽ commit;
+- Nếu hàm bên ngoài bắt và nuốt luôn (catch/swallow) ngoại lệ: hàm bên ngoài tiếp tục chạy và có thể commit;
+- Nếu hàm bên trong có `rollbackFor`: giao dịch tham gia sẽ được đánh dấu cờ rollback-only;
+- Nếu hàm bên ngoài bắt ngoại lệ rồi vẫn cố gắng gọi commit: nó thường sẽ nhận về lỗi `UnexpectedRollbackException`.
 
-Vì vậy rollback contract phải được đặt ở boundary và exception phải đi qua đúng
-proxy. Case SPR-001 vẫn áp dụng cho self-invocation.
+Vì vậy, cam kết về việc xử lý khi thất bại (rollback contract) phải được định nghĩa rõ ràng ở ranh giới ngoài cùng, và ngoại lệ bắt buộc phải đi xuyên qua đúng proxy. Bài học từ case SPR-001 vẫn áp dụng cho trường hợp gọi hàm nội bộ (self-invocation).
 
-## Hibernate flush không phải nguyên nhân
+## Lệnh flush của Hibernate không phải là nguyên nhân
 
-Managed entity mutations có thể chưa tạo SQL ngay. Hibernate thường dirty-check
-và flush trước commit; một query hoặc explicit `flush()` cũng có thể flush sớm.
+Các đột biến (mutations) trên thực thể bị quản lý (managed entity) có thể chưa sinh ra câu lệnh SQL ngay lập tức. Hibernate thường sẽ kiểm tra trạng thái bẩn (dirty-check) và tự động flush trước khi commit; hoặc một truy vấn khác, hay một lệnh `flush()` thủ công cũng có thể đẩy SQL đi sớm hơn.
 
-Hai variants:
+Hai biến thể về thời gian:
 
 ```text
-late flush: checked exception -> commit path -> flush SQL -> COMMIT
-early flush: SQL sent -> checked exception -> commit path -> COMMIT
+Flush trễ (late flush): ngoại lệ có kiểm tra -> luồng commit -> flush sinh SQL -> COMMIT
+Flush sớm (early flush): SQL đã đẩy đi -> ngoại lệ có kiểm tra -> luồng commit -> COMMIT
 ```
 
-Nếu rollback rule đúng:
+Nếu quy tắc rollback được cấu hình đúng:
 
 ```text
-early flush: SQL sent -> checked exception -> ROLLBACK
+Flush sớm: SQL đã đẩy đi -> ngoại lệ có kiểm tra -> ROLLBACK
 ```
 
-SQL đã chạy trong transaction vẫn được PostgreSQL undo khi rollback. Vì thế
-`saveAndFlush()` không làm state “quá muộn để rollback”, và bỏ nó cũng không sửa
-default classification.
+Những lệnh SQL đã chạy trong giao dịch vẫn sẽ được PostgreSQL đảo ngược hoàn toàn (undo) khi có lệnh rollback. Vì thế, việc gọi `saveAndFlush()` không hề làm cho trạng thái dữ liệu bị "quá muộn để rollback", và loại bỏ nó đi cũng không sửa được bản chất quy tắc phân loại mặc định.
 
-## PostgreSQL snapshot và locks
+## MVCC Snapshot và Khóa dòng của PostgreSQL (PostgreSQL snapshot và locks)
 
-Isolation mặc định `READ COMMITTED` đủ để chứng minh case:
+Mức độ cô lập mặc định `READ COMMITTED` là đủ để chứng minh vấn đề trong case này:
 
-- Tx-A giữ row locks từ pessimistic SELECT/update đến commit hoặc rollback;
-- dispatcher transaction trước T5 không thấy uncommitted changes;
-- query bắt đầu sau T5 thấy committed `PROCESSING` state;
-- nếu Tx-A rollback đúng, dispatcher không bao giờ thấy intermediate mutations;
-- PostgreSQL không biết Java exception mang ý nghĩa business gì.
+- Giao dịch Tx-A sẽ giữ các khóa dòng (row locks) từ lúc bắt đầu đọc/ghi cho đến tận khi commit hoặc rollback;
+- Giao dịch của tiến trình điều phối nếu xảy ra trước mốc T5 sẽ không thể nhìn thấy các thay đổi chưa được commit;
+- Nếu truy vấn bắt đầu sau mốc T5, nó chắc chắn nhìn thấy trạng thái `PROCESSING` đã được commit;
+- Nếu Tx-A được phép rollback đúng đắn, tiến trình điều phối sẽ không bao giờ nhìn thấy các đột biến trạng thái trung gian (intermediate mutations);
+- Cơ sở dữ liệu PostgreSQL hoàn toàn không có khả năng hiểu ngoại lệ của Java mang ý nghĩa nghiệp vụ (business) gì.
 
-Row lock giải quyết write interleaving trên cùng rows. Nó không quyết định commit
-hay rollback và không thể ngăn một state hợp lệ về SQL nhưng sai theo failure
-contract trở nên visible.
+Khóa dòng chỉ giải quyết rủi ro ghi đè dữ liệu (write interleaving) trên cùng một dòng. Nó không có thẩm quyền quyết định giao dịch đó sẽ commit hay rollback, và càng không thể ngăn chặn một trạng thái hoàn toàn đúng về mặt cú pháp SQL (nhưng sai bét theo cam kết thất bại nghiệp vụ) trở nên hiển thị cho hệ thống.
 
-## Vì sao đây vẫn là concurrency problem?
+## Vì sao đây vẫn được coi là lỗi đồng thời (Concurrency problem)?
 
-Một request đơn lẻ đã tạo inconsistent outcome. Concurrency làm hậu quả operational
-hơn: dispatcher, retry request, reconciliation job và node khác phản ứng với commit
-trước khi con người hiểu exception log.
+Ngay cả một yêu cầu đơn lẻ (single request) cũng đã tạo ra một kết quả mâu thuẫn (inconsistent outcome). Yếu tố đồng thời (concurrency) chỉ làm cho hậu quả vận hành (operational) trở nên rõ ràng và trầm trọng hơn: tiến trình điều phối, yêu cầu thử lại, hệ thống đối soát và các máy chủ khác sẽ phản ứng ngay lập tức với dữ liệu vừa commit từ trước khi con người kịp hiểu ra dòng cảnh báo ngoại lệ trong log.
 
-Shared state không nằm trong JVM; nó nằm ở PostgreSQL. Một `synchronized` quanh
-`prepare()` trên App node 1:
+Trạng thái chia sẻ (Shared state) ở đây không nằm trong bộ nhớ máy ảo Java (JVM) mà nằm ở cơ sở dữ liệu PostgreSQL. Nếu bạn cố bọc một khối `synchronized` quanh hàm `prepare()` trên máy chủ số 1:
 
-- không đổi rollback rule;
-- không chặn dispatcher trên App node 2;
-- không đảo durable commit;
-- không bảo vệ retry đi qua instance khác.
+- Nó không hề làm thay đổi quy tắc rollback mặc định;
+- Nó không thể chặn tiến trình điều phối đang chạy trên máy chủ số 2;
+- Nó không thể đảo ngược (undo) được bản ghi commit vĩnh viễn (durable commit);
+- Nó không bảo vệ được nếu yêu cầu thử lại vô tình chuyển hướng sang máy chủ khác.
 
-Database transaction outcome và executable-state predicate mới là authoritative
-coordination boundary.
+Kết quả của giao dịch cơ sở dữ liệu (Database transaction outcome) và quy tắc kiểm tra trạng thái có thể thực thi (executable-state predicate) mới thực sự là ranh giới phối hợp có uy quyền tuyệt đối (authoritative coordination boundary).
 
-## Catching làm thay đổi điều proxy quan sát
+## Việc chủ động bắt ngoại lệ (Catching) làm thay đổi những gì proxy quan sát được
 
-Broken variant:
+Ví dụ về việc xử lý sai lầm (Broken variant):
 
 ```java
 @Transactional(rollbackFor = BeneficiaryRejectedException.class)
@@ -170,83 +149,64 @@ public PreparationResult prepare(UUID payoutId) {
 }
 ```
 
-Exception không thoát khỏi method, nên interceptor không áp dụng `rollbackFor`.
-Nếu code đã mutate executable state trước catch và không sửa lại, transaction vẫn
-commit.
+Do ngoại lệ không hề thoát ra khỏi phương thức, trình chặn (interceptor) sẽ không bao giờ thấy nó để mà áp dụng quy tắc `rollbackFor`. Nếu trong mã lệnh của bạn đã lỡ sửa trạng thái thành có thể thực thi trước khi gọi khối catch và không chịu khôi phục (sửa lại) nó, giao dịch sẽ vẫn vui vẻ tiến hành commit.
 
-Credible choices:
+Những lựa chọn đáng tin cậy (Credible choices):
 
-- rethrow để proxy rollback;
-- validate trước mutation rồi commit explicit `REJECTED` result;
-- mark rollback-only programmatically khi API buộc phải return;
-- tách rejected audit record sang một transaction độc lập có chủ đích.
+- Ném lại (rethrow) để proxy tiến hành rollback;
+- Thực hiện kiểm tra tính hợp lệ (validate) từ trước khi thay đổi dữ liệu, rồi sau đó commit kết quả tường minh là `REJECTED`;
+- Chủ động đánh dấu cờ rollback-only bằng mã lập trình (programmatically) khi bắt buộc API phải trả về dữ liệu (return);
+- Tách riêng bản ghi kiểm toán bị từ chối (rejected audit record) sang một giao dịch độc lập hoàn toàn có chủ đích.
 
-Không vừa swallow exception vừa kỳ vọng annotation thấy nó.
+Không thể vừa bắt và nuốt ngoại lệ (swallow exception) lại vừa kỳ vọng cái annotation trên đầu tự động thần giao cách cảm mà rollback giúp bạn.
 
-## Exception translation và wrapping
+## Dịch thuật và bao bọc ngoại lệ (Exception translation và wrapping)
 
-Nếu code wrap checked exception thành `RuntimeException`, default rollback xảy ra.
-Nhưng exception hierarchy phải diễn đạt failure contract, không chỉ phục vụ một
-framework default.
+Nếu mã nguồn bọc một ngoại lệ có kiểm tra thành một ngoại lệ `RuntimeException`, thì quy tắc rollback mặc định sẽ xảy ra. Tuy nhiên, cấu trúc thứ bậc của các ngoại lệ (exception hierarchy) phải thể hiện rõ cam kết nghiệp vụ (failure contract), chứ không chỉ sinh ra để phục vụ cho sự tiện lợi mặc định của một framework.
 
-Ngược lại, wrap một unchecked data-access failure vào checked exception có thể vô
-tình đổi rollback thành commit nếu transaction chưa được đánh dấu rollback-only.
-Spring-translated `DataAccessException` vốn là unchecked; đừng làm mất signal khi
-chuyển abstraction layer.
+Ngược lại, nếu bạn đem bọc một lỗi truy cập dữ liệu không kiểm tra (unchecked data-access failure) vào trong một ngoại lệ có kiểm tra, bạn có thể vô tình biến thao tác rollback thành commit nếu như giao dịch đó chưa được đánh dấu rollback-only. Lỗi `DataAccessException` do Spring chuyển đổi vốn là một lỗi không kiểm tra; đừng làm mất đi tín hiệu cảnh báo quan trọng này khi bạn chuyển tiếp giữa các tầng trừu tượng (abstraction layer).
 
-Ưu tiên type-safe:
+Nên ưu tiên cấu hình an toàn về kiểu (type-safe):
 
 ```java
 rollbackFor = BeneficiaryRejectedException.class
 ```
 
-String-based class-name rules dễ match rộng hoặc sai khi tên exception trùng một
-phần. Nếu dùng shared meta-annotation, integration test phải chứng minh effective
-behavior, không chỉ inspect annotation.
+Việc dùng chuỗi tên lớp (String-based class-name rules) rất dễ bị khớp nhầm (match rộng) hoặc báo lỗi nếu tên ngoại lệ trùng nhau một phần. Nếu bạn sử dụng các siêu chú thích dùng chung (shared meta-annotation), thì bài kiểm thử tích hợp (integration test) bắt buộc phải chứng minh được hành vi thực tế (effective behavior), chứ không chỉ dùng để soi xem có annotation hay không.
 
-## Commit cũng có thể thất bại
+## Thao tác commit cũng có thể thất bại
 
-Default rule chọn commit không bảo đảm commit thành công. Flush có thể gặp unique
-constraint, lock timeout hoặc connection failure; caller khi đó có thể nhận một
-transaction/data-access exception khác.
+Việc quy tắc mặc định quyết định "hãy commit đi" không đồng nghĩa với việc commit chắc chắn thành công. Quá trình flush có thể vi phạm điều kiện dữ liệu duy nhất (unique constraint), hết thời gian chờ khóa (lock timeout) hoặc rớt kết nối; khi đó, người gọi có thể sẽ nhận lại một lỗi hoàn toàn khác (transaction/data-access exception).
 
-Case này giả định commit thành công để cô lập rollback classification. Remote
-timeout/unknown external outcome nằm ngoài scope.
+Case này giả định việc commit thành công là để cô lập phân tích riêng vấn đề phân loại ngoại lệ rollback. Việc hết thời gian gọi I/O từ xa hay không rõ kết quả của hệ thống ngoài đều nằm ngoài phạm vi phân tích.
 
-## Retry và duplicate command
+## Thử lại và Lệnh trùng lặp (Retry và duplicate command)
 
-Caller thấy checked exception có thể retry P-42 hoặc gửi command mới:
+Caller khi thấy ngoại lệ có kiểm tra có thể sẽ thử gọi lại (retry) P-42 hoặc phát một lệnh hoàn toàn mới:
 
-- retry cùng ID gặp `PROCESSING`, không phải initial state;
-- retry ID mới có thể giữ tiền lần nữa nếu không có idempotency constraint;
-- unique ledger key có thể chặn duplicate ledger nhưng không tự hoàn tác state
-  `PROCESSING`;
-- retry mù không sửa durable outcome đầu tiên.
+- Nếu gọi lại cùng ID, nó sẽ bị vấp phải trạng thái `PROCESSING`, thay vì trạng thái ban đầu `RECEIVED`;
+- Nếu gọi ID mới, hệ thống có thể sẽ giữ tiền thêm một lần nữa nếu không có ràng buộc về tính lũy đẳng (idempotency constraint);
+- Một khóa duy nhất của sổ cái (unique ledger key) có thể chặn được bản ghi trùng lặp nhưng lại không thể tự động đảo ngược trạng thái đang `PROCESSING` của đơn hàng;
+- Việc nhắm mắt nhắm mũi thử lại (retry mù) sẽ không sửa được kết quả bền vững đã lỡ sai ở lần thử đầu tiên.
 
-Idempotency vẫn cần cho command delivery, nhưng không thay thế rollback rule. Hai
-cơ chế bảo vệ hai invariants khác nhau.
+Tính lũy đẳng (Idempotency) vẫn rất cần thiết để xử lý quá trình chuyển giao lệnh (command delivery), nhưng nó không sinh ra để thay thế quy tắc rollback (rollback rule). Hai cơ chế này bảo vệ cho hai rào chắn tính đúng đắn hoàn toàn khác nhau.
 
-## Crash behavior
+## Hành vi khi sự cố xảy ra (Crash behavior)
 
-- Crash trước PostgreSQL commit: connection close làm transaction rollback.
-- Crash sau commit nhưng trước API response: state committed, caller không biết
-  outcome; đây là ambiguous response case khác.
-- Checked exception path ở case này không cần crash: proxy chủ động commit rồi
-  rethrow.
-- Dispatcher crash sau claim cần recovery/idempotency riêng, không thay đổi root
-  cause của SPR-005.
+- Sập trước khi PostgreSQL kịp commit: Việc mất kết nối (connection close) sẽ khiến giao dịch bị rollback.
+- Sập sau khi đã commit nhưng trước khi trả về (API response): Dữ liệu đã bền vững nhưng người gọi không rõ kết quả; đây lại là bài toán mơ hồ về kết quả phản hồi.
+- Trong trường hợp lỗi do checked exception: Tiến trình không cần phải sập; proxy sẽ tự động commit êm đẹp rồi ném ra ngoại lệ.
+- Tiến trình điều phối (Dispatcher) sập sau khi đã giữ công việc thì cần cơ chế khôi phục và lũy đẳng độc lập; việc đó không hề làm thay đổi nguyên nhân cốt lõi của SPR-005.
 
-## Observability
+## Khả năng quan sát (Observability)
 
-Nên ghi nhận cùng correlation identifiers:
+Nên luôn ghi nhận kèm theo các bộ định danh tương quan (correlation identifiers):
 
-- payout ID, command/idempotency key và transaction name;
-- domain outcome `READY`/`REJECTED`;
-- transaction completion status từ test/diagnostic instrumentation;
-- committed payout state và ledger reconciliation result;
-- dispatcher claim sau rejection;
-- `UnexpectedRollbackException` nếu outer scope swallow một inner rollback.
+- ID chi trả (payout ID), mã khóa lệnh lũy đẳng (command/idempotency key) và tên giao dịch;
+- Kết quả xử lý nghiệp vụ `READY` / `REJECTED`;
+- Trạng thái hoàn tất của giao dịch thu thập từ các công cụ chuẩn đoán/kiểm thử (test/diagnostic instrumentation);
+- Đối chiếu trạng thái đã commit của giao dịch chi trả với bản ghi trong sổ cái;
+- Việc lấy việc của tiến trình điều phối diễn ra sau sự từ chối;
+- Lỗi `UnexpectedRollbackException` nếu phạm vi bên ngoài cố tình nuốt chửng việc đòi rollback của phạm vi bên trong.
 
-Không log full beneficiary/bank data. Alert quan trọng là mismatch giữa rejected
-business outcome và committed executable/financial state, không chỉ exception
-count.
+Không ghi log (log) toàn bộ dữ liệu tài khoản hay ngân hàng. Cảnh báo quan trọng nhất chính là sự vênh nhau (mismatch) giữa kết quả nghiệp vụ bị từ chối và trạng thái tài chính vẫn ngang nhiên có thể thực thi dưới cơ sở dữ liệu, chứ không chỉ đơn thuần là đếm số lượng ngoại lệ.

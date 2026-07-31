@@ -1,36 +1,35 @@
-# Bounded saturation experiments
+# Các thí nghiệm với sự quá tải có giới hạn (Bounded saturation experiments)
 
 ## Mục tiêu
 
-Bộ test phải chứng minh:
+Bộ kiểm thử (test) phải chứng minh được:
 
-1. remote wait bên trong transaction giữ Hikari connections;
-2. PostgreSQL lock waiter cũng giữ connection;
-3. unrelated short query fail ở pool acquisition, không phải SQL execution;
-4. split boundary giải phóng pool trong remote wait;
-5. commit phase revalidate stale snapshot;
-6. mọi wait/test cleanup đều bounded.
+1. Việc đứng chờ hệ thống từ xa (remote wait) ngay trong lòng giao dịch sẽ tiếp tục chiếm giữ các kết nối Hikari;
+2. Kẻ đứng đợi khóa (lock waiter) của PostgreSQL cũng sẽ trắng trợn ngậm chặt một kết nối;
+3. Một truy vấn ngắn không liên quan (unrelated short query) sẽ sụp đổ (fail) ngay ở khâu lấy kết nối (pool acquisition), chứ không phải do lỗi khi thực thi lệnh SQL;
+4. Việc bóc tách ranh giới (split boundary) sẽ giải phóng hoàn toàn hồ kết nối trong suốt thời gian chờ hệ thống từ xa;
+5. Giao dịch ở khâu chốt (commit phase) có khả năng từ chối (revalidate) các bản ảnh cũ kỹ rác rưởi (stale snapshot);
+6. Tất thảy mọi tác vụ chờ đợi hay dọn dẹp kiểm thử (wait/test cleanup) đều phải có giới hạn điểm dừng (bounded).
 
-> **Nói ngắn gọn:** ép finite pool full bằng gates, đo active/pending connections,
-> rồi assert committed business state sau cleanup.
+> **Nói ngắn gọn:** Chúng ta sẽ chủ động dồn ép một hồ kết nối có dung lượng giới hạn (finite pool) phải đầy ứ ự bằng các cánh cổng rào (gates), tiến hành đo đạc lượng kết nối đang bận/đang chờ (active/pending connections), rồi dõng dạc xác minh trạng thái nghiệp vụ cuối cùng đã được commit (committed business state) sau khi đã dọn dẹp (cleanup).
 
-## Test topology
+## Cấu trúc bài kiểm thử (Test topology)
 
 ```text
-pool max = 2
+sức chứa của hồ (pool max) = 2
 
-broken:
-  actor A -> Tx/conn-1 -> row lock -> remote gate
-  actor B -> Tx/conn-2 -> row lock -> remote gate hoặc lock wait
-  actor U -> waits for pool -> acquisition timeout
+Bị lỗi (broken):
+  tác nhân A (actor A) -> Giao dịch Tx/conn-1 -> khóa dòng (row lock) -> đụng cửa rào chặn hệ thống từ xa (remote gate)
+  tác nhân B (actor B) -> Giao dịch Tx/conn-2 -> khóa dòng -> đụng cửa rào hệ thống từ xa hoặc đứng ngây ra đợi khóa (lock wait)
+  tác nhân U (actor U) -> đứng chờ hồ kết nối -> hết thời gian chờ mượn (acquisition timeout)
 
-fixed:
-  actor A/B -> snapshot Tx ends -> remote gate (no connection)
-  actor U   -> short query succeeds
-  release A/B -> short apply transactions
+Đã sửa (fixed):
+  tác nhân A/B -> giao dịch chụp ảnh (snapshot Tx) hoàn tất -> đụng cửa rào hệ thống từ xa (và hoàn toàn không giữ kết nối - no connection)
+  tác nhân U   -> câu truy vấn ngắn gọn vượt qua trót lọt (success)
+  thả tác nhân A/B (release A/B) -> chạy tiếp các giao dịch áp dụng ngắn ngủi (short apply transactions)
 ```
 
-## PostgreSQL Testcontainers và Hikari test profile
+## PostgreSQL Testcontainers và thông số thiết lập Hikari (Hikari test profile)
 
 ```java
 @Testcontainers
@@ -49,10 +48,10 @@ class LongTransactionPoolIntegrationTest {
 }
 ```
 
-`400ms` chỉ làm test fail-fast và deterministic; không phải production setting.
-Không annotate test method bằng `@Transactional`.
+Mức ngắt ngưỡng `400ms` chỉ để bảo chứng cho bài test nhanh chóng sụp đổ (fail-fast) một cách rành rọt (deterministic); tuyệt đối đừng mang nó đem cài vào cấu hình thực tế (production setting).
+Nghiêm cấm dùng annotation `@Transactional` trên các phương thức kiểm thử (test method).
 
-Schema:
+Lược đồ (Schema):
 
 ```sql
 create table payment_order (
@@ -65,9 +64,9 @@ create table payment_order (
 );
 ```
 
-Mỗi test insert committed fixtures P-42/P-99 ở `RISK_PENDING`.
+Ở mỗi vòng thi, bộ kiểm thử sẽ rải dữ liệu mồi (insert committed fixtures) với mã P-42/P-99 ở trạng thái `RISK_PENDING`.
 
-## Controlled remote gate
+## Cổng chặn điều hướng hệ thống từ xa (Controlled remote gate)
 
 ```java
 final class RemoteScenario {
@@ -130,9 +129,9 @@ class ControlledRiskClient implements RiskClient {
 }
 ```
 
-`finally` luôn release scenario trước khi shutdown actor executor.
+Khối lệnh `finally` luôn bảo đảm sẽ hạ barie thả trôi lưu lượng (release scenario) trước lúc kết liễu bộ điều phối tác nhân (shutdown actor executor).
 
-## Pool probe
+## Dụng cụ đo lường trạng thái hồ (Pool probe)
 
 ```java
 @Component
@@ -158,7 +157,7 @@ final class PoolProbe {
 }
 ```
 
-Pool metrics là eventual observations. Dùng bounded Awaitility:
+Các chỉ số của hồ chứa (Pool metrics) có bản chất là những quan sát bị trễ nhịp (eventual observations). Vì thế ta phải bám nhờ thư viện Awaitility có giới hạn thời gian (bounded):
 
 ```java
 await()
@@ -169,11 +168,11 @@ await()
     });
 ```
 
-Awaitility polling có deadline; gate vẫn là primary interleaving mechanism.
+Tuy vòng lặp kiểm tra của Awaitility (polling) có thời hạn (deadline) riêng; nhưng cổng chặn (gate) vẫn là cơ chế then chốt dệt nên trật tự xen kẽ các luồng (primary interleaving mechanism).
 
-## Experiment 1 — Hai remote waits làm cạn pool
+## Thí nghiệm 1 — Hai khoảng chờ từ xa (remote waits) vắt cạn cả hồ chứa
 
-Dùng hai payment IDs khác nhau để loại row contention:
+Ta rắp tâm sử dụng hai mã thanh toán (payment IDs) trái ngược nhau để triệt tiêu bài toán cạnh tranh dòng dữ liệu (row contention):
 
 ```java
 @Test
@@ -228,15 +227,13 @@ void remoteWaitInsideTransactionsStarvesUnrelatedQuery()
 }
 ```
 
-`shortQuery.selectOne()` không chạy SQL vì không mượn được connection. Assertion
-root cause phân biệt pool acquisition failure với PostgreSQL statement timeout.
+Hàm `shortQuery.selectOne()` thậm chí không hề được cấp quyền phun một dòng SQL nào do nó bất lực trong việc mượn hồ (connection). Kiểm tra xác nhận ở tầng gốc rễ (Assertion root cause) rạch ròi phân loại lỗi không mượn được kết nối (pool acquisition failure) so với lỗi hết giờ chạy lệnh tại chính PostgreSQL (statement timeout).
 
-## Experiment 2 — Lock waiter chiếm connection
+## Thí nghiệm 2 — Đứng đợi khóa mà cũng trơ trẽn chiếm luôn kết nối (Lock waiter chiếm connection)
 
-Cả A và B dùng P-42. A acquire lock rồi vào remote gate; B borrow connection thứ
-hai và block ở `FOR UPDATE`.
+Cả A và B xâu xé chung một nạn nhân P-42. Thằng A đoạt được khóa rồi lẩn vào trốn trong cổng chặn (remote gate); Thằng B lôi được kết nối thứ hai từ hồ ra và rồi bị chôn chân cứng ngắc ở lệnh `FOR UPDATE`.
 
-Dùng một direct admin connection ngoài application pool chỉ cho diagnostics:
+Chúng ta sử dụng một kết nối ngầm (admin connection) độc lập hoàn toàn khỏi application pool chuyên dành cho thao tác chuẩn đoán (diagnostics):
 
 ```java
 long lockWaiterCount() {
@@ -262,7 +259,7 @@ long lockWaiterCount() {
 }
 ```
 
-Test sequence:
+Trình tự test (Test sequence):
 
 ```java
 @Test
@@ -274,7 +271,7 @@ void rowLockWaiterConsumesSecondPoolConnection() throws Exception {
         Future<ApprovalResult> holder = actors.submit(() ->
             broken.assessAndApprove(PAYMENT_42)
         );
-        firstCall.awaitAllEntered(); // conn-1 owns row lock
+        firstCall.awaitAllEntered(); // conn-1 ôm khóa dòng (owns row lock)
 
         Future<Throwable> waiter = actors.submit(() ->
             catchThrowable(() ->
@@ -310,14 +307,11 @@ void rowLockWaiterConsumesSecondPoolConnection() throws Exception {
 }
 ```
 
-Controlled client gates first call only; duplicate proceeds after holder commit,
-then broken code performs unnecessary risk call and fails state validation. Main
-assertion là one remote holder + one DB lock waiter đã full pool.
+Đoạn máy trạm ảo diệu (Controlled client) chỉ chặn gác cái yêu cầu thứ nhất thôi; kẻ trùng lặp (duplicate) sẽ tự động phi qua sau khi tên ôm khóa chịu nhả (holder commit). Sau đó mã bị lỗi (broken code) lại ngang nhiên đánh đu thực hiện lời gọi rủi ro ảo (unnecessary risk call) và rồi tức tưởi sụp đổ ở vòng thẩm định trạng thái (fails state validation). Điểm khẳng định mạnh mẽ nhất ở bài kiểm tra (Main assertion) là bằng chứng rõ mười mươi: 1 người cầm khóa đợi + 1 kẻ đứng xếp hàng đòi DB lock là đã dư sức thổi tung bóp chết cả cái pool (đã full pool).
 
-Admin connection không được dùng như production workaround; nó chỉ quan sát
-application pool từ bên ngoài.
+Cái kết nối quản trị (Admin connection) đó không phải được dùng hòng phác thảo lấp liếm lỗi của môi trường thực (production workaround); nó chỉ tồn tại với tư cách là con mắt quan sát độc lập từ bên ngoài nhìn soi vào application pool.
 
-## Experiment 3 — Fixed remote waits không giữ connection
+## Thí nghiệm 3 — Khoảng chờ hệ thống từ xa sau khi sửa lỗi không còn ngâm kết nối nữa (Fixed remote waits không giữ connection)
 
 ```java
 @Test
@@ -366,10 +360,9 @@ void splitBoundaryLeavesPoolAvailableDuringRemoteWait()
 }
 ```
 
-Snapshot transactions đã end trước actors enter remote gate. Pool active `0` là
-technical evidence; unrelated query success là business/service evidence.
+Những giao dịch mang sứ mệnh chớp nhoáng (Snapshot transactions) đã tự động bay màu (end) nhường lối lại cho luồng tác nhân được rẽ bước vào cánh cổng trễ mạng (actors enter remote gate). Việc phát hiện pool active chỉ có `0` là những luận điểm mang đầy tính kỹ thuật sắc bén (technical evidence); đồng thời truy vấn qua đường không vướng bận chút nào (unrelated query success) là minh chứng hùng hồn nhất dưới con mắt thực thi (business/service evidence).
 
-## Experiment 4 — Revalidation từ chối stale decision
+## Thí nghiệm 4 — Quá trình Thẩm định lại khước từ mọi loại Quyết định mốc meo (Revalidation từ chối stale decision)
 
 ```java
 @Test
@@ -382,8 +375,8 @@ void concurrentChangeMakesRemoteDecisionStale() throws Exception {
             fixed.assessAndApprove(PAYMENT_42, testDeadline())
         );
 
-        scenario.awaitAllEntered(); // snapshot version 12, no Tx open
-        canceller.cancel(PAYMENT_42); // short independent Tx -> version 13
+        scenario.awaitAllEntered(); // lúc này snapshot đang version 12, không có Tx mở
+        canceller.cancel(PAYMENT_42); // bồi thêm short independent Tx -> chuyển version 13
         scenario.releaseAll();
 
         ApprovalResult result =
@@ -402,11 +395,11 @@ void concurrentChangeMakesRemoteDecisionStale() throws Exception {
 }
 ```
 
-Test này bắt regression “move remote out of Tx nhưng quên revalidate”.
+Bài test thâm thúy này đã chặn đứng mầm bệnh thoái trào (regression) tai hại: “Đã bê remote ra ngoài Tx rồi mà não lại quên tái thẩm định lại dữ liệu (revalidate)”.
 
-## Experiment 5 — Remote timeout xảy ra khi không có DB transaction
+## Thí nghiệm 5 — Thời gian chờ từ xa báo lỗi (Remote timeout) nhưng không hề kéo theo sự mở ra của một luồng Giao dịch cập nhật (DB transaction)
 
-Test client ném controlled `RiskDependencyTimeoutException` sau bounded gate:
+Cài bẫy sao cho Client của bài test bị nổ lỗi `RiskDependencyTimeoutException` chủ động sau khi đập mặt vào ngưỡng giới hạn (bounded gate):
 
 ```java
 @Test
@@ -422,78 +415,74 @@ void remoteTimeoutDoesNotOpenCommitTransaction() {
 }
 ```
 
-Snapshot read transaction đã commit trước remote call; apply transaction không bắt
-đầu khi dependency fails.
+Sứ mệnh đọc bản ảnh giao dịch (Snapshot read transaction) đã kịp thời đóng chốt (commit) trước khi lời gọi từ xa (remote call) gieo mình xuất phát; và giao dịch áp dụng cập nhật sau chót (apply transaction) sẽ chẳng dại gì mà mở bung ra một khi nhận thấy hệ thống đối tác vừa lăn đùng ra chết (dependency fails).
 
-## Experiment 6 — Bounded lock timeout cleanup
+## Thí nghiệm 6 — Dọn dẹp tàn cuộc khi bị ngắt bởi quá hạn khóa dòng (Bounded lock timeout cleanup)
 
-Trong test profile, apply transaction có trusted test guardrail:
+Thêm một bức tường thành bảo vệ vô cùng cứng cáp (trusted test guardrail) cho tiến trình (apply transaction) ở môi trường cấu hình test (test profile):
 
 ```sql
 set local lock_timeout = '300ms';
 ```
 
-Giữ P-42 lock bằng một independent transaction, gọi fixed writer và assert:
+Thử dùng một rào chắn độc lập (independent transaction) ôm chặt lấy P-42, và vẫy gọi luồng mã chữa cháy (fixed writer) rồi tiến hành giám sát (assert):
 
-- exception/cause có PostgreSQL lock-timeout SQLSTATE phù hợp;
-- apply transaction rollback;
-- pool active trở về baseline;
-- status/version không đổi;
-- retry không chạy bên trong failed transaction.
+- Mũi tên exception/nguyên nhân bốc cháy (cause) đều khớp chính xác vào thông báo trạng thái nghẹt thở của PostgreSQL lock-timeout SQLSTATE;
+- Giao dịch cập nhật dứt khoát rút lui (apply transaction rollback);
+- Trạng thái bận của hồ lập tức nhảy lùi về lại mốc sàn ổn định (pool active trở về baseline);
+- Danh tính và số hiệu trạng thái của dữ liệu bất di bất dịch (status/version không đổi);
+- Quá trình đè nhấn thử lại (retry) cấm tuyệt đối việc mò vào thực thi ngay trên nền tảng của giao dịch chết yếu (failed transaction) vừa rồi.
 
-Giá trị timeout là test fixture. Production classification phải dựa trên driver
-cause/SQLSTATE và remaining deadline.
+Con số về thời lượng bị ngắt (Giá trị timeout) ở đây hoàn toàn là chiêu trò bày biện cho bộ kiểm thử (test fixture). Để ấn định những số liệu quy chuẩn ngoài đời thực (Production classification) phải luôn bám rễ dựa dẫm (derive) vào cội nguồn phát động mã trình điều khiển (driver cause/SQLSTATE) cộng với giới hạn còn sót lại của thời gian sống (remaining deadline).
 
-## Experiment 7 — Pool size không sửa long duration
+## Thí nghiệm 7 — Kích thước của Pool (Pool size) mãi vô vọng trong việc trị bệnh thâm niên về thời gian dài cổ (long duration)
 
-Chạy parameterized test với pool capacities nhỏ khác nhau, luôn tạo đúng số remote
-waiters bằng capacity. Với mỗi capacity:
+Cho phóng rầm rầm tập hợp các mô phỏng (parameterized test) bằng vô vàn các cỡ hồ (pool capacities) khiêm tốn khác nhau, luôn nhắm tới việc tạo ra chính xác lượng thợ chầu trực hệ thống xa (remote waiters) ăn khớp trọn vẹn với kích cỡ dung lượng (capacity). Đều đặn với mỗi mốc sức chứa:
 
 ```text
-active == maximumPoolSize
-unrelated borrower times out
-transaction duration tracks remote gate duration
+số kết nối bận (active) == kích thước cực đại (maximumPoolSize)
+kẻ tới sau nhòm ngó mượn ké phải chết dí (unrelated borrower times out)
+tuổi thọ của giao dịch (transaction duration) tò tò chạy theo y chang tuổi thọ của nút thắt ở cổng xa (tracks remote gate duration)
 ```
 
-Không dùng test để tuyên bố một pool size tối ưu. Mục tiêu là chứng minh tăng finite
-capacity chỉ tăng số long transactions trước saturation.
+Không hề lợi dụng mớ kết quả (test) đong đếm này hòng xưng hùng xưng bá vạch ra một quy chuẩn (pool size tối ưu) cho thiên hạ. Tham vọng duy nhất là vạch trần chân lý: Dù có lấp đầy một cái rổ (finite capacity) lớn đến cỡ nào thì cũng chỉ là gom thêm một rổ những sự cố giam hãm (long transactions) trước khi cỗ máy gầm rú quá tải (saturation).
 
-## Coverage matrix
+## Bảng đối chiếu các luồng dữ liệu bao phủ (Coverage matrix)
 
-| Scenario | Active connections trong remote wait | Lock waiter | Unrelated query |
+| Kịch bản (Scenario) | Kết nối đang bận trong lúc chờ từ xa (Active connections trong remote wait) | Kẻ đợi khóa (Lock waiter) | Truy vấn ất ơ (Unrelated query) |
 | --- | --- | --- | --- |
-| Broken, different rows | 2/2 | Không | Acquisition timeout |
-| Broken, same row | 2/2 | Có | Acquisition timeout |
-| Fixed split boundary | 0/2 | Không | Success |
-| Fixed stale snapshot | 0 trong remote; short apply | Short | Stale/no-op |
-| Remote timeout outside Tx | 0 sau snapshot | Không | Unaffected |
-| Apply lock timeout | Bounded short Tx | Có | Pool recovers |
+| Lỗi (Broken), khác dòng xử lý | Chết đứng 2/2 | Báo Không | Quá hạn chờ mượn hồ (Acquisition timeout) |
+| Lỗi (Broken), nã vào một dòng | Chết đứng 2/2 | Báo Có | Quá hạn chờ mượn hồ (Acquisition timeout) |
+| Đã sửa: Chia đôi ranh giới | Dư giả 0/2 | Báo Không | Êm ru, trót lọt (Success) |
+| Đã sửa: Chặn lén bản ảnh lỗi | Chỉ 0 lúc đang đợi; và áp dụng chớp nhoáng (short apply) | Mất một lúc (Short) | Phát hiện rác, chối ngay (Stale/no-op) |
+| Lỗi ngắt chờ từ xa ngoài vùng Tx | Chỉ 0 tăm hơi sau khi ảnh chốt (sau snapshot) | Báo Không | Không mảy may tổn hại (Unaffected) |
+| Sập bẫy ngắt khóa cập nhật (Apply lock timeout) | Bị bó gọn, chớp nhoáng (Bounded short Tx) | Báo Có | Hồ lại hồi phục sinh lực (Pool recovers) |
 
-## Chống flaky
+## Chống "nay chạy được, mai báo lỗi" (Chống flaky)
 
-- Remote latches chứng minh actors đã qua DB query trước khi block.
-- Mọi latch, future, Awaitility wait và executor termination có timeout.
-- `finally` release remote gate trước executor shutdown.
-- Test class chạy `SAME_THREAD`; controlled client là single-scenario.
-- Test method không có outer transaction.
-- Pool capacity/config chỉ áp dụng test context.
-- Direct admin connection luôn đóng bằng try-with-resources.
-- Fixtures dùng committed setup và IDs riêng.
-- Assert cả pool state, exception layer và committed payment state.
+- Các đối tượng chốt chặn từ xa (Remote latches) như lời cam kết đinh ninh diễn viên đã trót lọt vượt qua lệnh truy vấn cơ sở dữ liệu (actors đã qua DB query) trước khi bị ép đông đá (block).
+- Mọi mốc thời gian chốt chặn (latch), mốc chờ từ lai (future), công cụ mỏ neo Awaitility, và điểm triệt hạ đường dẫn executor đều trang bị rành rọt đếm ngược ngắt bỏ (timeout).
+- Lệnh cấm kỵ: phải dỡ lệnh chặn hãm (release remote gate) trong khối `finally` trước khi nổ mìn dẹp tiệm (executor shutdown).
+- Cấu hình file lớp test mặc định cắm rễ luôn theo con đường duy nhất `SAME_THREAD`; thiết bị ngụy trang kiểm soát (controlled client) có bản chất duy nhất kịch bản (single-scenario).
+- Các phương thức kiểm nghiệm (Test method) sạch bóng lớp mạng che đậy bên ngoài (outer transaction).
+- Sức chứa (Pool capacity) cũng như khung cài đặt cấu hình chỉ có tiếng nói độc quyền trong địa hạt bao trọn của bài kiểm tra (test context).
+- Đầu mối móc ngoặc quản trị mạng (Direct admin connection) lúc nào cũng tuân thủ nghiêm ngặt tháo ngòi thắt nút khi hết việc bằng try-with-resources.
+- Khối dựng mô hình rập khuôn (Fixtures) bắt buộc dùng khung đã đóng ván đóng đinh (committed setup) với những con số thẻ căn cước (IDs) rạch ròi không dính lứu.
+- Luôn phải soi thấu tâm can (Assert) trên đủ 3 mặt trận: sự trinh bạch của hồ kết nối (pool state), bề mặt của các điểm bùng nổ (exception layer) và toàn vẹn nội dung của báo cáo tài chính đã an bài (committed payment state).
 
-## Production verification
+## Đánh giá mức độ xác thực của môi trường Production (Production verification)
 
-Dashboard correlate cùng time window:
+Dashboard cần liên kết móc nối vạn vật trong một khung thời gian (correlate cùng time window):
 
 ```text
-Hikari active/max, pending, acquisition timeout
-PostgreSQL xact age, idle-in-tx, lock waits/blockers
-remote latency/timeouts, bulkhead active/rejected
-request/executor active, queue, rejection
-instance count and total configured connections
+Chỉ số căng cứng Hikari active/max, số lượng vật vờ chờ mượn (pending), số lượng cạn sức từ bỏ (acquisition timeout)
+Tốc độ hao mòn PostgreSQL xact age, hiện tượng thả rông idle-in-tx, đám tắc đường chờ khóa (lock waits/blockers)
+Tốc độ ngậm từ xa (remote latency/timeouts), mức độ chen lấn của cổng vách ngăn (bulkhead active/queued/rejected)
+Tổng hành dinh hoạt động luồng xử lý yêu cầu/ngồi chờ, hiện tượng đuổi việc cự tuyệt tiếp khách (rejection)
+Tổng quân số máy móc (instance count) và toàn bộ những đường đi nước bước đã quy định (total configured connections)
 ```
 
-Diagnostic SQL:
+Nghệ thuật soi mói hệ thống (Diagnostic SQL):
 
 ```sql
 select a.pid,
@@ -509,5 +498,4 @@ where a.datname = current_database()
 order by a.xact_start;
 ```
 
-Production alert ưu tiên rising transaction/connection usage duration và pending
-borrowers. Pool timeout là late signal của cascade.
+Còi báo động ở môi trường thực tế (Production alert) phải nhạy bén đôn sự ưu tiên phát hỏa trước những biểu đồ nhấp nhô của mốc thời gian nằm lì (rising transaction/connection usage duration) và đám lâu la chầu rìa đói khát (pending borrowers). Lấy số liệu quá hạn thời gian chầu chực xin hồ (Pool timeout) làm cơ sở chỉ huy là nước cờ muộn màng tụt hậu, báo hiệu cái bẫy sập đổ (cascade) đã thành hình.

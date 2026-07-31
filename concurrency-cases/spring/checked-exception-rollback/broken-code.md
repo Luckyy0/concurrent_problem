@@ -1,10 +1,8 @@
-# Broken checked-exception path
+# Đoạn mã nguồn bị lỗi theo đường dẫn checked-exception
 
-## Domain model tối thiểu
+## Mô hình nghiệp vụ tối giản (Domain model)
 
-Payout và wallet là mutable projections; ledger entry là append-only audit record.
-Các entity mappings thông thường được rút gọn để tập trung vào transaction; JPA
-no-arg constructors và getters không liên quan được lược bỏ:
+Giao dịch chi trả (Payout) và ví (wallet) được mô phỏng dưới dạng các đối tượng có thể thay đổi trạng thái; bản ghi sổ cái (ledger entry) đóng vai trò là một lưu vết kiểm toán chỉ được phép thêm mới (append-only). Các thiết lập ánh xạ thực thể (entity mappings) thông thường đã được rút gọn để tập trung thảo luận vào giao dịch; phần JPA no-arg constructors hay các hàm getters vốn không liên quan cũng đã được lược bỏ:
 
 ```java
 public enum PayoutStatus {
@@ -56,9 +54,7 @@ public class WalletAccount {
 }
 ```
 
-Trong production ledger nên dùng amount, currency, direction và immutable
-references rõ ràng. Case dùng factory để tránh coi balance projection là financial
-history duy nhất:
+Trong thực tế production, sổ cái nên có thêm thông tin số tiền (amount), loại tiền tệ (currency), hướng giao dịch (direction) và các tham chiếu không thể thay đổi (immutable references). Trong ví dụ này, việc sử dụng hàm tạo (factory) nhằm tránh nhầm tưởng rằng số dư khả dụng (balance projection) là thông tin lịch sử tài chính duy nhất:
 
 ```java
 @Entity
@@ -94,10 +90,9 @@ public class LedgerEntry {
 }
 ```
 
-## Repository locking không sửa rollback rule
+## Khóa kho lưu trữ (Repository locking) không thể sửa quy tắc rollback
 
-Repositories lock hai mutable aggregates để loại trừ concurrent mutation không
-liên quan:
+Các kho dữ liệu (Repositories) sẽ khóa hai cấu trúc đối tượng dữ liệu thay đổi để loại trừ các tác động xen ngang (concurrent mutation) không mong muốn:
 
 ```java
 public interface PayoutRepository
@@ -119,10 +114,9 @@ public interface WalletRepository
 }
 ```
 
-Row locks bảo vệ concurrent writes trong lúc transaction chạy. Chúng không quyết
-định exception nào làm rollback.
+Khóa dòng (Row locks) bảo vệ hệ thống khỏi các thao tác ghi đồng thời trong quá trình giao dịch đang chạy. Tuy nhiên, chúng không hề có khả năng quyết định loại ngoại lệ nào sẽ kích hoạt quá trình rollback.
 
-## Checked business exception
+## Ngoại lệ nghiệp vụ có kiểm tra (Checked business exception)
 
 ```java
 public final class BeneficiaryRejectedException extends Exception {
@@ -132,8 +126,7 @@ public final class BeneficiaryRejectedException extends Exception {
 }
 ```
 
-Policy chỉ đọc local registry đã có trong cùng database/cache policy snapshot; nó
-không gọi remote service trong transaction:
+Chính sách nghiệp vụ (Policy) chỉ tiến hành đối chiếu với danh sách bị khóa trên bộ nhớ cục bộ, hoặc sử dụng bản sao thông qua chung bộ đệm cơ sở dữ liệu (cache policy snapshot); nó hoàn toàn không gọi sang các dịch vụ từ xa (remote service) làm kéo dài thời gian giao dịch:
 
 ```java
 @Component
@@ -149,7 +142,7 @@ public class BeneficiaryPolicy {
 }
 ```
 
-## Broken service
+## Dịch vụ lỗi (Broken service)
 
 ```java
 @Service
@@ -193,44 +186,40 @@ public class PayoutPreparationService {
 }
 ```
 
-Code không thiếu proxy: caller gọi public method trên Spring bean thật. Vấn đề là
-`@Transactional` không khai báo rollback rule cho checked exception.
+Đoạn code trên không hề bị lỗi gọi nội bộ mất proxy: phương thức gọi (caller) vẫn gọi hàm công khai trên hạt đậu (bean) Spring chính thức. Vấn đề nằm ở chỗ chú thích `@Transactional` đã bỏ quên khai báo quy tắc rollback (rollback rule) cho ngoại lệ có kiểm tra kia.
 
-## Điều Spring thực hiện
+## Điều mà Spring thực sự sẽ làm
 
-Path rút gọn:
+Đây là toàn bộ đường đi vắn tắt (Path rút gọn):
 
 ```text
-proxy begins Tx
-  -> method mutates managed entities
-  -> method throws BeneficiaryRejectedException
-  -> rollback rule returns false
-  -> Hibernate flushes pending SQL
-  -> transaction manager commits
-  -> proxy rethrows BeneficiaryRejectedException
+proxy mở giao dịch (begins Tx)
+  -> phương thức tiến hành thay đổi trên các thực thể được quản lý (mutates managed entities)
+  -> phương thức ném ra BeneficiaryRejectedException
+  -> quy tắc rollback (rollback rule) kiểm tra và trả về false (do là checked exception)
+  -> Hibernate đẩy (flushes) các lệnh SQL đang chờ xuống cơ sở dữ liệu
+  -> trình quản lý giao dịch ra lệnh commit (commits)
+  -> proxy ném lại (rethrows) BeneficiaryRejectedException ra ngoài
 ```
 
-Nếu SQL đã flush sớm, row locks vẫn giữ tới commit. Nếu chưa flush, Hibernate gửi
-SQL trong commit. Cả hai path đều có cùng durable outcome: changes committed.
+Nếu lệnh SQL đã được chủ động flush sớm từ trước, các khóa dòng vẫn được giữ nguyên cho đến tận khi commit. Nếu chưa flush, Hibernate sẽ tự động gửi đi mọi lệnh SQL trong quá trình commit. Cả hai trường hợp này đều đi tới một cái kết chắc nịch (durable outcome): các thay đổi đã được commit thành công.
 
-> **Nói ngắn gọn:** exception thoát khỏi method không tự động đồng nghĩa transaction
-> rollback; exception type và configured rollback rule mới quyết định.
+> **Nói ngắn gọn:** Ngoại lệ có thoát khỏi phương thức hay không thì cũng không đồng nghĩa với việc giao dịch đó tự động rollback; kiểu ngoại lệ (exception type) và quy tắc rollback đã được cấu hình (configured rollback rule) mới là thứ có quyền sinh sát.
 
-## Preconditions tái hiện
+## Các điều kiện tiền đề để tái hiện lỗi (Preconditions tái hiện)
 
-- `prepare()` được gọi qua Spring proxy và tạo/join transaction `REQUIRED`.
-- Beneficiary policy ném đúng checked exception đã khai báo.
-- Exception thoát khỏi public method, không bị đổi thành unchecked exception.
-- Không có `rollbackFor` hoặc programmatic rollback-only.
-- Flush/commit không gặp một database error độc lập.
-- Dispatcher chọn `PROCESSING` payout sau commit.
+- Hàm `prepare()` được gọi qua Spring proxy và tạo mới (hoặc tham gia) vào một giao dịch với chính sách lan truyền `REQUIRED`.
+- Chính sách người thụ hưởng ném ra chính xác ngoại lệ có kiểm tra đã được khai báo.
+- Ngoại lệ này phải lọt qua ranh giới hàm công khai, không bị biến tấu đổi thành ngoại lệ không kiểm tra (unchecked exception) trong quá trình xử lý.
+- Code không có `rollbackFor` cũng như không có thao tác đánh dấu rollback-only trong hàm (programmatic rollback-only).
+- Quá trình flush/commit không tình cờ vấp phải một lỗi độc lập khác của cơ sở dữ liệu.
+- Tiến trình điều phối sẽ quét thấy trạng thái `PROCESSING` ngay sau khi giao dịch này commit.
 
-## Những cách “sửa” chưa đủ
+## Những cách "sửa" chưa tới hoặc sai lầm hoàn toàn
 
-- Thêm `throws BeneficiaryRejectedException` vào signature; Java declaration không
-  cấu hình Spring rollback.
-- Gọi `saveAndFlush()` trước policy; flush không phải rollback.
-- Dùng row lock; lock chỉ serialize access và được release khi broken path commit.
-- Catch exception, log rồi return; proxy càng không thấy failure để rollback.
-- Mong PostgreSQL suy ra business rejection từ Java exception.
-- Retry sau exception mà không kiểm tra committed state/idempotency key.
+- Cố thêm từ khóa `throws BeneficiaryRejectedException` vào chữ ký (signature) hàm; việc khai báo trong Java không có tác dụng gì trong việc cấu hình tính năng rollback của Spring.
+- Gọi hàm `saveAndFlush()` trước lệnh kiểm tra chính sách; flush không hề đồng nghĩa với rollback.
+- Dùng khóa dòng (row lock); khóa chỉ có tác dụng sắp xếp thứ tự ưu tiên xử lý đồng thời, và đằng nào khóa cũng sẽ được giải phóng khi cái tiến trình sai lầm kia chịu commit.
+- Bắt (Catch) ngoại lệ, ghi lại log rồi kết thúc (return) nhẹ nhàng; proxy ở ngoài càng không hề nhận biết được lỗi nào xảy ra để mà rollback.
+- Chờ mong một phép màu từ cơ sở dữ liệu PostgreSQL rằng nó sẽ ngầm tự hiểu một loại trừ chối nghiệp vụ (business rejection) từ một ngoại lệ Java.
+- Cho gọi thử lại (Retry) sau khi gặp ngoại lệ mà không thèm kiểm tra xem trạng thái hay khóa từ chối lũy đẳng (idempotency key) đã được commit bền vững dưới cơ sở dữ liệu hay chưa.

@@ -2,76 +2,70 @@
 
 ## Tóm tắt
 
-`OrderPlacementService` tạo order trong một transaction rồi gọi `@Async` processor.
-Async method chạy trên executor thread khác nên không tham gia transaction của
-caller. Nó có thể query trước outer commit và không thấy order; hoặc commit một
-side effect độc lập rồi outer transaction rollback, để lại orphan work.
+`OrderPlacementService` tạo đơn hàng (order) trong một giao dịch (transaction) rồi gọi đến một bộ xử lý `@Async`.
+Hàm bất đồng bộ (async method) này chạy trên một luồng (thread) khác thuộc executor, do đó nó không tham gia vào giao dịch của phương thức gọi (caller). Hậu quả là, nó có thể truy vấn dữ liệu trước khi giao dịch bên ngoài (outer transaction) kịp commit và sẽ không tìm thấy đơn hàng; hoặc nó có thể ghi nhận một tác động bên ngoài (side effect) độc lập rồi sau đó giao dịch bên ngoài bị rollback, để lại một công việc bị mồ côi (orphan work).
 
-Case bảo vệ các invariant:
+Bài toán này giúp bảo vệ các rào chắn tính đúng đắn (invariant) sau:
 
 ```text
-Async work phụ thuộc order chỉ được dispatch sau khi order transaction commit.
-Outer rollback không được tạo notification/audit được coi là hợp lệ cho order.
-Không truyền EntityManager, managed entity hoặc transaction context qua thread.
-Durability requirement phải được nói rõ: local after-commit hay transactional outbox.
+Công việc bất đồng bộ phụ thuộc vào đơn hàng chỉ được phép điều phối (dispatch) sau khi giao dịch của đơn hàng đã commit thành công.
+Việc giao dịch bên ngoài bị rollback không được phép sinh ra các thông báo (notification) hay bản ghi kiểm toán (audit) ngầm hiểu rằng đơn hàng đã hợp lệ.
+Tuyệt đối không truyền EntityManager, các thực thể đang được quản lý (managed entity) hoặc bối cảnh giao dịch (transaction context) xuyên qua các luồng.
+Yêu cầu về độ bền dữ liệu (durability) phải được xác định rõ ràng: chấp nhận rủi ro mất mát dữ liệu cục bộ sau khi commit (local after-commit) hay phải dùng bảng lưu trữ tạm (transactional outbox) để đảm bảo an toàn tuyệt đối.
 ```
 
-> **Nói ngắn gọn:** chuyển code sang thread khác cũng chuyển nó ra khỏi chiếc hộp
->transaction hiện tại; `@Async` không phải continuation của database transaction.
+> **Nói ngắn gọn:** Chuyển mã nguồn sang chạy trên một luồng khác cũng đồng nghĩa với việc đưa nó ra khỏi ranh giới của giao dịch hiện tại; `@Async` không phải là sự nối tiếp của giao dịch cơ sở dữ liệu.
 
 ## Thuật ngữ cần biết
 
 | Thuật ngữ | Giải thích dễ hiểu |
 | --- | --- |
-| thread-bound transaction | Transaction/resource gắn với thread đang thực thi |
-| async boundary | Điểm work được giao sang executor thread khác |
-| after-commit work | Work chỉ được schedule sau khi transaction commit thành công |
-| orphan side effect | Side effect tồn tại dù business aggregate gốc rollback |
-| context propagation | Truyền MDC/security/trace context; không đồng nghĩa truyền transaction |
-| transactional event listener | Listener chạy theo phase commit/rollback của transaction publish event |
-| local handoff | Giao work vào in-process executor, có thể mất khi process crash |
-| transactional outbox | Ghi business state và event record trong cùng database transaction |
+| Thread-bound transaction | Giao dịch hoặc tài nguyên được gắn chặt với luồng đang thực thi |
+| Async boundary | Ranh giới bất đồng bộ, nơi công việc được giao sang một luồng xử lý khác |
+| After-commit work | Công việc chỉ được lên lịch chạy sau khi giao dịch đã commit thành công |
+| Orphan side effect | Tác động bên ngoài vẫn tồn tại dù cho khối dữ liệu gốc đã bị rollback |
+| Context propagation | Việc truyền các bối cảnh như MDC, bảo mật hoặc truy vết (trace); không đồng nghĩa với việc truyền giao dịch |
+| Transactional event listener | Trình lắng nghe sự kiện chạy theo từng giai đoạn (commit/rollback) của giao dịch phát ra sự kiện |
+| Local handoff | Giao công việc vào một executor trong cùng tiến trình, có nguy cơ bị mất khi tiến trình gặp sự cố (crash) |
+| Transactional outbox | Ghi trạng thái nghiệp vụ và bản ghi sự kiện trong cùng một giao dịch cơ sở dữ liệu |
 
 ## Bối cảnh và transaction boundary
 
 | Thành phần | Giá trị |
 | --- | --- |
-| Caller | Request thread, outer `@Transactional` |
-| Async worker | `orderExecutor` thread |
-| Caller transaction | Insert order, commit/rollback ở cuối entry method |
-| Worker transaction | Không có, hoặc transaction mới nếu async method annotated |
-| Race window | Sau async submit, trước outer commit |
-| Database | PostgreSQL `READ COMMITTED` |
-| Durability boundary | Local executor không durable |
+| Caller | Luồng yêu cầu (Request thread), chứa `@Transactional` bên ngoài |
+| Async worker | Luồng `orderExecutor` |
+| Caller transaction | Lưu đơn hàng, commit/rollback ở cuối hàm gọi |
+| Worker transaction | Không có, hoặc là một giao dịch mới hoàn toàn nếu hàm async có gắn annotation |
+| Race window | Khoảng thời gian từ sau khi nộp (submit) tác vụ async, đến trước khi giao dịch bên ngoài commit |
+| Database | PostgreSQL với mức độ cô lập `READ COMMITTED` |
+| Durability boundary | Bộ thực thi cục bộ (Local executor) không đảm bảo tính bền vững của dữ liệu |
 
-## Điều hướng
+## Hướng dẫn điều hướng
 
-- [Broken code](broken-code.md)
-- [Thread/transaction timeline](analysis.md)
-- [After-commit và outbox alternatives](solutions.md)
-- [PostgreSQL integration experiments](experiments.md)
-- [Spring transaction boundaries](../../concepts/spring-transaction-boundaries.md)
-- [Concurrency testing](../../concepts/concurrency-testing.md)
+- [Code lỗi](broken-code.md)
+- [Phân tích luồng và giao dịch](analysis.md)
+- [Các giải pháp after-commit và outbox](solutions.md)
+- [Các thí nghiệm tích hợp với PostgreSQL](experiments.md)
+- [Ranh giới giao dịch trong Spring](../../concepts/spring-transaction-boundaries.md)
+- [Kiểm thử các vấn đề đồng thời](../../concepts/concurrency-testing.md)
 
-## Hậu quả production
+## Hậu quả trong production nếu làm sai
 
-- async query báo “order not found” theo timing;
-- notification/audit/job commit cho order đã rollback;
-- lazy-loading exception khi entity đi qua thread;
-- future cancel nhưng worker transaction vẫn commit;
-- executor rejection sau commit làm local event bị mất;
-- trace/security context sai nếu propagation policy không explicit.
+- Truy vấn bất đồng bộ báo "không tìm thấy đơn hàng" do sai lệch về thời gian (timing).
+- Thông báo, kiểm toán hoặc công việc nền được commit cho một đơn hàng đã bị rollback.
+- Lỗi tải dữ liệu trễ (lazy-loading exception) khi một thực thể (entity) đi qua luồng khác.
+- Tác vụ tương lai (future) bị hủy (cancel) nhưng giao dịch của worker vẫn tiếp tục commit.
+- Bộ thực thi (executor) từ chối công việc sau khi đã commit, làm mất sự kiện cục bộ.
+- Bối cảnh truy vết (trace) hoặc bảo mật bị sai lệch nếu chính sách truyền tải (propagation policy) không được định nghĩa rõ ràng.
 
-## Hướng sửa khuyến nghị
+## Hướng sửa chữa (Khuyến nghị)
 
-- Work phải cùng atomic boundary: chạy synchronous trong caller transaction.
-- Work chỉ được bắt đầu sau commit, chấp nhận mất khi crash: publish domain event
-  và xử lý bằng `@TransactionalEventListener(AFTER_COMMIT)`; có thể kết hợp `@Async`.
-- Work phải durable/at-least-once: transactional outbox (`MSG-007`).
-- Async method cần database writes riêng: mở transaction mới trên worker sau
-  after-commit dispatch, không cố truyền transaction caller.
+- Nếu công việc đòi hỏi phải chung ranh giới nguyên tử (atomic boundary): Hãy chạy đồng bộ (synchronous) ngay trong giao dịch của caller.
+- Nếu công việc chỉ được bắt đầu sau khi commit và có thể chấp nhận rủi ro mất dữ liệu khi hệ thống sập: Hãy phát hành sự kiện nghiệp vụ (domain event) và xử lý bằng `@TransactionalEventListener(AFTER_COMMIT)`; có thể kết hợp thêm với `@Async`.
+- Nếu công việc bắt buộc phải bền vững và thực hiện ít nhất một lần (durable/at-least-once): Sử dụng mẫu transactional outbox (`MSG-007`).
+- Nếu hàm async cần ghi dữ liệu riêng: Mở một giao dịch mới trên worker sau khi sự kiện after-commit được điều phối, tuyệt đối không cố gắng truyền giao dịch của caller sang.
 
-## Phạm vi
+## Phạm vi của bài viết
 
-Case xử lý local async invocation. Durable event publication, inbox/outbox và
-message redelivery thuộc `MSG-007`; executor starvation thuộc `JVM-008`.
+Bài viết này xử lý việc gọi hàm bất đồng bộ cục bộ (local async invocation). Việc phát hành sự kiện bền vững (durable event publication), mô hình inbox/outbox và cơ chế gửi lại tin nhắn (message redelivery) thuộc phạm vi của bài toán `MSG-007`; tình trạng "chết đói" của executor (executor starvation) thuộc phạm vi của bài toán `JVM-008`.
