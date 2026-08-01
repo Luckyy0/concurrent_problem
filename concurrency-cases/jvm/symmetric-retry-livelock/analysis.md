@@ -2,75 +2,77 @@
 
 ## Trạng thái ban đầu
 
-Lock-A và Lock-B đều tự do. T1 muốn `A → B`, T2 muốn `B → A`. Ownership chưa bị thay đổi vì mutation chỉ chạy sau khi lấy đủ hai lock.
+Tưởng tượng Lock-A và Lock-B đang nằm không. T1 thì muốn lấy A rồi lấy B, T2 thì muốn B rồi đến A. Chưa có dữ liệu nào bị thay đổi cả, vì chúng ta cẩn thận chỉ cho phép đổi khi lấy đủ cả 2 khóa.
 
 ## Interleaving tạo livelock
 
-| Phase | T1 | T2 | Progress |
+Dưới đây là màn "tấu hài" khiến hệ thống bị kẹt (livelock):
+
+| Bước (Phase) | Anh T1 | Anh T2 | Kết quả (Progress) |
 | --- | --- | --- | --- |
-| 1 | acquire A | acquire B | mỗi actor giữ một lock |
-| 2 | fail `tryLock(B)` | fail `tryLock(A)` | không thực hiện hoán đổi (swap) |
-| 3 | release A | release B | cả hai vẫn active, giữ nguyên state cũ |
-| 4 | fixed backoff | fixed backoff | cùng nhịp |
-| 5 | acquire A | acquire B | chu kỳ (phase) lặp lại |
+| 1 | lấy được A | lấy được B | mỗi anh ôm khư khư một khóa |
+| 2 | tạch khi lấy B (`tryLock(B)`) | tạch khi lấy A (`tryLock(A)`) | chả đổi chác được gì |
+| 3 | chán nản nhả A | buồn bã nhả B | vẫn thức, state chẳng thay đổi |
+| 4 | chờ một tí (fixed backoff) | chờ một tí y chang (fixed backoff) | hai anh cùng nhịp |
+| 5 | lại lấy A | lại lấy B | lặp lại từ đầu, nhức cái đầu! |
 
-Không có wait-for cycle nào tồn tại lâu: actor release lock và tiếp tục chạy. Vì vậy thread dump có thể hiển thị trạng thái RUNNABLE hoặc TIMED_WAITING thay vì BLOCKED, nhưng số lượng completed operation vẫn bằng 0.
+Trường hợp này không ai giữ khóa lâu (không có wait-for cycle), ai cũng nhả ra rồi chạy tiếp. Nên nếu bạn chụp thread dump, bạn sẽ thấy tụi nó báo là đang chạy (RUNNABLE) hoặc đang chờ (TIMED_WAITING) chứ chả thấy BLOCKED đâu. Khổ nỗi, chạy mãi mà công việc xong vẫn bằng 0.
 
-> **Nói ngắn gọn:** deadlock thất bại vì không actor nào hành động được; livelock thất bại vì các actor hành động quá giống nhau.
+> **Nói ngắn gọn:** Deadlock là hai ông cứng đầu đứng nhìn nhau không ai nhường ai, còn Livelock là hai ông khách sáo nhường nhau hoài nên kẹt luôn ở cửa.
 
 ## Kết quả mong đợi và thực tế
 
-| Khía cạnh | Mong đợi | Broken loop |
+| Khía cạnh | Điều ta muốn (Mong đợi) | Thực tế đắng lòng (Broken loop) |
 | --- | --- | --- |
-| Kết quả cuối cùng (Terminal outcome) | Thành công (Success) hoặc lỗi (failure) trước deadline | Có thể retry vô hạn |
-| Mức sử dụng CPU và thread | Tỷ lệ thuận với công việc hữu ích (useful work) | Bị tiêu tốn cho conflict và retry |
-| Huỷ (Cancellation) | Interrupt dừng operation | `parkNanos` trả về nhưng loop tiếp tục |
-| Đột biến (Mutation) | Chỉ có một thao tác hoán đổi (swap) hoàn tất | Không có mutation nhưng cũng không có progress |
-| Khả năng quan sát (Observability) | Conflict có budget và outcome rõ ràng | Log retry tăng lên, mức độ hoàn thành (completion) đứng yên |
+| Kết quả cuối cùng | Xong việc hoặc báo lỗi đàng hoàng trước khi hết giờ | Thử lại mãi mãi không lối thoát |
+| Tài nguyên CPU & Thread | Chạy tốn sức thì phải ra việc | Tốn hơi sức chỉ để đụng nhau và thử lại |
+| Hủy bỏ (Cancellation) | Có interrupt thì phải dừng | Bỏ qua interrupt, loop cứ chạy phà phà |
+| Thay đổi dữ liệu (Mutation) | Chỉ khi thành công mới cập nhật dữ liệu | Không cập nhật bậy bạ, nhưng cũng chả làm được gì |
+| Dễ theo dõi (Observability) | Rõ ràng ngân sách và kết quả | Log rác một đống, nhưng việc hoàn thành thì giậm chân tại chỗ |
 
 ## Nguyên nhân gốc rễ (Root cause)
 
-`tryLock` bảo vệ tính an toàn (safety) và tránh các blocking cycle, nhưng không tạo ra fairness hoặc progress guarantee. Hai cỗ máy trạng thái tất định (deterministic state machine) nhận cùng một signal, dùng cùng một fixed delay và đưa ra cùng một quyết định nên tính đối xứng (symmetry) được duy trì.
+Cái hàm `tryLock` chỉ giúp bạn an toàn không bị kẹt cứng (deadlock), nhưng nó chả hứa hẹn là sẽ giúp bạn hoàn thành công việc. Hai luồng chạy y chang nhau, nhận tín hiệu như nhau, thời gian chờ cũng bằng nhau, quyết định cũng giống nhau... thì đụng nhau là tất yếu (cái này gọi là symmetry - tính đối xứng).
 
-Backoff chỉ hữu ích khi làm giảm hoặc xáo trộn sự chồng chéo (phase overlap). Jitter tạo ra xác suất một actor đến trước; trong khi đó, deadline và giới hạn attempt (attempt cap) mới bảo đảm method có terminal outcome.
+Cho tụi nó chờ (backoff) chỉ có ích khi bạn làm "trật nhịp" của tụi nó đi. Thời gian chờ ngẫu nhiên (Jitter) sẽ giúp một anh có cơ hội ra tay trước. Nhưng nhớ nhé, phải kèm thêm cả deadline và giới hạn số lần thử, chứ chờ ngẫu nhiên không thôi thì lỡ xui nó vẫn thử mãi mãi đấy.
 
 ## Livelock, deadlock và starvation
 
-- Deadlock: các actor giữ và chờ resource theo vòng (cycle), thường không tiếp tục chạy.
-- Livelock: các actor liên tục phản ứng và retry nhưng tổng thể công việc (global work) không hoàn tất.
-- Starvation: một actor cụ thể không tạo ra tiến triển, trong khi các actor khác có thể hoàn tất.
+Để rõ ràng hơn, mình phân biệt 3 bệnh này nhé:
+- **Deadlock**: Các anh khóa nhau thành vòng tròn, ôm nhau chết chìm.
+- **Livelock**: Các anh cứ nhường nhau, chạy lui chạy tới mà công việc chung không nhúc nhích.
+- **Starvation**: Một anh bị xui, toàn bị mấy anh khác hớt tay trên, đói meo mốc mỏ.
 
-Một hệ thống randomized retry có thể tránh global livelock nhưng vẫn không bảo đảm fairness cho từng actor. Nếu fairness là một invariant, hãy dùng queue, owner hoặc fair lock có chính sách rõ ràng thay vì chỉ dùng jitter.
+Nếu bạn cho thời gian chờ ngẫu nhiên, bạn có thể trị được bệnh Livelock toàn cục, nhưng chả bảo đảm anh nào xui thì vẫn bị Starvation. Nếu bạn muốn "chơi đẹp" (fairness), hãy nghĩ đến chuyện dùng hàng đợi (queue) hoặc các khóa công bằng (fair lock).
 
 ## Ordering là kỹ thuật symmetry breaking mạnh hơn
 
-Stable total order dựa trên `channelId` khiến cả T1 và T2 yêu cầu (acquire) cùng một lock trước. Một actor sẽ giành được lock đầu tiên; actor còn lại không thể đồng thời giữ lock thứ hai để chặn winner. Ordering loại bỏ hoàn toàn cấu trúc gây ra conflict thay vì hy vọng vào sự khác biệt trong timing.
+Sắp xếp thứ tự (Stable total order) là "trùm cuối". Ví dụ dựa vào `channelId`, bắt buộc anh nào cũng phải lấy A trước. Lúc này, 1 anh sẽ ăn A, anh kia đành phải đứng chờ ở cửa A chứ không thể chạy qua lấy B được. Thế là hết chuyện đụng nhau lãng nhách!
 
-Comparator phải đảm bảo tính total và stable. Nếu hai object khác nhau có ID giống nhau thì cần bị từ chối hoặc có một tie-breaker duy nhất; không thực hiện order dựa trên các thuộc tính có thể thay đổi (mutable owner hay current role).
+Ghi chú nhỏ: Cấu trúc so sánh (Comparator) phải chuẩn xác nhé. Không lấy những cái hay thay đổi như chủ sở hữu để đem ra sắp xếp.
 
 ## Retry budget và deadline
 
-Retry policy cần đồng thời có các cơ chế sau:
+Khi đã quyết định làm cơ chế Retry, phải trang bị tận răng:
+- Đặt deadline cho toàn bộ quá trình (bao gồm thời gian lấy lock, chờ và xử lý).
+- Phải có max attempts (giới hạn số lần thử tối đa) để chống lỗi config linh tinh.
+- Chặn mức chờ tối đa (exponential cap) để thời gian chờ không bị bung nóc (overflow).
+- Thêm jitter (chờ ngẫu nhiên) cho nó xáo trộn nhịp đi.
+- Luôn kiểm tra xem luồng có bị interrupt hay huỷ không.
+- Hết giờ hay hết lượt thì quăng lỗi `CONTENDED` hay `TIMEOUT` trả về cho bên gọi.
 
-- operation deadline tính cả thời gian chờ lock, backoff và xử lý nghiệp vụ (business work);
-- số lượng max attempts để phòng tránh lỗi do clock hoặc config;
-- giới hạn mũ (exponential cap) để khoảng thời gian delay không bị overflow;
-- full jitter hoặc equal jitter phù hợp với workload;
-- kiểm tra interrupt hoặc cancellation trước và sau backoff;
-- trả về outcome `CONTENDED` hoặc `TIMEOUT` ở trạng thái cuối cho hàm gọi (caller).
-
-Không reset deadline sau mỗi attempt. Không log từng collision ở mức chi tiết cao; thay vào đó, hãy tổng hợp histogram của số lần attempt và đếm số lần sử dụng hết budget (exhausted count).
+Đừng bao giờ reset deadline sau mỗi lần thử. Và làm ơn, đừng nhả log bừa bãi mỗi khi kẹt khóa, hỏng hết ổ cứng; hãy dùng biểu đồ (histogram) đếm số lần kẹt là đủ.
 
 ## Failure, side effect và cleanup
 
-Mỗi attempt phải release mọi lock đã acquire bên trong khối `finally`. Business mutation chỉ chạy sau khi đã lấy đủ lock, nên attempt thất bại không cần rollback. Nếu một side effect bên ngoài đã chạy, cơ chế retry cần tính idempotent hoặc reconciliation và khi đó, nó không còn là một local lock loop đơn giản nữa.
+Lần thử nào tạch thì phải đảm bảo nhả hết khóa trong block `finally`. Do mình chỉ đổi dữ liệu khi đã nắm đủ 2 khóa, nên không cần rollback gì cả. Nhưng nếu trước đó bạn lỡ gọi một API bên ngoài nào đó, thì bạn phải lo liệu vụ idempotent (gọi nhiều lần không sao). Cái này thì không còn là bài toán khóa nội bộ đơn giản nữa rồi.
 
-`LockSupport.parkNanos` không ném ra ngoại lệ `InterruptedException`; mã nguồn phải tự kiểm tra `Thread.currentThread().isInterrupted()` và kết thúc, thường là giữ nguyên cờ interrupt (flag).
+Nhớ nha, `LockSupport.parkNanos` không quăng `InterruptedException` đâu. Bạn phải tự lấy tay check `Thread.currentThread().isInterrupted()` rồi mới quyết định dừng cuộc chơi.
 
 ## Multi-instance và scope
 
-Mỗi JVM có channel và lock riêng biệt; local retry không phối hợp authoritative state giữa các node. Các cơ chế database serialization hoặc deadlock retry có transaction rollback, phân loại lỗi (error classification) và cơ chế idempotency riêng được trình bày tại `LOCK-002` hoặc `DB-009`.
+Lưu ý là bài toán này chỉ nằm trong 1 máy ảo Java (JVM) thôi nhé. Mỗi máy có khóa riêng. Nếu bạn định xử lý vấn đề trên nhiều máy hoặc liên quan tới Database, thì phải xem các mẫu như `LOCK-002` hoặc `DB-009`.
 
 ## Hậu quả và khả năng quan sát (observability)
 
-Theo dõi tỷ lệ attempt trên completion, số lần exhausted retry, operation deadline, lock conflict, khoảng thời gian backoff, mức sử dụng CPU và runnable threads. Tín hiệu livelock điển hình: số lần retry tăng nhanh, số lần success gần như bằng 0, state version không thay đổi. Việc lấy thread dump theo thời gian sẽ hữu ích hơn so với một ảnh chụp (snapshot) đơn lẻ.
+Để biết hệ thống có bị Livelock hay không, hãy để ý: số lần retry bắn lên nóc, nhưng số lệnh hoàn thành thì bẹp dí bằng 0, version dữ liệu chả thay đổi. Nếu thấy cảnh này, chụp vài cái thread dump liên tục (theo thời gian) sẽ giúp bạn nhìn rõ bệnh hơn là chỉ chụp 1 tấm rồi ngồi đoán.

@@ -2,9 +2,7 @@
 
 ## Chiến lược
 
-Dùng latch để buộc hai tiến trình xử lý (worker) giữ lock đầu tiên trước khi cùng xin lock thứ hai. Gọi `ThreadMXBean.findDeadlockedThreads()` để xác nhận wait-for cycle trên `ReentrantLock`. Trình kiểm thử (harness) dùng `lockInterruptibly` để kiểm tra khả năng hủy và dọn dẹp; không tạo intrinsic-lock deadlock làm rò rỉ platform thread trong JVM kiểm thử.
-
-Không dùng `Thread.sleep`; mọi latch và future đều có timeout. Xem [Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
+Đừng xài `Thread.sleep` để test đa luồng, dùng CountDownLatch đi! Trong bài này, ta ép hai thread chạy song song, đợi tụi nó tạo vòng lặp rồi dùng `ThreadMXBean` để bắt quả tang. Nhớ dùng hàm `lockInterruptibly` để lỡ test bị kẹt thì vẫn huỷ (cancel) được, tránh để lại rác trong JVM.
 
 ## Thử nghiệm 1: tạo và phát hiện chu trình tất định
 
@@ -96,9 +94,9 @@ class OppositeLockOrderDeadlockTest {
 }
 ```
 
-`findDeadlockedThreads` nhận cả ownable synchronizers; `findMonitorDeadlockedThreads` chỉ tìm chu trình monitor intrinsic. Lệnh `cancel(true)` hoạt động vì trình kiểm thử chờ bằng `lockInterruptibly`; code bị lỗi trên production dùng `lock()` có thể không thoát.
+Đoạn test này vừa chứng minh được có vòng lặp, vừa phá được nó nhờ `cancel(true)` (vì dùng `lockInterruptibly`). 
 
-> **Nói ngắn gọn:** kiểm thử vừa chứng minh chu trình tồn tại, vừa chủ động phá chu trình để bộ kiểm thử (test suite) không giữ thread chết sau khi quá trình xác nhận kết quả (assertion) kết thúc.
+> **Nói ngắn gọn:** Test này cố tình dàn cảnh để bắt lỗi, xong tự dọn dẹp luôn để không làm treo máy.
 
 ## Thử nghiệm 2: kiểm thử thoái lui (regression test) cho định hướng tất định
 
@@ -141,47 +139,39 @@ private static void awaitUnchecked(CountDownLatch latch) {
     }
 }
 ```
-
-Đoạn mã dùng import trước và static `assertEquals`. Bounded future timeout đóng vai trò bộ canh gác (watchdog) bên ngoài: nếu thoái lui tái tạo deadlock, bài kiểm thử sẽ thất bại thay vì bị treo. Việc xác nhận bảo toàn dữ liệu (assertion conservation) bổ sung cho việc kiểm tra tính tiến triển.
+Test này để đảm bảo code mới vừa không bị treo, vừa tính toán chuẩn số dư tài khoản.
 
 ## Thử nghiệm 3: giới hạn thời gian acquire và release lock đầu tiên
 
-Giữ lock thứ hai ở một thread hỗ trợ (helper thread), gọi `transferWithin` với thời hạn ngắn rồi kiểm tra xem hàm có trả về `false` không. Sau đó, thread chính hoặc một helper khác phải acquire được lock thứ nhất, chứng minh luồng lỗi đã release lock. Cũng cần kiểm tra ngắt (interrupt) trong lúc chờ:
-
-- Hàm ném ra `TransferInterruptedException`;
-- Cờ ngắt (interrupt flag) của worker được giữ;
-- Cả lock thứ nhất và thứ hai đều không còn thuộc worker;
-- Không balance nào bị thay đổi.
-
-Không dùng khoảng thời gian tính bằng mili giây làm bằng chứng duy nhất; latch xác nhận yếu tố chặn (blocker) đã giữ lock trước khi bắt đầu lượt thử, future timeout đóng vai trò watchdog.
+Thử xin lock với thời gian ngắn. Nếu không xin được lock thứ 2, bắt buộc phải nhả cái thứ nhất ra. Các bài test cần check xem:
+- Có văng lỗi nghiệp vụ không.
+- Thread có bị huỷ không.
+- Có nhả sạch lock không.
+- Số dư giữ nguyên chưa thay đổi gì không.
 
 ## Kiểm thử tải (Stress test) và kiểm thử thuộc tính
 
-Sinh nhiều thao tác chuyển hai chiều trên nhiều account, luôn kiểm tra:
-
-- Mọi future hoàn tất trong thời hạn thao tác;
-- Tổng balance được bảo toàn;
-- Balance không âm nếu quy tắc nghiệp vụ cấm thấu chi (overdraft);
-- `ThreadMXBean.findDeadlockedThreads()` không chứa worker của bộ kiểm thử;
-- Số lượt thử lại (retry count) bị giới hạn.
-
-Kiểm thử tải làm tăng độ phủ nhưng không thay thế được các kiểm thử thoái lui và chu trình tất định.
+Bắn cả rổ request cùng lúc để test chịu tải:
+- Đảm bảo xong đúng thời gian.
+- Tiền không tự nhiên sinh ra hay mất đi.
+- Không có lỗi âm tiền.
+- Chả có thằng nào bị kẹt deadlock.
+- Số lần retry nằm trong mức cho phép.
 
 ## Xác minh trên production
 
-- Chụp thread dump khi độ trễ yêu cầu hoặc số lượng active thread tăng.
-- Chạy detector định kỳ với tần suất thấp, cảnh báo và lưu `ThreadInfo` cũng như stack trace cho các ID.
-- Số liệu (Metric): thời gian acquire lock, timeout, thời gian chạy critical-section, số lượt thử lại và số yêu cầu vượt thời hạn.
-- Ghi log account ID thứ nhất và thứ hai theo thứ tự chuẩn cùng correlation ID, không ghi log balance nhạy cảm nếu chính sách cấm.
-- Phân biệt bộ phát hiện (detector) của JVM với deadlock SQLSTATE và log của PostgreSQL.
+- Khi thấy CPU hay số lượng thread tăng bất thường, chụp ngay thread dump.
+- Cài tool theo dõi và lưu log khi phát hiện.
+- Đo đạt metric: thời gian chờ lock, số lần xin lại...
+- Log đàng hoàng, rõ ràng để dễ troubleshoot. Đừng lỡ tay log số dư tài khoản nhé.
 
 ## Checklist
 
-- [ ] Kiểm thử lỗi (Broken test) tạo chu trình bằng latch, không bằng lệnh sleep.
-- [ ] Dùng đúng detector phù hợp với `ReentrantLock`.
-- [ ] Các worker bị deadlocked được hủy và dọn dẹp.
-- [ ] Kiểm thử sửa lỗi (Fixed test) chạy hai hướng chuyển và giới hạn thời gian chờ future.
-- [ ] Tiến trình và bảo toàn balance đều được xác nhận kết quả (assert).
-- [ ] Luồng ngắt hoặc timeout thực hiện release lock đã giữ.
-- [ ] Thử lại có thời hạn và giới hạn số lượt (attempt cap).
-- [ ] Chẩn đoán trên production lưu trữ owner và waiter stack.
+- [ ] Bài test cũ chạy lỗi vì sinh chu trình vòng tròn (dùng Latch).
+- [ ] Dùng đúng `findDeadlockedThreads` cho `ReentrantLock`.
+- [ ] Worker trong test huỷ được gọn cảng.
+- [ ] Test code mới chạy trơn tru hai hướng chuyển.
+- [ ] Data luôn đảm bảo chính xác.
+- [ ] Khi ngắt lệnh phải nhả lock đàng hoàng.
+- [ ] Cài đặt giới hạn thời gian/số lần retry chuẩn.
+- [ ] Log rành mạch lỗi trên production.

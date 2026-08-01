@@ -2,37 +2,37 @@
 
 ## 1. Dòng Thời Gian Đan Xen Luồng (Interleaving Timeline)
 
-Giả định Tác vụ T1 và T2 đồng thời chạm đích (hoàn tất), cả hai luồng cùng truy xuất vào thông số `size` nội tại của cấu trúc mảng và tiến hành hành vi ghi đè (write). Hậu quả: một kết quả vật lý có nguy cơ cao bị xóa sổ hoàn toàn khỏi bộ nhớ.
-Kịch bản Tác vụ T3 sụp đổ sẽ khiến khối tổng hợp (Aggregate) rơi vào trạng thái ngoại lệ (Exceptional); tuy nhiên, luồng T2 vẫn thản nhiên hoàn thành công việc sau đó và tiếp tục gây biến dạng cấu trúc dữ liệu lỗi (Mutate partial state).
+Cứ tưởng tượng luồng T1 và T2 cùng về đích một lúc. Cả hai đều tranh nhau đọc kích thước (`size`) của mảng rồi ghi đè dữ liệu lên đó. Thế là toang, data của thằng này có thể bị thằng kia ghi đè mất hút luôn!
+Nếu luồng T3 có bị lỗi (Exception), nó sẽ làm cho kết quả gom chung bị lỗi theo. Ấy vậy mà luồng T2 vẫn tỉnh bơ chạy xong và tiếp tục ghi bậy vào cái mảng kết quả đó.
 
 ## 2. Đối Chiếu Kết Quả (Expected vs Actual)
 
-**Kỳ Vọng (Expected):**
-- Trả về tập dữ liệu Bất Biến (Immutable).
-- Quy mô đầy đủ, giữ chuẩn trình tự (Ordered success).
-- Hoặc cung cấp một ngoại lệ (Explicit failure) rõ ràng nếu hệ thống đứt gãy.
+**Anh em mình kỳ vọng (Expected):**
+- Trả về danh sách dữ liệu không thể thay đổi (Immutable).
+- Chạy đủ 100%, giữ nguyên thứ tự ngon lành.
+- Nếu có lỗi thì vứt ra cái lỗi (Exception) đàng hoàng.
 
-**Thực Tế (Actual):**
-- Mảng dữ liệu bị khuyết thiếu (Lost update).
-- Trật tự sắp xếp bị bẻ cong theo tốc độ hoàn thành luồng (Completion-order).
-- Trạng thái ngầm thay đổi dẫu cho Cờ Ngoại Lệ đã được giương lên.
-- Tín hiệu Hủy (Cancellation) hoàn toàn tắc nghẽn, không được kế thừa truyền dẫn (Propagate) cho các tác vụ con.
+**Thực tế nhận được (Actual):**
+- Dữ liệu trong mảng bị rớt mất.
+- Thứ tự lộn xộn, ai chạy xong trước thì nằm trước.
+- Dù có báo lỗi rồi mà data bên trong vẫn ngấm ngầm bị thay đổi.
+- Cần hủy (Cancel) mà nó chả chịu truyền cái lệnh hủy đó xuống cho mấy task con.
 
 ## 3. Bản Chất Nguồn Gốc Lỗi (Root Cause)
 
-Các chặng xử lý (Completion stages) duy trì đặc tính độc lập tuyệt đối về lịch trình phân bổ (Scheduling). Rào cản hệ quả `Happens-before` liên kết từ điểm hoàn tất tới lệnh `join` chỉ mang tính chất bảo chứng quyền Khả kiến (Visibility) của trạng thái được ghi chốt cuối cùng; nó hoàn toàn "Mù" trước các hành vi Đột biến đan xen (Concurrent mutation) đã xảy ra trước đó.
-Lệnh `allOf` đóng vai trò là một Rào cản Khép Vòng (Completion barrier), nó không được sinh ra để định danh cho một Chuỗi Giao Dịch (Transaction) hay một Cấu trúc Hủy Bỏ Đồng Bộ (Structured cancellation).
+Bản thân các luồng (Completion stages) nó chạy hoàn toàn độc lập với nhau. Khi bạn dùng `join` ở cuối, nó chỉ chắc chắn là nhận được kết quả cuối cùng thôi, chứ nó mù tịt không hề biết trước đó các luồng đã giành giật nhau ghi đè dữ liệu như thế nào.
+Thằng `allOf` chỉ như cái vạch đích báo hiệu "chạy xong hết rồi nè", chứ không phải là công cụ đóng gói quy trình (Transaction) hay hỗ trợ hủy đồng loạt.
 
 ## 4. Xử Lý Phân Loại Lỗi, Timeout Và Hủy Bỏ (Failure, Timeout, and Cancellation)
 
-- Thiết lập một Ngân sách Thời gian (Deadline) chung cho toàn khối; khi khối tổng hợp (Aggregate) gặp lỗi hoặc quá hạn, tiến hành kích hoạt tín hiệu Hủy (Cancel) các tiến trình con theo năng lực tối đa (Best-effort).
-- Các Client viễn trình (Remote client) bắt buộc vẫn phải tự cấu hình cơ chế Timeout độc lập.
-- Nghiêm cấm công bố cấu trúc Tích lũy (Accumulator) ra ngoài môi trường trước khi chốt phán quyết chung cuộc (Terminal outcome).
-- Phương thức `join` tự động bao bọc các mã lỗi vào trong khuôn khổ `CompletionException`; hệ thống cần thiết kế chủ đích mở gói (Unwrap cause) để nhận diện lỗi gốc.
+- Bạn nên gom chung 1 cái deadline (Timeout) cho nguyên cục. Khi hết hạn hoặc có lỗi, phải cố gắng đi hủy (Cancel) hết các luồng con đang chạy.
+- Nếu bạn gọi ra các dịch vụ ngoài (Remote client), tụi nó cũng phải tự có Timeout riêng nhe.
+- Tuyệt đối không đưa cái List data cho người ta xài khi chưa chạy xong xuôi hoàn toàn.
+- Hàm `join` sẽ bọc cái lỗi lại thành `CompletionException`, nên khi code bạn phải chủ động bóc lớp vỏ đó ra (Unwrap) để biết chính xác là lỗi gì.
 
 ## 5. Ứng Dụng Trên Kiến Trúc Phân Tán (Multi-instance Fallacy)
 
-- Toàn bộ khối Trạng thái (State) giới hạn cô lập trong một máy ảo JVM; chặng xử lý bất đồng bộ (Async stage) mặc định không kế thừa Khung Ngữ cảnh Giao dịch (Spring Transaction Context) gốc.
-- Bài toán đánh mất Ngữ cảnh Giao dịch (Transaction context loss) được phân tích chuyên sâu tại module SPR-002.
+- Toàn bộ trạng thái lúc này chỉ giới hạn trong một con Java (JVM) thôi. Khi chạy đa luồng (Async), nó sẽ mất luôn cái context của Spring Transaction.
+- Mất Transaction Context ra sao, bạn có thể xem kỹ hơn ở bài SPR-002 nhé.
 
-> **Nguyên tắc kỹ thuật:** Đồ thị cấu trúc hợp nhất (Composition graph) bắt buộc phải nắm giữ cả dòng chảy Giá trị (Value flow) lẫn dòng chảy Ngoại lệ (Failure flow); Mọi tác động ngoại vi (Shared side effect) đứng chênh vênh bên ngoài đồ thị sẽ vĩnh viễn thoát ly khỏi Hợp đồng Hoàn tất (Completion contract).
+> **Nhớ nè:** Lúc bạn ghép các Future lại, nhớ xử lý cả phần Dữ liệu (Value) và phần Lỗi (Failure). Những thao tác nào chọc ngoáy dữ liệu bên ngoài mà không nằm trong quản lý của Future thì coi như "mồ côi", Future sẽ không kiểm soát được đâu.

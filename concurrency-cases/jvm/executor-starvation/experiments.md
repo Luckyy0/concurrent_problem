@@ -1,8 +1,8 @@
 # Môi Trường Thực Nghiệm: Cấu Trúc Kiểm Định Rủi Ro & Đánh Giá Khai Thác
 
-## 1. Thí Nghiệm 1: Trình Diễn Bế Tắc Khép Kín (Self-Starvation)
+## 1. Thí Nghiệm 1: Tái Hiện Bế Tắc (Self-Starvation)
 
-Sử dụng chốt điều hướng (Latch) để đảm bảo hai Tác vụ Cha cùng đoạt quyền kiểm soát Luồng Công Nhân trước khi phóng Tác vụ Con ra tiền tuyến:
+Chúng ta dùng Latch để cố tình cho 2 Tác vụ Cha chạy và chiếm trọn 2 luồng công nhân, rồi mới cho chúng gọi Tác vụ Con ra chạy:
 
 ```java
 @Test
@@ -16,9 +16,9 @@ void parentsStarveChildrenOnTheSamePool() throws Exception {
     Callable<String> parent = () -> {
         bothParentsRunning.countDown();
         if (!bothParentsRunning.await(5, TimeUnit.SECONDS)) {
-            throw new IllegalStateException("Quy trình giả lập đan chéo đổ vỡ");
+            throw new IllegalStateException("Giả lập lỗi rồi");
         }
-        // Cha đẩy Con vào Hàng đợi và chôn chân chờ đợi
+        // Cha đẩy Con vào chung Hàng đợi rồi đứng đực ra đợi
         Future<String> child = pool.submit(() -> "child-done");
         return child.get(30, TimeUnit.SECONDS); 
     };
@@ -26,12 +26,12 @@ void parentsStarveChildrenOnTheSamePool() throws Exception {
     Future<String> first = pool.submit(parent);
     Future<String> second = pool.submit(parent);
     try {
-        // Tái xác nhận hệ thống đã đóng băng và văng lỗi Quá hạn
+        // Test sẽ pass nếu bị Timeout - chứng tỏ hệ thống đã đứng hình
         assertThrows(TimeoutException.class,
                 () -> first.get(300, TimeUnit.MILLISECONDS));
-        assertEquals(2, pool.getActiveCount()); // 100% Công Nhân đang kẹt
-        assertEquals(2, pool.getQueue().size()); // 100% Con bị nhốt
-        assertEquals(0, pool.getCompletedTaskCount()); // Không một ai hoàn thành
+        assertEquals(2, pool.getActiveCount()); // 100% Công nhân đang kẹt chờ
+        assertEquals(2, pool.getQueue().size()); // 100% Việc con mắc kẹt dưới hàng đợi
+        assertEquals(0, pool.getCompletedTaskCount()); // Chả làm được tích sự gì
     } finally {
         first.cancel(true);
         second.cancel(true);
@@ -41,11 +41,11 @@ void parentsStarveChildrenOnTheSamePool() throws Exception {
 }
 ```
 
-Hệ thống Timeout chỉ mang ý nghĩa làm Người gác cổng (Watchdog/Assertion), trong khi cấu trúc Latch mới là kiến trúc sư định hình Hình thái Cố định (Deterministic topology). Quy trình Hủy thử nghiệm (Test cleanup) tác động lên Cha; Cơ chế Ngắt (Interruption) sẽ ép hàm `child.get()` buông tay.
+Dùng Latch để chắc chắn hệ thống luôn kẹt đúng kịch bản mong muốn, thay vì dùng `Thread.sleep` hên xui.
 
-> **Nguyên tắc kỹ thuật:** Bằng chứng pháp lý "Công nhân chạy toàn bộ, Trẻ em kẹt trong hàng đợi, Hoàn thành bằng Không" khắc họa chân dung Nạn đói Tài nguyên một cách đanh thép hơn hàng vạn lần so với một tín hiệu Timeout đơn lẻ.
+> **Mẹo nhỏ:** Việc lôi ra bằng chứng "Luồng đầy, hàng đợi đầy, việc xong bằng 0" đáng giá hơn rất nhiều so với việc chỉ nhìn thấy một cái báo lỗi Timeout.
 
-## 2. Thí Nghiệm 2: Truy Vấn Trực Tiếp Giải Tỏa Tiến Trình (Direct Call)
+## 2. Thí Nghiệm 2: Giải Quyết Bằng Cách Gọi Trực Tiếp (Direct Call)
 
 ```java
 @Test
@@ -54,7 +54,7 @@ void directDependencyCallCompletesAtPoolCapacity() throws Exception {
     CountDownLatch start = new CountDownLatch(1);
     Callable<String> task = () -> {
         if (!start.await(5, TimeUnit.SECONDS)) throw new IllegalStateException();
-        return loadPriceDirectly(); // Truy xuất trực tiếp, không qua Hàng đợi
+        return loadPriceDirectly(); // Gọi hàm xử lý luôn, khỏi qua hàng đợi
     };
     Future<String> first = pool.submit(task);
     Future<String> second = pool.submit(task);
@@ -69,41 +69,42 @@ void directDependencyCallCompletesAtPoolCapacity() throws Exception {
 }
 ```
 
-Kiến tạo Giả lập (Fake dependency) bắt buộc tuân thủ tính Định Lượng (Bounded/Deterministic); Khước từ vĩnh viễn cấu trúc Ngủ (Sleep).
+Chạy thẳng hàm `loadPriceDirectly()` luôn, không thèm quăng vào queue nữa, thế là ngon lành!
 
-## 3. Thí Nghiệm 3: Cơ Chế Khước Từ Và Hủy Bỏ (Rejection & Cancellation)
+## 3. Thí Nghiệm 3: Test Lỗi Từ Chối Và Hủy Bỏ (Rejection & Cancellation)
 
-Kiến trúc thử nghiệm: Pool 1 + Queue 1. Phong tỏa Luồng Công Nhân qua Latch, tống khứ một Tác vụ vào Hàng đợi, tiếp tục nhồi Tác vụ thứ 3. Kích hoạt xác thực `RejectedExecutionException` ngay tại Cổng kiểm soát (Admission boundary).
-Kế tiếp, phá khóa Latch và nghiệm thu hai Tác vụ lọt lưới đã hoàn tất quy trình. 
-Luồng Kiểm định Timeout (Timeout path) bắt buộc xác nhận các Tác vụ Con phải hứng chịu tín hiệu `cancel(true)` và cờ Trạng Thái Ngắt (Interrupt status) của Luồng Công Nhân đã được khôi phục.
+Test này mình tạo Pool 1 luồng + Queue 1 chỗ. Khóa luồng bằng Latch, nhét 1 việc vào Queue, xong nhét thêm việc thứ 3. Hệ thống phải quăng lỗi `RejectedExecutionException` ngay lập tức.
+Sau đó mở Latch, xác nhận 2 việc kia chạy bình thường.
+Nếu có tác vụ nào bị báo Timeout, thì mình cũng phải test xem nó có nhận được lệnh `cancel(true)` để dọn dẹp sạch sẽ hay không.
 
-## 4. Xác Minh Sức Chịu Tải (Load/Stress Checks)
+## 4. Test Sức Chịu Tải (Load/Stress Checks)
 
-Kích thích Cường độ Yêu cầu (Request rate) vượt ngưỡng Cổng kiểm soát và chứng thực:
-- Dung lượng Hàng đợi không bùng nổ vượt giới hạn.
-- Sự kiện Từ chối (Rejection) xuất hiện trước khi Dung lượng Bộ nhớ (Memory growth) phình to.
-- Chỉ số Hoàn Tất (Completed count) vận hành bền bỉ.
-- Độ tuổi P99 của Hàng đợi (P99 queue age) nằm gọn trong Hạn mức cho phép.
-- Cơ chế Thử lại (Retry) không tự lao đầu vào lại chính Nút (Node) đang tử nạn.
-Lưu ý: Bộ Stress Test tuyệt đối không thay thế đặc tính chứng minh logic của bài Test Chờ Lồng Nhau.
+Bơm request dồn dập vào hệ thống xem nó chịu nhiệt ra sao. Nhớ kiểm tra:
+- Hàng đợi có bị bung nóc không?
+- Lỗi báo từ chối (Rejection) phải văng ra trước khi RAM bị đầy nghẹt.
+- Số lượng task làm xong vẫn phải tăng đều đặn.
+- Thời gian chờ của mấy thằng xếp hàng không được quá lâu.
+- Bọn bị từ chối không được lặp lại nhồi đạn (Retry) vào đúng cái server đang sấp mặt đó.
 
-## 5. Giám Sát Môi Trường Khai Thác (Production Blueprint)
+*(Lưu ý: Test chịu tải này không dùng để thay thế cho cái bài Test logic ở bước 1 đâu nha.)*
 
-Đặc tả vận hành:
-- Giám sát Luồng Active/Max, Thông lượng Hàng đợi/Sức chứa, Tuổi đời Tác vụ tồn đọng (Oldest task age);
-- Biên độ biến động Tác vụ Đệ trình/Bắt đầu/Hoàn Tất/Từ Chối/Hủy (Delta);
-- Khảo sát Thời gian Chờ (Queue wait), Thời lượng Thi Hành (Execution), Độ trễ Cấu trúc phụ thuộc (Dependency latency) và Hạn mức Cuối (End-to-end deadline);
-- Trích xuất Thread Dump vạch trần Ngăn Xếp Luồng Công Nhân (Worker stack) mắc kẹt tại `Future.get` / Nhập Xuất Viễn Trình (Remote I/O);
-- Đánh giá khả năng Tiêu thụ Tài nguyên Ngoại vi / Hạn Mức Tải (Downstream connection/Quota utilization);
-- Theo dõi Độ trễ Tắt Hệ Thống (Graceful shutdown elapsed) và Khối lượng Tác vụ Chết yếu (Unfinished task count).
+## 5. Cần Giám Sát Những Gì Trên Production (Production Blueprint)
+
+Đưa lên môi trường thật thì nhớ check:
+- Pool đang chạy bao nhiêu luồng, max bao nhiêu, hàng đợi chứa bao nhiêu.
+- Task cũ nhất dưới hàng đợi đã nằm đó bao lâu rồi.
+- Tốc độ nhận việc, chạy việc, hoàn thành và từ chối.
+- Nếu kẹt, lấy Thread Dump ra xem có phải mấy ông kẹ đang đứng ngáp ở hàm `Future.get()` không.
+- Coi chừng xài hết băng thông hay connection xuống DB.
+- Lúc tắt server (Graceful shutdown) nó tốn bao lâu và có bao nhiêu task tèo giữa chừng.
 
 ## 6. Khung Tiêu Chuẩn Thực Nghiệm (Quality Checklist)
 
-- [ ] Latch chứng minh hai Tác vụ Cha đã độc chiếm Luồng Công Nhân trước thềm Tác vụ Con ra đời.
-- [ ] 100% Mỏ neo `await`/`get` được gắn Timeout.
-- [ ] Xóa bỏ hoàn toàn định dạng `Thread.sleep`.
-- [ ] Chứng thực Nạn đói Tài nguyên bao hàm cả chuỗi số liệu: Active, Queued, Completed.
-- [ ] Tái lập quy trình Cleanup: Hủy Tác vụ và Neo hệ thống chờ Executor Shutdown.
-- [ ] Fixed test chứng minh Mạch Tiến Trình thông suốt trên cùng cấu trúc Pool.
-- [ ] Chính sách Khước từ (Rejection policy) đụng độ Bài kiểm định Cửa ngõ Quá tải (Overload boundary).
-- [ ] Metric Production phân định rạch ròi Độ Trễ Hàng Đợi (Queue wait) và Thời lượng Thi Hành.
+- [ ] Đã dùng Latch để test chắc chắn 100% Cha chiếm luồng.
+- [ ] Tất cả hàm `await` hay `get` đều phải nhét Timeout vào.
+- [ ] Bỏ hẳn thói quen dùng `Thread.sleep` khi viết Test.
+- [ ] Lúc văng lỗi đói tài nguyên, phải log đủ cả Active, Queued, Completed.
+- [ ] Test xong nhớ Cleanup sạch sẽ.
+- [ ] Phải có bài Test chứng minh cách fix trên một Pool duy nhất.
+- [ ] Test đủ cơ chế Rejection khi dồn tải qua cửa.
+- [ ] Trọn bộ Monitor đo được rõ thời gian kẹt trong hàng đợi và thời gian chạy thực tế.

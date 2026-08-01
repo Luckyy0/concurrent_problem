@@ -1,8 +1,8 @@
-# Phản Mẫu Thiết Kế (Anti-Patterns): Nguy Cơ Tranh Chấp Tài Nguyên Nội Tại Của ArrayList
+# Phản Mẫu Thiết Kế (Anti-Patterns): Nguy Cơ Khi Dùng Chung ArrayList
 
-## 1. Cấu Trúc Mã Nguồn Dùng Chung ArrayList
+## 1. Mã Nguồn Lỗi Dùng Chung ArrayList
 
-Đoạn mã cấu trúc một Service quản lý vòng lặp tác vụ thông qua Executor của hệ sinh thái Spring. Mỗi phân luồng thi hành độc lập truy vấn báo giá và chèn chung (append) vào một cá thể `ArrayList`. Đồng thời, đặc tả thiết kế cho phép phương thức giám sát `progressSnapshot()` kích hoạt song song nhằm khảo sát tiến độ.
+Đoạn mã dưới đây minh họa một Service quản lý xử lý tác vụ theo lô (batch) dùng Executor của Spring. Mỗi luồng (thread) chạy song song sẽ tự lấy báo giá và thêm (append) vào chung một `ArrayList`. Đồng thời, phương thức giám sát `progressSnapshot()` có thể được gọi bất cứ lúc nào để xem tiến độ hiện tại.
 
 ```java
 package com.example.quote;
@@ -41,7 +41,7 @@ public class BrokenBatchQuoteService {
         for (QuoteRequest request : requests) {
             Future<?> future = quoteExecutor.submit(() -> {
                 QuoteResult result = quoteClient.fetch(request);
-                // VỊ TRÍ LỖI: Cập nhật song song vào cấu trúc không an toàn
+                // LỖI Ở ĐÂY: Nhiều luồng cùng gọi add() vào danh sách không an toàn
                 batch.results.add(result);
             });
             batch.futures.add(future);
@@ -65,7 +65,7 @@ public class BrokenBatchQuoteService {
     }
 
     public List<QuoteResult> progressSnapshot(UUID batchId) {
-        // VỊ TRÍ LỖI: Duyệt danh sách trong lúc cấu trúc đang bị biến đổi ngầm
+        // LỖI Ở ĐÂY: Đọc/Copy danh sách trong lúc các luồng khác vẫn đang ngầm add()
         return List.copyOf(requireBatch(batchId).results);
     }
 
@@ -89,7 +89,7 @@ public class BrokenBatchQuoteService {
 }
 ```
 
-Mô hình đối tượng truyền dẫn cơ bản:
+Các record/class cơ bản được sử dụng:
 
 ```java
 package com.example.quote;
@@ -106,80 +106,77 @@ public record QuoteResult(
 ) {}
 ```
 
-Cấu trúc `running` (dựa trên `ConcurrentHashMap`) chỉ giới hạn chức năng bảo vệ bảng đăng ký theo dõi Lô xử lý. Nó **KHÔNG** truyền dẫn tính toàn vẹn (Thread-safety) lan xuống các lớp biến `ArrayList` chứa bên trong cấu trúc `RunningBatch`.
+**Lưu ý:** Việc bọc `RunningBatch` bên trong `ConcurrentHashMap` (biến `running`) chỉ giúp an toàn khi thêm/xóa mã lô (`batchId`). Nó **KHÔNG** làm cho danh sách `ArrayList` bên trong `RunningBatch` trở nên an toàn khi bị đa luồng truy cập (thread-safe).
 
-## 2. Phân Rã Hai Nguy Cơ Tranh Chấp Độc Lập
+## 2. Phân Tích Các Lỗi Tranh Chấp
 
-### 2.1 Cạnh Tranh Ghi Đè Trên Cùng Cấu Trúc Nội Tại
+### 2.1 Ghi Đè Lên Nhau Trong ArrayList
+Hàm `ArrayList.add` thực ra gồm nhiều bước nhỏ bên trong: đọc biến `size` để tìm vị trí, ghi dữ liệu vào mảng (backing array) ở vị trí đó, rồi tăng biến `size++`. Vì quá trình này không phải là một cục liền khối không thể chia cắt (không nguyên tử - not atomic), nên hai luồng có thể cùng đọc được một vị trí `size`, rồi cùng ghi dữ liệu vào vị trí đó. Kết quả là dữ liệu của luồng ghi sau sẽ đè lên luồng trước, gây mất dữ liệu.
 
-Về bản chất, hàm `ArrayList.add` thực thi chuỗi hành vi rời rạc: định vị biến `size` làm chỉ mục, nạp phần tử vào mảng cấp thấp (backing array), và tăng cấp trị số `size`. Trạng thái này thiếu hụt tính Nguyên Tử. Hậu quả: Hai phân luồng tác vụ có rủi ro sử dụng trùng một vị trí chỉ mục, dẫn đến một kết quả hoàn toàn bị xóa sổ bởi kết quả chậm hơn.
+Việc khai báo trước kích thước `new ArrayList<>(expectedSize)` chỉ giúp tránh việc mảng phải liên tục mở rộng bộ nhớ (resize), chứ không giúp giải quyết xung đột khi cộng biến đếm `size`.
 
-Hành động cấp phát bộ nhớ trước `new ArrayList<>(expectedSize)` chỉ cắt giảm tần suất dịch chuyển vùng nhớ (resize array). Nó không cấp phép nguyên tử hóa cho các thao tác đọc/ghi thông số vòng lặp ngầm.
+### 2.2 Sửa Đổi Trạng Thái Dùng Chung
+Phương thức `start()` trả về `batchId` ngay sau khi ném hết tác vụ vào thread pool. Lúc này, cả danh sách `batch.futures` lẫn `batch.results` đã ở trạng thái chia sẻ (Shared mutable state) và có thể bị các hàm khác đọc giữa chừng.
 
-### 2.2 Biến Biến Dạng Cấu Trúc Tại Luồng Điền Danh Sách Chờ
+### 2.3 Lỗi Khi Xem Tiến Độ Cùng Lúc (Snapshot)
+Lệnh `List.copyOf(batch.results)` đòi hỏi duyệt qua toàn bộ mảng. Nếu lúc nó đang duyệt mà có luồng khác đang gọi `add()` thì cấu trúc mảng bị thay đổi giữa chừng. Hệ quả là nó có thể ném ra lỗi `ConcurrentModificationException` làm treo hàm đọc, hoặc tệ hơn là trả về mảng có chứa các giá trị rác.
 
-Phương thức `start()` công bố định danh `batchId` tức thời sau khi kết thúc chuỗi gửi tiến trình (submit). Nếu các tác vụ nội tại khởi chạy hệ thống (event trigger) hoặc API gọi `awaitResult()` can thiệp sớm, việc chia sẻ biến `batch.futures` ngay lập tức trở thành nguy cơ phân cực trạng thái bất hợp pháp (Shared mutable state).
+> **Nguyên tắc kỹ thuật:** Việc đặt một danh sách `ArrayList` (Mutable object) vào trong một `ConcurrentHashMap` (Thread-safe map) KHÔNG hề giúp danh sách đó trở nên an toàn trước đa luồng.
 
-Thiết kế này giữ nguyên điểm công bố trạng thái (publish point) tại điểm cuối hàm `start()`, nhưng cần nhận thức rõ đặc tính rủi ro nếu quá trình nâng cấp mã nguồn vô tình phá vỡ hợp đồng luồng này.
+## 3. Vì Sao Code Dễ Đánh Lừa Lập Trình Viên?
 
-### 2.3 Hiện Tượng Ngắt Snapshot Tiến Độ Không Định Hình
+Lập trình viên thường nghĩ mã này an toàn vì:
+- Mỗi `RunningBatch` đều được cấp phát riêng cho từng request mới.
+- Mảng `ArrayList` đã được khai báo sẵn kích thước.
+- Dữ liệu `QuoteResult` là dữ liệu mới tạo riêng biệt.
+- Hàm `awaitResult` có dùng `Future.get` để chờ tất cả xong mới lấy kết quả.
+- Khi chạy thử nội bộ (Unit Test) một mình, lỗi đa luồng rất hiếm khi xảy ra.
 
-Giao thức `List.copyOf(batch.results)` bắt buộc hệ thống duyệt xuất qua toàn bộ mảng. Khi kết hợp với các luồng thay đổi cấu trúc mảng ngầm định, phương thức này phá vỡ hợp đồng quản trị an toàn luồng, gây phản ứng trả về dữ liệu rác (Partial view) hoặc ném lỗi ngưng trệ ứng dụng.
+Điểm chết người ở đây là: Tất cả các luồng ghi đều trút dữ liệu vào cùng một mảng dùng chung (Shared Accumulator) nhưng lại thiếu cơ chế bảo vệ như Khóa (Lock).
 
-> **Nguyên tắc kỹ thuật:** Đóng gói một danh sách thay đổi (Mutable object) vào bên trong cấu trúc lưu trữ An Toàn Luồng (Concurrent map) KHÔNG cấp phép an toàn tự động cho danh sách đó.
+## 4. Các Điều Kiện Kích Hoạt Lỗi
 
-## 3. Bản Chất Xung Đột Dễ Bị Lầm Tưởng
+Lỗi sẽ xảy ra khi hội tụ đủ các yếu tố:
+1. Có từ hai tác vụ trở lên chạy song song trong cùng một lô (Overlap tasks).
+2. Các luồng này tình cờ gọi `results.add` cùng lúc.
+3. Người dùng vô tình gọi API xem tiến độ (Progress reader) trước khi lô chạy xong.
+4. Không hề có Lock (Synchronized) hay dùng Collection hỗ trợ đa luồng.
+5. Nghiệp vụ yêu cầu danh sách kết quả phải đúng thứ tự, nhưng các luồng lại add() lộn xộn.
 
-Cấu trúc trên thường đánh lừa tư duy an toàn qua các cảm quan:
-- Bộ nhớ lưu trữ `RunningBatch` độc quyền trên mỗi yêu cầu (Request).
-- Không gian bộ nhớ mảng đã được phân bổ định mức đầu vào.
-- Tác vụ xử lý đối tượng truyền dẫn mới mẻ (`QuoteResult`).
-- Phán quyết trả kết quả được phong tỏa chờ luồng hoàn tất (`Future.get`).
-- Chuỗi kiểm thử cục bộ (Unit Test) khó bộc lộ lỗ hổng đan xen luồng.
+## 5. Những Cách Sửa Sai Lầm (Phản Mẫu - Anti-patterns)
 
-Điểm đứt gãy chí mạng: Tập trung toàn bộ tài nguyên Ghi vào cấu trúc Chia Sẻ (Shared Accumulator) trong điều kiện Vắng Bóng Rào Cản Thẩm Định (Lock / Ownership Protocol).
+Dưới đây là những cách sửa mà lập trình viên hay dùng nhưng thực chất **không giải quyết được vấn đề**:
 
-## 4. Các Tác Nhân Kích Hoạt Lỗi Hệ Thống
+### Truyền Khối Lượng Khởi Tạo Lớn (Initial Capacity)
+Như đã nói ở trên, việc `new ArrayList<>(size)` chỉ giúp mảng đỡ phải mở rộng kích thước, hoàn toàn không chặn được việc 2 luồng cùng ghi đè lên chung một vị trí `size`.
 
-1. Lô xử lý khởi phát tối thiểu hai tiến trình chéo (Overlap tasks).
-2. Chuỗi luồng thực thi đồng thời kích hoạt `results.add`.
-3. Tác vụ trích xuất tiến độ (Progress reader) khởi động trước ranh giới phong tỏa luồng.
-4. Triệt tiêu cơ chế Khóa hoặc cấu trúc Tập hợp đồng thời tương xứng.
-5. Yêu cầu định hình thứ tự dữ liệu đầu ra không khớp thứ tự hoàn thành.
+### Dùng từ khóa `volatile` hoặc `final`
+Từ khóa `final` chỉ khóa không cho trỏ biến đó sang một danh sách khác, `volatile` thì giúp luồng khác thấy danh sách được cập nhật. Cả hai từ khóa này không liên quan gì đến việc bảo vệ cơ chế `add()` của mảng khỏi xung đột đa luồng.
 
-## 5. Phản Mẫu Kỹ Thuật Khắc Phục Sai Lệch
-
-### Tăng Khối Lượng Phân Bổ (Initial Capacity)
-Xử lý Capacity chỉ loại trừ chu trình sao chép mảng mở rộng (Resize). Hiện tượng chồng chéo tham chiếu truy cập thuộc tính `size` nội tại vẫn tồn tại độc lập.
-
-### Che Chắn Bằng Khai Báo Biến Tĩnh (`volatile` / `final`)
-Tham số `final` định danh con trỏ vùng nhớ khởi tạo; tham số `volatile` định hình sự nhìn nhận thay đổi của luồng lên vùng nhớ. Cả hai công cụ này hoàn toàn không tái tạo tính Nguyên Tử cho phương thức cấp thấp `ArrayList.add`.
-
-### Ảo Giác An Toàn Qua Mảng Đồng Thời (Parallel Stream)
+### Dùng Parallel Stream Sai Cách
 
 ```java
 List<QuoteResult> results = new ArrayList<>();
 requests.parallelStream()
         .map(quoteClient::fetch)
-        .forEach(results::add);
+        .forEach(results::add); // LỖI Y HỆT
 ```
-Kiến trúc này duy trì một danh sách tích lũy ngoại vi. Framework Stream không cung cấp cơ chế khóa tự động cho các cấu trúc ngoại sinh nằm ngoài luồng thực thi.
+Vòng lặp bên trong chia luồng chạy song song, nhưng vẫn trút dữ liệu vào một biến `results` dùng chung bên ngoài (external accumulator). Framework Stream không tự động sinh ra Lock để bảo vệ biến đó.
 
-### Áp Dụng Giới Hạn Monitor (`Collections.synchronizedList`)
+### Bọc Khóa Bằng Collections.synchronizedList
 
-Bảo chứng tuần tự tại điểm nạp giá trị, nhưng phân tán quyền kiểm soát trên các tiến trình kết hợp:
+Cách này có thể tạm ổn khi `add`, nhưng lại rất dễ dính lỗi ở những chỗ khác:
 
 ```java
+// Khi gọi progressSnapshot
 synchronized (results) {
     return List.copyOf(results);
 }
 ```
-Lỗ hổng xuất hiện khi API Giám sát bỏ sót khai báo Monitor này, dẫn đến vỡ cấu trúc hợp đồng an toàn. Mô hình này không xử lý bài toán sắp xếp trạng thái hay quản trị vòng đời ngoại lệ.
+Lỗ hổng xảy ra nếu ở hàm nào đó lập trình viên quên dùng `synchronized (results)` khi duyệt mảng. Ngoài ra, cách này làm các luồng phải xếp hàng chờ nhau để `add()`, gây chậm, và nó không đảm bảo thứ tự kết quả như ban đầu.
 
-### Hao Tổn Cấu Trúc Với (`CopyOnWriteArrayList`)
+### Dùng CopyOnWriteArrayList
+Mỗi khi gọi `add()`, class này sẽ tạo bản sao (copy) của toàn bộ mảng. Nếu gọi `add()` hàng trăm lần, nó sẽ phung phí và ngốn bộ nhớ kinh khủng (Write-heavy). Class này chỉ phù hợp nếu ta ít khi thêm/xóa mà chủ yếu là đọc.
 
-Kiến tạo Mảng sao lưu (Copy backing array) trên từng thao tác Ghi. Ổn định ở điểm Truyệt Xuất, nhưng thiêu rụi bộ nhớ qua vô số lần phân bổ không cần thiết (Allocation) cho các quy trình tập trung Ghi Dữ Liệu (Write-heavy).
-
-### Trực Tiến Quản Trị Ngoại Lệ Bằng Thử Lại (Catch & Retry)
-
-Giao thức đánh ngắt nhanh (Fail-fast iterator) hoạt động dựa trên phương thức tối đa (Best-effort). Sự vắng mặt của ngoại lệ không đại diện cho Snapshot tinh sạch. Kích hoạt Retry hoàn toàn vô nghĩa trong việc khôi phục các dữ liệu đã bị xóa sổ bởi luồng đan chéo.
+### Dùng Khối Catch Bắt Lỗi Rồi Chạy Lại (Catch & Retry)
+Bắt lỗi `ConcurrentModificationException` rồi bỏ qua không giải quyết được việc các luồng đã lỡ đè dữ liệu lên nhau. Ngoài ra, Collection đôi khi bị hỏng cấu trúc ngầm mà không ném lỗi ngay. Việc Retry cũng không khôi phục được dữ liệu đã bị ghi đè mất.

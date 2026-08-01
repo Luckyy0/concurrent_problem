@@ -2,79 +2,80 @@
 
 ## 1. Dòng Thời Gian Đan Xen (Interleaving Timeline)
 
-Giả định Trạng Thái Gốc bảo lưu Thế hệ 41:
+Giả sử hiện tại hệ thống đang chạy với "Thế hệ 41":
 ```text
 merchant-a → Provider-X, Thế hệ=41
 merchant-b → Provider-Y, Thế hệ=41
 ```
 
-Hệ thống Dịch vụ cấu hình phát lệnh Thế hệ 42:
+Bây giờ Cấu hình báo có bản cập nhật mới, gọi là "Thế hệ 42":
 ```text
 merchant-a → Provider-Z, Thế hệ=42
 merchant-b → Provider-Y, Thế hệ=42
 ```
 
-Tuyến Ghi (Writer) tháo dỡ bằng `routes.clear()` rồi đổ dữ liệu bằng `routes.putAll(loaded)`. Mấu chốt kỹ thuật: `putAll` KHÔNG phải một thao tác nguyên khối; dưới góc độ ngữ nghĩa (semantics), nó bị phân rã thành một chuỗi liên hoàn các đột biến (mutations) cày xới trên bề mặt Map.
+Lúc này, Luồng ghi (Writer) bắt đầu dọn dẹp bằng `routes.clear()` rồi đổ dữ liệu vào bằng `routes.putAll(loaded)`. Vấn đề lớn nhất ở đây là: Lệnh `putAll` KHÔNG làm xong mọi thứ trong chớp mắt (nguyên khối). Thực tế, nó chia nhỏ thành từng bước lắt nhắt để cập nhật Map.
 
 ### Cửa Sổ Rủi Ro Đứt Gãy
 
+Hãy xem bảng thời gian này để thấy rủi ro:
+
 | Trình tự | Luồng Làm mới (T1) | Luồng Yêu cầu (T2) | Luồng Giám sát (T3) | Trạng Thái Hệ Thống Thực Tế |
 | --- | --- | --- | --- | --- |
-| 1 | Nạp xong Thế hệ 42 | | | Chứa toàn vẹn Thế hệ 41 |
-| 2 | Kích hoạt `routes.clear()` | | | Bản đồ bộ nhớ bị san phẳng (Rỗng) |
-| 3 | (Đóng băng) | Triệu gọi `get("merchant-b")` | | Nhận `null`, buộc dạt vào Fallback |
-| 4 | Nạp Khóa `merchant-a` | | | Map biến dị mang một mảnh của Thế hệ 42 |
-| 5 | (Đóng băng) | | Lặp qua `entrySet()` | Giám sát báo cáo hệ thống chỉ có `merchant-a` |
-| 6 | Nạp Khóa `merchant-b` | | | Tái cấu trúc thành công Thế hệ 42 |
+| 1 | Nạp xong Thế hệ 42 | | | Vẫn đang phục vụ Thế hệ 41 |
+| 2 | Kích hoạt `routes.clear()` | | | Bản đồ bộ nhớ bị xóa sạch bách (Rỗng) |
+| 3 | (Tạm nghỉ) | Gọi hàm `get("merchant-b")` | | Nhận về `null`, phải đẩy sang đối tác dự phòng (Fallback) |
+| 4 | Nạp Khóa `merchant-a` | | | Map bây giờ chỉ có 1 phần của Thế hệ 42 |
+| 5 | (Tạm nghỉ) | | Đang duyệt `entrySet()` | Báo cáo giám sát nói hệ thống chỉ có mỗi `merchant-a` |
+| 6 | Nạp Khóa `merchant-b` | | | Hoàn thành Thế hệ 42 trọn vẹn |
 
-Không cần tới 2 Tuyến Ghi để xé nát Quy tắc Bất biến (Invariant). Chỉ 1 Tuyến Ghi và 1 Tuyến Đọc là quá đủ làm sập hệ thống. Nếu vòng lặp (Iteration) đâm sầm vào Cấu trúc đang biến đổi, `HashMap` sẽ thẳng tay ném ngoại lệ `ConcurrentModificationException`. Đặc tính Ngắt nhanh (Fail-fast) chỉ là nỗ lực vớt vát (Best-effort), nghiêm cấm coi đây là Tấm khiên bảo vệ.
+Bạn thấy đấy, không cần tới nhiều luồng ghi, chỉ cần 1 Luồng ghi và 1 Luồng đọc là đủ để hệ thống "ăn hành". Khi luồng lặp dữ liệu đâm sầm vào lúc Map đang đổi, `HashMap` sẽ ném cái lỗi `ConcurrentModificationException`. Lỗi này không phải là "tấm khiên" bảo vệ đâu, nó chỉ là một cố gắng nhỏ nhoi để "vớt vát" mà thôi.
 
-> **Nguyên tắc kỹ thuật:** Kết quả cuối cùng hoàn toàn có thể đúng, nhưng sự thật đằng sau là Luồng Yêu Cầu đã tự phán xét và xử lý Sinh Mệnh Giao Dịch ngay tại thời khắc Dữ liệu đang vỡ nát.
+> **Nguyên tắc kỹ thuật:** Kết quả có vẻ đúng, nhưng sự thật là Luồng Yêu Cầu đã tự xử lý giao dịch dựa trên một dữ liệu nát bét lúc đó rồi.
 
 ## 2. Đối Chiếu Kết Quả (Expected vs Actual)
 
-| Tiêu Chí Đánh Giá | Kỳ Vọng (Expected) | Hệ Quả Thực Tế (Broken code) |
+| Tiêu Chí Đánh Giá | Kỳ Vọng (Mình muốn gì) | Hệ Quả Thực Tế (Code vỡ nó làm gì) |
 | --- | --- | --- |
-| Tính Toàn Vẹn | Tuyến Đọc thụ hưởng 100% Thế hệ 41 hoặc 42 | Tuyến Đọc hứng chịu Map Rỗng hoặc Mảnh vỡ Thế hệ 42 |
-| Tính Nhất Quán | Dữ liệu quét qua thuộc chuẩn 1 Thế hệ | Truy xuất đứt gãy lai tạp giữa 2 Thế hệ |
-| Khả Kiến (Visibility) | Ghi thành công báo hiệu tức thời cho Mạng lưới | Vắng bóng Hợp đồng Khả kiến do gán qua Thuộc tính thường |
-| Vòng Lặp (Iteration) | Giám sát bóc tách Bản chụp tĩnh | Vòng lặp mất Khóa, Đội dữ liệu, hoặc Văng Ngoại Lệ |
-| Sai Số (Failure) | Cập nhật lỗi thì lùi về Bản chụp Tốt Gần Nhất | Đột biến Dữ liệu Phá hủy trạng thái phục vụ vĩnh viễn |
+| Tính Toàn Vẹn | Luồng đọc nhận đủ 100% Thế hệ 41 hoặc 42 | Luồng đọc nhận cái Map Rỗng, hoặc dữ liệu nửa mùa |
+| Tính Nhất Quán | Dữ liệu đồng nhất cùng 1 Thế hệ | Truy xuất bị gãy, dính cả cũ lẫn mới |
+| Khả Kiến (Visibility) | Ghi xong là các luồng khác thấy ngay | Gán biến thường nên luồng khác có thể vẫn thấy bản cũ |
+| Vòng Lặp (Iteration) | Lấy được 1 bản chụp dữ liệu tĩnh để giám sát | Vòng lặp mất Khóa, dữ liệu lộn xộn, hoặc Văng Lỗi |
+| Sai Số (Failure) | Lỗi cập nhật thì giữ nguyên dữ liệu Tốt gần nhất | Chỉnh sửa trực tiếp làm vỡ dữ liệu, hệ thống không phục hồi được |
 
 ## 3. Bản Chất Cội Nguồn Lỗi Theo Các Lớp Phân Tách
 
 ### Khuyết Tật Của Cấu Trúc HashMap
-`HashMap` tuyên bố cự tuyệt khả năng Chống biến đổi Cấu trúc Đồng thời (Concurrent structural modification). Vắng mặt Cơ chế Đồng bộ Ngoại vi (External synchronization), giao lộ Đọc/Ghi biến thành một Đấu trường Đua dữ liệu (Data race). Tuyệt đối cấm xây dựng độ tin cậy của hệ thống dựa trên ảo mộng "phiên bản JDK hiện tại dường như chạy ổn".
+`HashMap` thông thường không hề có cam kết bảo vệ dữ liệu khi nhiều luồng cùng đục khoét (Concurrent structural modification). Không có "khóa", việc vừa đọc vừa ghi trở thành một cuộc chiến dữ liệu (Data race). Đừng bao giờ ảo tưởng rằng "bản JDK này chạy thử thấy ổn nên chắc không sao".
 
 ### Hành Vi Phức Hợp (Compound Action)
-Góc độ Nghiệp vụ coi Đợt làm mới là Một Hành Vi Đơn Thể. Góc độ Bộ nhớ coi Đợt làm mới là Một Chuỗi Hành Vi Phân Rã (`clear` + `put` + `put`). Không thiết lập **Điểm Hiệu Lực Duy Nhất (Linearization point)**, Tuyến Đọc ngang nhiên lách qua khe hở của sự biến thiên.
+Với bạn, làm mới cấu hình là MỘT việc. Nhưng với máy ảo, làm mới là NHIỀU lệnh nhỏ (`clear` rồi `put`, rồi lại `put`). Bạn không có một **Điểm Hiệu Lực Duy Nhất (Linearization point)** để chốt sổ, nên luồng đọc cứ thế lách qua kẽ hở để đọc sai.
 
-### Góc Khuất Mô Hình Bộ Nhớ (Java Memory Model)
-Cho dù tái cấu trúc mã thành Sao-Chép-Và-Tráo-Đổi (Copy-and-swap), nhưng nếu Biến tham chiếu (Reference field) là một cấu trúc Biến thường, JMM sẽ không bao giờ vẽ ra đường gạch nối `happens-before` giữa Tuyến Đọc và Tuyến Ghi. Việc xây Map cục bộ trước khi Gán là đúng với Quy tắc Trình tự (Program order) của Luồng, nhưng Vô nghĩa trong việc Khai báo sự Khả kiến.
-
-`volatile`, Monitor Lock, hay Atomic Variable là các chìa khóa thiết lập Ranh giới `happens-before`.
+### Góc Khuất Mô Hình Bộ Nhớ (Java Memory Model - JMM)
+Dù bạn thông minh xài trò "Tạo bản sao mới rồi tráo" (Copy-and-swap), nhưng nếu biến bạn lưu bản sao chỉ là biến bình thường, JMM chả hứa hẹn gì về việc các luồng khác sẽ thấy cái biến đó ngay (Luật `happens-before`). 
+Bạn cần `volatile`, Monitor Lock, hoặc biến Atomic để tạo cầu nối cho các luồng thấy nhau.
 
 ### Ảo Giác Container Spring
-Định nghĩa Singleton chỉ trói buộc Quy mô Vòng Đời, không trói buộc Chính Sách Đồng Bộ. Container xuất bản cá thể một cách an toàn, tuy nhiên Phương thức Làm Mới Định Kỳ (Scheduled) và Tuyến Yêu Cầu Controller có quyền tự do tung hoành trên nhiều Luồng và cùng chà đạp lên một Biến Khả Biến (Mutable field).
+Bean Singleton chỉ có nghĩa là nó sống "duy nhất 1 bản" từ đầu đến cuối, chứ không hứa hẹn là nó chịu được đa luồng! Cái `@Scheduled` của bạn và cái Controller hứng yêu cầu là chạy ở các luồng khác nhau, vô tư đâm chém vào một biến đổi được (Mutable field).
 
 ### Giới Hạn Cơ Chế Giao Dịch
-Không Tồn tại Database Row, không có MVCC, Commit hay Rollback. `@Transactional` không có tư cách bảo vệ Trạng Thái Bộ Nhớ Cục Bộ (Memory state). Nếu Luồng Cập Nhật đục phá Map rồi văng Ngoại lệ, Transaction DB sẽ tự hoàn tác, nhưng Mảnh rác trong Java Map vĩnh viễn không thể lùi về trạng thái cũ.
+Đừng nghĩ xài `@Transactional` là thoát. Cái đó chỉ cho Database thôi. Nếu Luồng cập nhật xóa sạch Map rồi văng lỗi giữa chừng, Transaction DB sẽ Rollback lại, nhưng cái Map trên RAM thì đã bị xóa sạch sẽ, vĩnh viễn không cứu lại được.
 
 ## 4. Ranh Giới Điểm Hiệu Lực (Linearization Point) Chuẩn Mực
 
-Áp dụng Bản chụp Bất biến (Immutable snapshot), Tuyến Ghi phân rã thành 3 tiến trình:
-1. Tải và Validate dữ liệu bên trong Không gian Biến cục bộ.
-2. Đóng gói Bản chụp hoàn chỉnh qua `Map.copyOf(...)`, phong ấn biến đổi.
-3. Xuất bản qua lệnh `AtomicReference.set` hoặc write `volatile`.
+Để an toàn, hãy dùng chiến thuật **Bản chụp Bất biến (Immutable snapshot)**. Luồng ghi sẽ làm đúng 3 bước:
+1. Tải và kiểm tra dữ liệu ở một vùng kín (Biến cục bộ).
+2. "Đóng băng" nó lại thành một khối không thể sửa bằng `Map.copyOf(...)`.
+3. Xuất bản nó lên bằng `AtomicReference.set` hoặc biến `volatile`.
 
-Giai đoạn 3 là Điểm Hiệu Lực Độc Tôn. Tuyến Đọc nắm giữ Tham chiếu 1 lần duy nhất, đảm bảo tính Toàn vẹn Thế hệ cho 100% logic xử lý. Nếu đa Tuyến Ghi cùng hội tụ, Hoán đổi Nguyên tử chỉ bảo vệ Tính Toàn Vẹn, chưa bảo vệ Tính Tươi Mới (Độ Trễ). Bắt buộc phải áp dụng Cờ So Sánh (`compare-and-set`) và phế truất Bản chụp Lỗi thời (Stale).
+Bước 3 chính là Điểm Hiệu Lực Duy Nhất! Luồng đọc chỉ cần lấy tham chiếu 1 lần là lấy nguyên cục Thế hệ 100% chuẩn, không sợ ai thay đổi. Nếu có nhiều Luồng ghi cùng lúc, phải dùng cơ chế **So sánh - và - Đặt (`compare-and-set`)** để luồng đến sau biết mà lùi bước nếu bản chụp của nó đã lỗi thời.
 
 ## 5. Xử Lý Phân Loại Lỗi Hệ Thống Và Vòng Đời Cấu Trúc
 
-- Tuyệt đối cấm `clear()` Trạng thái Đang Phục Vụ để dọn chỗ cho dữ liệu rác chưa qua Khâu Validate.
-- Nếu Bản chụp Hoán đổi bằng phương pháp Nguyên tử duy nhất, Hệ thống không cần lo lắng về Lỗi Rollback Phân mảnh.
-- Application Crash sau khi Swap, Yêu cầu cục bộ đã thấy Thế hệ Mới, nhưng không có nghĩa các Nút (Node) khác cũng tự động đồng bộ Thế hệ đó.
+- Tuyệt đối cấm dùng `clear()` lúc dữ liệu đang phục vụ khách, chỉ để dọn chỗ cho cái mới chưa kịp kiểm tra.
+- Đã tráo đổi nguyên tử (Atomic Swap) thì không bao giờ sợ bị vỡ vụn lúc hỏng hóc (Rollback phân mảnh).
+- Ứng dụng lỡ sập sau khi tráo đổi, dữ liệu tại máy đó đã là Mới, nhưng các máy chủ (node) khác không có nghĩa là cũng tự động theo kịp.
 
 ## 6. Giới Hạn Phạm Vi Và Môi Trường Phân Tán
 
-Bản chất `AtomicReference` chỉ cai quản ranh giới JVM nội bộ. Không một khóa (JVM Lock) nào đủ thẩm quyền ép buộc Nút B phải nghe theo Nút A. Đối với Lệnh Yêu cầu Tức thời (Vô hiệu hóa Provider), cần xây dựng Cấu trúc Giao thức từ gốc Config: Mã Thế hệ (Generation order), Kênh Phân phối Sự kiện (Event delivery), Chứng nhận Tiếp nhận (Acknowledgement) hoặc một ranh giới Cấu trúc Phân Tán (Distributed Database).
+Nhớ nhé, `AtomicReference` chỉ cai quản bộ nhớ bên trong MỘT máy ảo JVM. Không có lệnh khóa (Lock) nào ép được Máy chủ B phải cập nhật giống Máy chủ A. Nếu muốn cấm một Đối tác ngay tức khắc trên toàn mạng lưới, bạn phải giải quyết ở bài toán Hệ thống Phân tán (như Event, Versioning ở Config hay DB dùng chung).

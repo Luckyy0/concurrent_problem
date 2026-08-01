@@ -2,16 +2,16 @@
 
 ## 1. Chiến Lược Kiểm Thử Cốt Lõi (Core Strategy)
 
-Ma trận kiểm định tập trung bóc tách 3 luồng rủi ro:
-1. Đánh giá Cấu trúc Suy thoái (Broken code) phơi bày mảnh vỡ Dữ liệu Đang làm mới.
-2. Chứng minh Cấu trúc Bản Chụp Bất Biến (Immutable snapshot) bảo vệ Tính Toàn Vẹn và buộc Thế hệ (Generation) tăng đơn điệu.
-3. Rà soát chuẩn Ngữ nghĩa Duyệt (Iteration semantics) của Khung Tập Hợp (Collection) tương thích Khách hàng (Caller).
+Kế hoạch test của chúng ta sẽ xoáy sâu vào 3 luồng rủi ro chính:
+1. Chứng minh đoạn code lỗi (Broken code) sẽ để lộ ra dữ liệu gãy vụn lúc đang cập nhật.
+2. Chứng minh Cấu trúc Bản Chụp Bất Biến (Immutable snapshot) bảo vệ an toàn 100% dữ liệu và bắt buộc các Thế Hệ phải tăng dần đều.
+3. Rà soát xem cách duyệt danh sách (Iteration) có đáp ứng đúng mong mỏi của người gọi hàm hay không.
 
-Mỏ neo `Latch` điều phối luồng vào chính xác Tọa độ Tranh chấp (Conflict window). Tuyệt đối cấm khai thác `Thread.sleep` làm mốc Phán Quyết vì tính bấp bênh của Bộ lập lịch (Scheduler). Thiết lập Timeout cưỡng chế cho 100% lệnh chốt chặn.
+Để làm được, chúng ta xài `Latch` (chốt chặn) để điều khiển các luồng lao vào đúng ngay cái "Tọa độ tử thần" (lúc tranh chấp). Tuyệt đối KHÔNG dùng `Thread.sleep` để đoán thời gian vì cái Bộ lập lịch (Scheduler) của máy ảo nó "quay xe" bất ngờ lắm. Và nhớ, phải đặt Thời gian chờ tối đa (Timeout) cho mọi lệnh chốt chặn để test không bị treo vĩnh viễn.
 
 ## 2. Thí Nghiệm 1: Trình Diễn Bóc Tách Bản Chụp Phân Mảnh (Partial Snapshot)
 
-Luồng Kiểm Thử hãm phanh Tuyến Ghi (Writer) ngay sau khi Nhập liệu Khóa (Entry) đầu tiên của Thế hệ mới. Tuyến Đọc (Reader) xông vào lúc Tuyến Ghi tạm dừng, tạo tiền đề Lỗi Xác Định (Deterministic) hoàn toàn không dựa vào xác suất.
+Ở bài test này, chúng ta sẽ "tóm cổ" Luồng ghi ngay lúc nó vừa mới nhét được ĐÚNG 1 phần tử của Thế hệ mới vào Map. Ngay khoảnh khắc Luồng ghi bị đứng hình, Luồng đọc sẽ lao vào. Lỗi này là chắc chắn 100% xảy ra, không phụ thuộc vào may rủi.
 
 ```java
 @Test
@@ -47,11 +47,11 @@ void readerCanObserveOnlyPartOfTheNewGeneration() throws Exception {
 }
 ```
 
-Mục tiêu không phải là ép phát sinh `ConcurrentModificationException`. Hệ thống ưu tiên đánh phá Quy tắc Bất Biến (Invariant): Tuyến Đọc phải chứng kiến bằng được cái khung Bản Đồ chỉ chứa 1 mảnh vụn dữ liệu dẫu cả 2 Thế hệ Gốc đều có Khối lượng là 2.
+Mục đích ở đây không phải là ép nó văng lỗi `ConcurrentModificationException`. Chúng ta muốn chứng minh sự vi phạm luật chơi (Invariant): Luồng đọc nhìn thấy cái Map chỉ có ĐÚNG 1 mẩu dữ liệu, trong khi cả Thế hệ cũ và mới đáng lẽ phải luôn chứa 2 mẩu!
 
 ## 3. Thí Nghiệm 2: Tôn Tôn Trọng Bản Chụp Nguyên Tử & Chặn Đứng Tuyến Ghi Chậm Trễ (Stale Writer)
 
-Cuộc đụng độ của 2 Tuyến Làm Mới (Writer). Kịch bản: Tuyến Ghi Thế hệ 42 bị phong tỏa; Thế hệ 43 lướt qua xuất bản trước. Sau khi nhả Khóa, Khối Logic So-Sánh-Và-Gán (Compare-and-set) phải cự tuyệt tàn nhẫn Tuyến Ghi 42 Lỗi thời.
+Đây là cuộc chiến sinh tử giữa 2 Luồng Ghi. Kịch bản: Luồng cầm Thế hệ 42 bị kẹt đèn đỏ; Luồng cầm Thế hệ 43 phóng lên trước xuất bản thành công. Khi Luồng 42 được nhả ra, cơ chế So-Sánh-Và-Gán (CAS) sẽ thẳng tay từ chối cái dữ liệu quá đát của nó.
 
 ```java
 @Test
@@ -83,11 +83,11 @@ void snapshotIsCompleteAndOlderWriterCannotOverwriteNewerGeneration() throws Exc
 }
 ```
 
-Kiểm định Quy tắc: Bản chụp vinh danh 2 Khóa trọn vẹn và 100% Giá trị chia sẻ Chung 1 Dấu mộc Thế hệ. Cấm lạm dụng Phép đo Kích thước (Size) hoặc Cờ Ngoại Lệ để thay thế Xác thực Invariant.
+Kiểm định luật chơi: Bản chụp luôn giữ nguyên vẹn 2 mẩu khóa và 100% dữ liệu phải mang chung cái mộc Thế Hệ. Đừng bao giờ lôi số đếm (size) hay rình rập Exception ra làm thước đo chuẩn mực!
 
 ## 4. Thí Nghiệm 3: Thẩm Định Năng Lực Trụ Vững Khi Cập Nhật Vỡ Lở (Failure Keeps Last-Known-Good)
 
-Phép thử Hồi quy (Regression test) cốt lõi chứng minh Nền tảng "Dựng Khung Trước Xuất Bản Sau" (Build-before-publish):
+Bài test cực kỳ quan trọng để bảo vệ triết lý "Xây nhà xong hết mới tung biển quảng cáo" (Build-before-publish):
 
 ```java
 @Test
@@ -112,11 +112,11 @@ void invalidRefreshDoesNotDestroyCurrentSnapshot() {
 }
 ```
 
-Chứng minh một Đợt làm mới Đổ nát không kéo theo sự Diệt vong của Thế hệ Đang Phục Vụ.
+Bài test chứng minh rõ ràng: Một đợt cập nhật bị thối (tung rác) sẽ bị chặn đứng, và cấu trúc đang chạy ngon lành ở Thế hệ cũ (41) vẫn vĩnh viễn an toàn.
 
 ## 5. Thí Nghiệm 4: Khảo Sát Bức Tranh Lỗ Hổng Công Bố Dữ Liệu (Unsafe Publication Stress)
 
-Tuyệt đối cấm khai báo JUnit bắt buộc "Reader must observe stale value", vì Bộ Lập Lịch không hỗ trợ Ký Hợp Đồng Hệ Quả (Happens-before). Ứng dụng OpenJDK JCStress để vạch trần thảm họa cho phép theo định nghĩa JMM:
+Đừng dại mà viết JUnit test kiểu "bắt Luồng Đọc phải thấy dữ liệu cũ", bởi vì Bộ lập lịch không bao giờ hứa hẹn luật lệ đó (Happens-before). Hãy dùng tool `OpenJDK JCStress` để tra tấn và lột trần cái mớ lý thuyết thảm họa của Java Memory Model:
 
 ```java
 @JCStressTest
@@ -144,32 +144,33 @@ public class UnsafeSnapshotPublicationStress {
 }
 ```
 
-Kết quả `0` phơi bày việc Thiếu Hợp Đồng Khả Kiến. Dẫu cho đã bọc `volatile` hay `AtomicReference`, Thiết kế Chuẩn Mực Outcome buộc phải phản ánh Trật Tự (Ordering) Nghiệp Vụ, Khước từ quy chụp Đặc tính Lập Lịch (Scheduling) làm Trật Tự Bộ Nhớ (Memory).
+Nếu kết quả ra `0`, chứng tỏ bạn đang quên ký "Hợp Đồng Khả Kiến" giữa các luồng. Dù bạn đã bọc `volatile` hay `AtomicReference`, bạn vẫn phải thiết kế luật lệ sao cho nó chuẩn Nghiệp Vụ, chứ đừng nương tựa vào sự hên xui của Trật tự Bộ Lập Lịch.
 
 ## 6. Tiêu Chuẩn Ngữ Nghĩa ConcurrentHashMap
 
-Nếu đánh đổi kiến trúc Bản Chụp Bất Biến lấy tốc độ của `ConcurrentHashMap`, bài Kiểm Định Bắt Buộc chứng minh:
-- Không xuất hiện Đứt gãy Cấu trúc và Vắng bóng `ConcurrentModificationException`.
-- Định vị Dữ liệu Bất khả Xâm phạm Nguyên Tử (Atomic) cho Từng Đơn vị Khóa.
-- Báo cáo Toàn Bảng chỉ được phép định danh là "Ước Tán" (Approximate).
-*Cảnh báo: Phế truất ngay Lựa chọn này nếu Nghiệp vụ ép buộc Chuẩn Toàn Bảng Chung Thế Hệ.*
+Nếu bạn chấp nhận xài `ConcurrentHashMap` để đổi lấy tốc độ và đánh rơi Bản chụp Bất biến, thì bài test phải chứng minh được:
+- Ứng dụng không bao giờ bị nát cấu trúc và văng lỗi `ConcurrentModificationException`.
+- Dữ liệu ở từng chiếc Khóa (Key) luôn chuẩn xác 100% (Atomic).
+- Việc in ra toàn bộ Map phải gọi rõ ràng là "Ước Tán" (Approximate).
+*Cảnh báo: Nếu sếp bạn bắt buộc bảng dữ liệu phải đồng nhất Thế Hệ cùng một lúc, dẹp ngay cái giải pháp này đi nhé!*
 
 ## 7. Khung Giám Sát Khai Thác (Production Blueprint)
 
-Đặc tả Vận hành:
-- Tuổi thọ Bản Chụp và Định danh Thế Hệ (Generation ID).
-- Số khối lượng (Entry Count) và Chứng Chỉ Tính Toàn Vẹn (Checksum).
-- Thống kê tỷ lệ Từ Chối Bản Chụp Trễ Hạn (Stale publish rejected).
-- Đo lường Yêu cầu Hụt Tuyến (Fallback).
-- Bản đồ Phân Phối Thế Hệ giữa Liên Nút (Node).
+Đồ chơi mang lên Production cần có:
+- Đo xem tuổi thọ của Bản Chụp sống được bao lâu, Thế Hệ (ID) đang là mấy.
+- Lượng Khóa (Entry Count) và Chứng Chỉ Tính Toàn Vẹn (Checksum).
+- Thống kê xem có bao nhiêu đợt cập nhật trễ bị tát văng (Stale publish rejected).
+- Đếm số ca đi tìm đối tác không ra phải xài dự phòng (Fallback).
+- Biểu đồ xem Thế hệ đang rải rác thế nào giữa các máy chủ (Node).
 
 ## 8. Khung Tiêu Chuẩn Thực Nghiệm (Quality Checklist)
 
-- [ ] Bài thử Broken Test giam luồng Đọc trong Khe hở Cập nhật bằng Latch.
-- [ ] Xóa bỏ Phép Đo Lường Vận Mệnh bằng `Thread.sleep`.
-- [ ] 100% Khối Chặn Latch/Future bọc vỏ Timeout.
-- [ ] Kiểm định Hồi Quy bao phủ Tổng Số Lượng và Tính Đồng Nhất Thế Hệ.
-- [ ] Bài Test Phơi bày Áp Lực Đa Tuyến Ghi và Khước từ Thế Hệ Lỗi Thời.
-- [ ] Xác nhận Sập Cập Nhật luôn được Neo Giữ bởi Bản Chụp Tốt Nhất Cuối Cùng.
-- [ ] Ngữ Nghĩa Vòng Lặp phản chiếu chính xác Lựa chọn Hạch Tâm Collection.
-- [ ] Hậu Kiểm Thử: Đóng Executor và Khôi Phục Cờ Tín Hiệu Ngắt (Interrupt).
+Trước khi đóng code, rà soát lại:
+- [ ] Bài test Broken Test đã kẹp cổ Luồng Đọc vào giữa khe hở cập nhật bằng Latch chưa?
+- [ ] Xóa bỏ hết thói hư tật xấu dùng `Thread.sleep` để đoán mò chưa?
+- [ ] 100% các Khối Chặn Latch/Future đã có cái bọc Timeout chưa?
+- [ ] Chạy Hồi Quy (Regression) kiểm chứng Tổng Số Lượng và tính Đồng Nhất Thế Hệ chưa?
+- [ ] Chạy tra tấn xem nhiều Luồng Ghi có đấm đá được nhau để chối bỏ Thế hệ quá đát không?
+- [ ] Chứng nhận rằng cập nhật tịt ngòi thì hệ thống vẫn giữ nguyên Bản Chụp cuối cùng.
+- [ ] Luật duyệt danh sách đúng chuẩn với Loại Collection bạn chọn.
+- [ ] Dọn dẹp chiến trường: Đóng Executor và trả lại Cờ Tín Hiệu (Interrupt) sạch sẽ.

@@ -2,9 +2,9 @@
 
 ## Tóm tắt
 
-Hai thread chuyển giá trị giữa hai in-memory account. Mỗi thao tác chuyển khóa source rồi destination. T1 chuyển A→B nên giữ Lock-A và chờ Lock-B; T2 chuyển B→A nên giữ Lock-B và chờ Lock-A. Hai thread tạo một wait-for cycle và không tiến tiếp.
+Chào bạn, lỗi deadlock này rất kinh điển. Tưởng tượng hai thread chuyển tiền giữa hai tài khoản. Thread 1 chuyển từ A sang B nên giữ khoá A và chờ khoá B. Cùng lúc, Thread 2 chuyển từ B sang A nên giữ B và chờ A. Thế là cả hai đứng nhìn nhau, tạo thành vòng lặp chờ vô tận (wait-for cycle).
 
-Tình huống bảo vệ các bất biến:
+Tình huống này nhắc nhở chúng ta:
 
 ```text
 Mọi thao tác cần nhiều account lock phải acquire theo cùng một total order.
@@ -13,33 +13,33 @@ Khi acquire thất bại hoặc bị ngắt (interrupt), mọi lock đã giữ p
 Thao tác chuyển hoàn tất phải bảo toàn tổng balance trong phạm vi in-memory của tình huống.
 ```
 
-> **Nói ngắn gọn:** “khóa cả hai account” vẫn có thể sai; thứ tự khóa phải giống nhau cho mọi hướng chuyển.
+> **Nói ngắn gọn:** Không phải cứ "khóa cả hai" là an toàn. Bạn phải khóa theo một thứ tự cố định, bất kể chiều chuyển khoản là gì.
 
 ## Thuật ngữ cần biết
 
 | Thuật ngữ | Giải thích dễ hiểu |
 | --- | --- |
-| deadlock | Nhiều thread chờ nhau theo vòng kín và không thread nào tiến tiếp |
-| wait-for cycle | Chu trình T1 chờ T2, T2 lại chờ T1 |
-| lock ordering | Quy tắc total order quyết định lock nào luôn được acquire trước |
-| intrinsic lock | Monitor dùng bởi `synchronized` |
-| ownable synchronizer | Lock như `ReentrantLock` mà JVM diagnostics biết owner |
-| interruptible acquisition | Chờ lock có thể dừng khi thread bị ngắt (interrupt) |
-| timed acquisition | `tryLock` với giới hạn thời gian chờ |
-| livelock | Tác nhân liên tục thử lại (retry) hoặc nhường nhau nhưng vẫn không hoàn tất |
+| deadlock | Tình trạng tắc nghẽn, các thread chờ nhau thành vòng tròn. |
+| wait-for cycle | Cái vòng lẩn quẩn: T1 chờ T2, T2 lại chờ T1. |
+| lock ordering | Quy tắc "xếp hàng": quy định rõ lock nào phải lấy trước. |
+| intrinsic lock | Kiểu lock tích hợp sẵn dùng trong `synchronized`. |
+| ownable synchronizer | Các lock xịn như `ReentrantLock`, JVM biết ai đang giữ nó. |
+| interruptible acquisition | Xin lock nhưng có thể bị huỷ giữa chừng nếu thread bị ngắt. |
+| timed acquisition | Hàm `tryLock` có cài đặt thời gian chờ tối đa. |
+| livelock | Thread không ngủ nhưng cứ chạy đi chạy lại mà chả giải quyết được việc gì. |
 
 ## Bối cảnh và contention point
 
-T1 thực hiện `transfer(A, B, 10)`, T2 thực hiện `transfer(B, A, 20)`. Account được lưu trong một local registry và có `ReentrantLock` ổn định.
+T1 chạy `transfer(A, B, 10)`, T2 chạy `transfer(B, A, 20)`. Cả hai đang tranh nhau cập nhật trạng thái trong RAM với `ReentrantLock`.
 
 | Thành phần | Giá trị |
 | --- | --- |
-| Shared state | Hai `LocalAccount` và balance |
-| Tác nhân | Hai luồng xử lý hoặc thread yêu cầu |
-| Broken order | Khóa source trước, khóa destination sau |
-| Cycle | T1 giữ A chờ B; T2 giữ B chờ A |
-| Transaction | Không có database transaction |
-| Scope | Một JVM; PostgreSQL deadlock là `DB-008` |
+| Shared state | Hai đối tượng `LocalAccount` và số dư |
+| Tác nhân | Hai thread thực thi lệnh |
+| Broken order | Sai lầm ở chỗ: cứ hễ chuyển từ đâu thì khoá thằng đó trước. |
+| Cycle | T1 có A đòi B; T2 có B đòi A. Đứng hình! |
+| Transaction | Đây là bộ nhớ, không có transaction như Database. |
+| Scope | Giới hạn trong 1 ứng dụng JVM thôi nhé. Deadlock database để sau. |
 
 ## Điều hướng
 
@@ -52,26 +52,26 @@ T1 thực hiện `transfer(A, B, 10)`, T2 thực hiện `transfer(B, A, 20)`. Ac
 
 ## Hậu quả production
 
-- Các yêu cầu bị treo, thread pool và connection pool dần cạn kiệt;
-- Quá thời gian chờ (timeout) ở phía gọi không tự giải phóng thread đang chờ intrinsic lock;
-- Việc thử lại từ phía client tạo thêm khối lượng công việc và chu trình (cycle);
-- Health endpoint có thể vẫn hoạt động bình thường trong khi lưu lượng nghiệp vụ bị đình trệ;
-- Việc khởi động lại process sẽ phá deadlock nhưng làm mất dữ liệu trên bộ nhớ (in-memory).
+- Hệ thống đứng cmn hình, thread pool và connection cạn kiệt.
+- Gọi timeout từ phía ngoài cũng chả ăn thua nếu thread đang kẹt cứng ở intrinsic lock.
+- Client thử gọi lại chỉ làm rác thêm hệ thống.
+- Endpoint báo health check vẫn xanh nhưng app thì ngắc ngoải.
+- Chỉ có cách khởi động lại ứng dụng, nhưng lại mất dữ liệu đang làm dở trên RAM.
 
 ## Hướng sửa khuyến nghị
 
-Sử dụng khóa định danh account (account key) ổn định để tạo một total order: account ID nhỏ hơn luôn khóa trước, không phụ thuộc vào source hay destination. Thực hiện acquire có thể ngắt (interruptibly) hoặc có thời hạn (deadline) khi ràng buộc độ trễ yêu cầu; release lock thứ hai rồi lock thứ nhất trong `finally`.
+Dùng ID của tài khoản để tạo luật xếp hàng (total order): thằng nào ID nhỏ hơn thì luôn bị khóa trước, không quan trọng nó là nguồn hay đích. Ngoài ra, nên dùng kiểu xin lock có thể ngắt (interruptible) hoặc có thời gian chờ (timeout). Lỡ có lỗi thì nhớ nhả lock theo thứ tự ngược lại trong khối `finally`.
 
-Việc giới hạn thời gian acquire (timed acquisition) không thay thế cho lock ordering. Nó là một cơ chế an toàn (safety net) giúp tránh chờ vô hạn; việc thử lại cần giới hạn số lần (bounded attempts), có khoảng lùi (backoff) và chỉ chạy sau khi dọn dẹp (cleanup).
+Nhớ nhé: Timeout không thể thay thế cho việc xếp hàng đúng thứ tự lock. Nó chỉ là phao cứu sinh để tránh bị treo vĩnh viễn.
 
 ## Phạm vi
 
-Tình huống chỉ xử lý JVM lock và in-memory balance để minh họa. Không dùng local lock để bảo vệ dữ liệu row của account giữa nhiều node. Việc phát hiện, chọn nạn nhân (victim), và rollback của PostgreSQL thuộc về `DB-008`; thao tác chuyển tiền bền vững thuộc các tình huống ngân hàng (banking cases).
+Bài này chỉ bàn chuyện xử lý JVM lock và bộ nhớ trong. Không áp dụng lock kiểu này cho dữ liệu lưu ở database (như bài `DB-008`).
 
 ## Khi nào dùng giải pháp nào
 
-- Định hướng tất định (Deterministic order): mặc định khi phải giữ nhiều lock cùng lúc.
-- Coarse single lock: trạng thái nhỏ, contention thấp, ưu tiên dễ chứng minh.
-- `tryLock` với deadline: yêu cầu có ngân sách độ trễ (latency budget), chấp nhận thất bại hoặc thử lại có kiểm soát.
-- Thiết kế không giữ hai lock: có thể thay đổi mô hình dữ liệu, quyền sở hữu (ownership), hoặc truyền thông điệp (message passing).
-- Database transaction: trạng thái xác thực (authoritative state) là database row và có nhiều node cùng cập nhật.
+- Định hướng tất định (Deterministic order): Bắt buộc khi cần giữ nhiều lock cùng lúc.
+- Coarse single lock: Dùng một lock bự cho dễ hiểu, nếu hệ thống nhỏ, ít tranh chấp.
+- `tryLock` với deadline: Khi bạn có giới hạn thời gian rõ ràng và thà thất bại còn hơn treo máy.
+- Thiết kế không giữ hai lock: Tìm cách chuyển qua kiến trúc message passing hoặc phân chia quyền sở hữu.
+- Database transaction: Dùng khi dữ liệu cần lưu dai dẳng và có nhiều server cùng chọc vào.

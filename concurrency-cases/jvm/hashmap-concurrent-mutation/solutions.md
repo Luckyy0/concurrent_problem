@@ -2,7 +2,7 @@
 
 ## 1. Phương Án Lõi: Bản Chụp Bất Biến Qua AtomicReference (Immutable Snapshot)
 
-Chiến thuật thượng tôn cho hệ thống Bào Đọc (Read-heavy) và Yêu cầu Tái thiết Toàn Bảng. Cấu trúc đóng gói đồng nhất Metadata (Generation) và Dữ liệu Map làm một Khối Nguyên Tử.
+Đây là tuyệt chiêu tối thượng cho hệ thống đọc liên tục (Read-heavy) và yêu cầu cập nhật nguyên cả bảng dữ liệu. Chúng ta gom cả phiên bản (Generation) và dữ liệu Map thành một khối không thể tách rời (Khối Nguyên Tử).
 
 ```java
 package com.example.routing;
@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public class PaymentRoutingRegistry {
 
     private final RoutingConfigClient configClient;
-    // Điểm Hiệu Lực Trung Tâm (Linearization Point)
+    // Điểm Hiệu Lực Trung Tâm (Linearization Point) - Nơi chốt sổ
     private final AtomicReference<RoutingSnapshot> current =
             new AtomicReference<>(RoutingSnapshot.empty());
 
@@ -65,11 +65,11 @@ public class PaymentRoutingRegistry {
     boolean publishIfNewer(RoutingSnapshot loaded) {
         while (true) {
             RoutingSnapshot observed = current.get();
-            // Cự Tuyệt Tàn Nhẫn Kẻ Lỗi Thời
+            // Từ chối thẳng thừng nếu phiên bản cũ hơn
             if (loaded.generation() <= observed.generation()) {
                 return false;
             }
-            // Mệnh lệnh Xuất Bản Nguyên Tử
+            // Mệnh lệnh Xuất Bản Nguyên Tử (chỉ ai nhanh chân mới được)
             if (current.compareAndSet(observed, loaded)) {
                 return true;
             }
@@ -89,18 +89,18 @@ public class PaymentRoutingRegistry {
 }
 ```
 
-### Cơ Trí Tối Thượng Của Khối Bất Biến
-- Quyền Năng `current.get()`: Đoạt tham chiếu đúng 1 lần cho mọi Đọc/Truy Xuất, Cắt đứt hoàn toàn nguy cơ dính dáng Dữ Liệu Thay Đổi.
-- Giao Điểm Nguyên Tử kiến tạo Tường Lửa Khả Kiến (Safe Publication) tuyệt đối.
-- Tuyến Ghi bị tước bỏ khả năng Phá Hủy (Mutate) Dữ liệu đã Lên Sóng.
-- Lệnh So-Sánh-Và-Gán (CAS) là Lưới Đánh Chặn xung đột của Đa Tuyến Ghi. Kẻ Mang Thế Hệ Cũ Bị Tiêu Diệt Ngay Tức Khắc.
-- Tuyến Đọc lướt qua Hàng Đợi, Khước từ Áp lực Nghẽn Đóng Băng trong lúc Client Gánh Dữ Liệu.
+### Tại sao khối bất biến lại vô đối?
+- **Sức mạnh của `current.get()`:** Luồng đọc chỉ bốc đúng 1 lần duy nhất, lấy trọn gói dữ liệu để xài xuyên suốt, vĩnh viễn không lo ai đó sờ vào làm rác dữ liệu.
+- **Xuất bản cực an toàn:** Việc đổi tham chiếu biến mọi thứ trở nên minh bạch và an toàn ngay lập tức.
+- **Dữ liệu "Cứng như đá":** Một khi đã xuất bản thì Luồng ghi hết cửa sửa đổi.
+- **Lưới bảo vệ `compare-and-set` (CAS):** Nếu có nhiều luồng ghi tranh nhau cập nhật, lệnh CAS sẽ tát văng mấy luồng mang dữ liệu lỗi thời.
+- **Luồng đọc phi ầm ầm:** Hệ thống không bao giờ bị đóng băng khi luồng đọc lao vào, bất chấp lúc đó tải đang cao cỡ nào.
 
-> **Nguyên tắc kỹ thuật:** Nhà thầu (Writer) đúc bê tông toàn bộ Công trình ở Phân xưởng, rồi thay biển Hiệu ngay trong Đêm (CAS). Người dân (Request) vĩnh viễn không bao giờ phải chịu trận Bụi bặm của quá trình Xây Dựng Cấu Trúc.
+> **Nguyên tắc kỹ thuật:** Cứ tưởng tượng nhà thầu (Writer) xây nguyên một cái nhà xưởng mới ở nơi khác. Khi xong xuôi, họ chỉ tốn 1 giây để tráo biển số nhà (CAS). Khách (Request) cứ thế mà vào nhà xưởng, không mảy may hít phải hạt bụi nào từ lúc thi công.
 
 ## 2. Phương Án Trọng Tài Độc Nhất: Bản Chụp Bất Biến Volatile
 
-Rút gọn cấu trúc khi Hệ thống Tuyên thệ chỉ Duy trì Độc Tôn 1 Tuyến Ghi, Triệt tiêu Cấu trúc CAS phức tạp.
+Nếu bạn thề thốt là hệ thống của bạn luôn luôn chỉ có ĐÚNG 1 luồng ghi cập nhật dữ liệu, thì hãy xài cách này cho gọn nhẹ, khỏi cần CAS loằng ngoằng.
 
 ```java
 @Service
@@ -115,17 +115,17 @@ public class VolatileSnapshotRoutingRegistry {
 
     public void refresh(RoutingSnapshot loaded) {
         RoutingSnapshot validated = validateAndCopy(loaded);
-        current = validated; // Lệnh Xuất Bản Đơn Tốc Volatile
+        current = validated; // Lệnh Xuất Bản Đơn Tốc bằng Volatile
     }
 // ...
 }
 ```
 
-Phép Ghi `volatile` phát tán Tính Toàn Vẹn Cấu Trúc Khả Kiến Mạng Lưới; Phép Đọc bảo chứng Tươi Mới. Rủi ro: Khối lệnh Khảo sát Thế Hệ đan xen Khối Gán biến đổi thành Hành Vi Phức Hợp (Compound Action); Nếu có Đa Tuyến Ghi (Multi-writer), Khung Sườn Vỡ Vụn Ngay Lập Tức.
+Dùng `volatile` giúp luồng đọc luôn thấy được đồ tươi mới nhất. Đổi lại, chỉ cần xuất hiện thêm một luồng ghi thứ 2 chen ngang, hệ thống của bạn sẽ sụp đổ cái một!
 
 ## 3. Chấp Nhận Khuyết Tật Tập Thể: Mô Hình ConcurrentHashMap
 
-Áp dụng cho Mô hình Quản Trị Khóa Độc Lập (Per-Merchant) - Buông bỏ Luật "Đồng Nhất Thế Hệ":
+Cách này dành cho lúc bạn chỉ quan tâm cấu hình từng đối tác lẻ tẻ (Per-Merchant) và "buông xuôi" cái luật bắt buộc MỌI quy tắc phải cùng 1 Thế Hệ.
 
 ```java
 @Service
@@ -151,11 +151,11 @@ public class PerMerchantRoutingRegistry {
 }
 ```
 
-Bảo toàn Cấu Trúc, Tránh Lỗi Ngoại Lệ, Bù lại Hệ Thống Trả về Khối Dữ Liệu Lai Tạp. Định danh Rạch Ròi Khái Niệm `Approximation` (Ước Lượng) để Caller Không Bị Đánh Tráo Khái Niệm.
+Nó giúp Map không bị sập, nhưng đổi lại khi liệt kê toàn bộ, kết quả sẽ là một nồi lẩu thập cẩm cũ mới lẫn lộn (Approximation). Bạn nên dán nhãn rõ để mọi người dùng cái hàm này biết mà liệu.
 
 ## 4. Xích Cổ Khóa Trọng Lực: ReentrantReadWriteLock
 
-Lựa chọn Cực Đoan bảo vệ Tính Khả Biến Cấu Trúc (Mutable State) Bắt buộc: Đóng đinh Tuyến Đọc/Tuyến Ghi vào Chung Lõi Khóa.
+Đây là đòn "bất chấp tất cả" để bảo vệ an toàn: Bắt cả luồng đọc và luồng ghi dùng chung 1 cái khóa.
 
 ```java
 @Service
@@ -186,23 +186,24 @@ public class LockedRoutingRegistry {
 }
 ```
 
-Tuyến Đọc Phải Hiến Tế Độ Trễ (Block) để đổi lấy Không Gian Nhất Quán Tuyệt Đối. Sự xuất hiện của Khóa làm tê liệt Khả năng Xử lý Đỉnh Tải (Peak).
+An toàn thì vô đối, nhưng luồng đọc phải "nằm chờ" dài cổ mỗi khi luồng ghi làm việc. Dưới áp lực hệ thống cao, cách này sẽ bóp nghẹt hiệu năng của bạn.
 
 ## 5. Ma Trận Đánh Đổi Chiến Lược (Trade-offs)
 
 | Giải Pháp Kỹ Thuật | Đặc Tính Trọng Tâm | Tác Động Tuyến Đọc | Tác Động Tuyến Ghi/Nghẽn | Phạm Vi Khai Thác |
 | --- | --- | --- | --- | --- |
-| `AtomicReference` (Khuyên Dùng) | Bản Chụp Bất Biến Toàn Bảng, Thế Hệ Tiến Đơn Điệu | Tốc Độ Quang Học (1 Lệnh) | Trả Giá Chi Phí Copy Gắn Rời | Nội Bộ 1 JVM |
-| `volatile` Snapshot | Kế Thừa Sức Mạnh Chụp, Hủy Chống Đa Ghi | Tốc Độ Quang Học | Sụp Đổ Trước Đa Tuyến Ghi | Nội Bộ 1 JVM |
-| `ConcurrentHashMap` | Khóa Độc Lập Biến Động, Khước Từ Tính Thế Hệ | Khả Kiến Lỏng, Đọc Trộn Thế Hệ | Kháng Nghẽn Cực Cao Theo Key | Nội Bộ 1 JVM |
-| `ReadWriteLock` | Khóa Chết Trạng Thái Khả Biến Đa Lớp | Chịu Trận Đóng Băng Khóa Ghi | Bức Tử Hệ Thống Đọc Dưới Tải Lớn | Nội Bộ 1 JVM |
-| Kiến Trúc Phân Tán (Database/Protocol) | Dập Tắt Biến Thiên Toàn Mạng Lưới Cluster | Ngân Sách Network (Cao) | Kiểm Soát Giao Dịch Phức Hợp | Kiến Trúc Microservices Toàn Cục |
+| `AtomicReference` (Khuyên Dùng) | Tạo Bản Chụp Bất Biến cho Toàn Bảng, Thế Hệ luôn tăng dần | Nhanh như chớp (1 Lệnh) | Tốn chút xíu chi phí copy tạo mới lúc Ghi | Nội Bộ 1 Máy Ảo JVM |
+| `volatile` Snapshot | Tương tự bản chụp nhưng Không chịu nổi Đa Ghi | Nhanh như chớp | Toang ngay nếu có Đa Tuyến Ghi | Nội Bộ 1 Máy Ảo JVM |
+| `ConcurrentHashMap` | Thay đổi lẻ tẻ từng Khóa, Bỏ luật "Thế Hệ đồng nhất" | Thấy lờ mờ, Đọc trộn cũ mới | Chống nghẽn cực ngon khi update lẻ tẻ | Nội Bộ 1 Máy Ảo JVM |
+| `ReadWriteLock` | Khóa chết trạng thái để ép buộc an toàn | Chịu cảnh xếp hàng đợi Khóa Ghi | Bóp nghẹt hệ thống lúc tải lớn | Nội Bộ 1 Máy Ảo JVM |
+| Kiến Trúc Phân Tán (Database/Protocol) | Dập tắt khác biệt trên Toàn mạng lưới | Tốn nhiều tài nguyên mạng | Quản lý được giao dịch cực kỳ phức tạp | Cả hệ thống Microservices |
 
 ## 6. Sách Lược Vận Hành (Production Imperatives)
 
-- Ngăn Chặn Khủng Hoảng RAM Bằng Giới Hạn Kích Thước (Size Limit) tại ngưỡng Cửa `Map.copyOf`.
-- Khước từ Tẩy Rác Log Toàn Bộ Dữ Liệu; Khoanh Vùng Checksum, Thế Hệ và Đếm Mục Lục.
-- Quét Hệ Thống `stale_publish_rejected_total` và Thời Hạn Tuổi Đời Snapshot Lỗi.
-- Kích Hoạt Tín Hiệu Cảnh Báo Đỏ (Alert) khi Vòng Đời Tải Dữ Liệu Liên Tiếp Thất Bại Dưới Cờ Fail.
-- Phế Truất Mọi Hoạt Động Cày Xới `PaymentRoute` (Mutate Value) Hậu Xuất Bản.
-- Cấu Hình Giám Sát Phân Tán: Phơi Trần Thế Hệ (Generation Dashboard) Phân Loại Theo Định Danh Node Để Tầm Soát Lệch Cấu Hình.
+Khi đưa lên chạy thật (Production), nhớ kỹ:
+- Tránh vỡ RAM bằng cách đặt giới hạn độ to của Map ở chỗ `Map.copyOf`.
+- Đừng cố in log nguyên cái Map to đùng; chỉ in Thế Hệ, số lượng mục hoặc Checksum thôi.
+- Đặt biểu đồ theo dõi các bản cập nhật quá cũ bị từ chối (`stale_publish_rejected_total`).
+- Gắn cờ Cảnh báo (Alert) réo ầm lên nếu quá trình Tải Dữ Liệu thất bại liên tục.
+- Khóa tay mọi cố gắng đục khoét (Mutate) cái cấu trúc `PaymentRoute` sau khi nó đã lên sóng.
+- Ở tầm mức hệ thống phân tán, nên làm biểu đồ xem có máy chủ nào rớt nhịp, không theo kịp Thế hệ hiện hành hay không.

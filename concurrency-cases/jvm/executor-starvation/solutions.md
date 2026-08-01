@@ -1,27 +1,27 @@
 # Giải Pháp Kiến Trúc Tối Ưu và Chiến Lược Hoạch Định Sức Chứa
 
-## 1. Phương Án 1: Xóa Sổ Cơ Chế Đệ Trình Lồng Nhau (Drop Nested Submission)
+## 1. Phương Án 1: Bỏ Ngay Việc Ném Task Lồng Nhau (Drop Nested Submission)
 
-Nếu Tác vụ Cha đã yên vị trên Executor, hãy thẳng tay thực thi lệnh gọi Cấu trúc phụ thuộc (Dependency) ngay trên chính Luồng Công Nhân đó:
+Cách tốt nhất là: Đã có luồng rồi thì gọi trực tiếp hàm xử lý luôn, đừng đẻ thêm hàng đợi làm gì cho rườm rà.
 
 ```java
 public EnrichedOrder enrich(Order order) {
-    Price price = pricingClient.loadPrice(order.productId()); // Gọi trực tiếp đồng bộ
+    Price price = pricingClient.loadPrice(order.productId()); // Gọi trực tiếp luôn cho khỏe
     return new EnrichedOrder(order.orderId(), price);
 }
 ```
 
-Bứt rễ hoàn toàn hệ sinh thái Hàng Đợi/Future của Tác vụ Con, triệt tiêu tận gốc mầm mống Nạn Đói Nội Bộ (Self-starvation). Điểm lưu ý: Client Viễn trình (Remote client) bắt buộc tự trang bị Timeout; Sức chứa đồng thời của Executor phải thấp hơn/bằng Tổng Ngân Sách Tài Nguyên (Resource budget) phân bổ dưới tầng sâu.
+Cách này nhổ tận gốc rễ vấn đề "Nạn đói nội bộ". Lưu ý nhỏ: Khi gọi API ra ngoài thì tự cài timeout cho nó nhé. Và số luồng của Pool không được lớn hơn tổng số connection cấp phép ở bên dưới.
 
-## 2. Phương Án 2: Bộ Điều Phối Kích Hoạt Tác Vụ Lá (Orchestrator Submits Leaf Tasks)
+## 2. Phương Án 2: Dùng Người Điều Phối Trực Tiếp (Orchestrator Submits Leaf Tasks)
 
-Yêu cầu/Bộ Điều Phối đứng chênh vênh bên ngoài Worker Pool, trực tiếp nã đạn (submit) các Tác vụ Lá (Leaf tasks), neo mình tại Hạn mức thời gian (Deadline chung), và cấm tiệt hành vi nhúng vỏ bọc Tác vụ Cha vào chung một Pool. Khi hệ thống đổ vỡ/Quá hạn, kích hoạt Hủy mọi Future còn tồn đọng, khôi phục Cờ Ngắt (Interrupt) và chặn đứng hành vi phát tán Mảnh dữ liệu rác (Partial result). Đi sâu cấu trúc Hợp nhất tại chuyên đề `JVM-009`.
+Thay vì để Cha tự gọi Con, hãy tạo một người quản lý chung (Orchestrator). Ông này đứng ngoài Pool, giao việc nhỏ (Leaf tasks) thẳng vào Pool luôn. Cấm tiệt chuyện đưa ông Cha vào chung mâm với các việc nhỏ. Nếu quá hạn (Timeout), ông quản lý sẽ hú còi hủy hết các tác vụ đang kẹt. Chi tiết hơn xem bài `JVM-009`.
 
-## 3. Phương Án 3: Phân Ly Executor Theo Khối Phụ Thuộc (Separate Pools)
+## 3. Phương Án 3: Tách Riêng Pool Ra (Separate Pools)
 
-Tách bạch Pool của Cha và Con chém đứt vòng lặp tự sinh tự diệt, song đòi hỏi kỹ nghệ Hoạch định cấu trúc (Sizing) song song bao hàm cả Hàng đợi Giới hạn và Trạm kiểm soát Đầu vào. Khối lượng công việc đồng thời của Cha KHÔNG được phép thổi bùng Nhu cầu (Demand) của Tác vụ Con vượt khỏi Ngưỡng Sức Chứa của Tầng Con/Viễn Trình; Nhu nhược ở khâu này chỉ là việc dời Nạn Đói (Starvation) sang thảm họa Quá tải Hàng đợi (Queueing overload).
+Nếu buộc phải đẻ thêm tác vụ, thì Pool của Cha và Pool của Con phải riêng biệt. Cơ mà cách này cực kỳ mệt óc lúc setup giới hạn (Sizing). Pool Cha sinh việc nhanh quá mà Pool Con gánh không nổi thì Pool Con cũng banh xác. Tức là chỉ chuyển bệnh từ phòng này sang phòng khác thôi.
 
-## 4. Định Chuẩn Khai Thác ThreadPoolExecutor (Production Baseline)
+## 4. Cấu Hình ThreadPoolExecutor Chuẩn Thực Tế (Production Baseline)
 
 ```java
 new ThreadPoolExecutor(
@@ -30,30 +30,37 @@ new ThreadPoolExecutor(
         30, TimeUnit.SECONDS,
         new ArrayBlockingQueue<>(queueCapacity),
         threadFactory,
-        new ThreadPoolExecutor.AbortPolicy() // Rắn rỏi Khước từ
+        new ThreadPoolExecutor.AbortPolicy() // Quá tải thì văng lỗi, từ chối thẳng thừng!
 );
 ```
 
-Thiết lập lưới đánh chặn `RejectedExecutionException` ngay tại Cửa Ngõ (Admission boundary) và tái cấu trúc nó thành Phản hồi Quá Tải (Overload response); Tuyệt đối cấm hành vi Nuốt Lỗi (Swallow). Chính sách `CallerRunsPolicy` chỉ phát huy hiệu quả khi hệ Caller tự giảm tốc độ (Slowdown) và hệ lụy Bám Luồng (Thread-affinity side effect) đã được bảo chứng chấp thuận.
+Bắt được lỗi `RejectedExecutionException` thì báo luôn cho user là "Hệ thống quá tải", tuyệt đối không được nuốt lỗi (Swallow). Dùng `CallerRunsPolicy` chỉ khi bạn muốn hệ thống tự làm chậm lại, nhưng cẩn thận vì luồng gọi sẽ bị kẹt lại để làm thay tác vụ đó.
 
-## 5. Kỷ Luật Hạn Mức Và Khống Chế Hủy Bỏ (Deadline & Cancellation)
+## 5. Chặt Chẽ Với Deadline Và Hủy Bỏ (Deadline & Cancellation)
 
-Khai thác Hạn mức chung, lệnh `future.get(remaining, unit)`, lệnh `cancel(true)` khi sụp đổ và Khôi phục Cờ Ngắt. Hệ Client Viễn Trình/JDBC luôn cần một rào cản Timeout độc quyền; Cờ Interrupt chưa bao giờ là một Bảo chứng Hủy Mạng lưới (Network cancellation guarantee) đáng tin cậy.
+Luôn dùng `future.get(thời gian còn lại)`. Nếu lố giờ thì gọi `cancel(true)` ngay để giải phóng. Gọi API hay DB thì phải có timeout riêng của nó, đừng quá tin tưởng vào mỗi cờ Hủy (Interrupt).
 
-## 6. Tranh Luận Về Luồng Ảo (Virtual Threads)
+## 6. Lời Bàn Về Luồng Ảo (Virtual Threads)
 
-Công cụ thần thánh đối phó I/O Tắc Nghẽn (Blocking I/O), biến hóa Thread Dump/Mô hình Tác vụ thành tuyệt tác tinh giản. NHƯNG, bắt buộc giăng rào Semaphore/Giới hạn Đầu vào bám sát Hạn Mức Tải Kết Nối/Viễn Trình (Connection/Remote quota). Khước từ tư duy lạm dụng Đội Quân Luồng Ảo Vô Hạn làm phao cứu sinh cho Hoạch Định Sức Chứa (Capacity policy).
+Luồng ảo cực ngon để xử lý mấy vụ kẹt I/O, code nhìn rất gọn. NHƯNG, số luồng có thể ảo, còn Database và băng thông mạng thì không ảo đâu nha em. Vẫn phải có chốt chặn (Semaphore) đàng hoàng. Đừng nghĩ luồng ảo là thuốc tiên trị được lỗi kiến trúc hệ thống.
 
-## 7. Ma Trận Đánh Đổi Thiết Kế (Trade-offs)
+## 7. Đánh Đổi Giữa Các Giải Pháp (Trade-offs)
 
-| Giải Pháp Kỹ Thuật | Đặc Tính Tiến Trình (Progress) | Áp Lực Quá Tải (Overload) | Độ Phức Tạp |
+| Giải Pháp | Khả Năng Xử Lý Chơn Chu | Rủi Ro Quá Tải | Độ Phức Tạp |
 | --- | --- | --- | --- |
-| Truy Vấn Trực Tiếp (Direct Call) | Tiêu diệt Tận Gốc Self-starvation | Bảo vệ bằng Bounded Executor / Cổng Kiểm Soát | Thấp |
-| Điều Phối Tác Vụ Lá (Leaf Tasks) | Cha từ bỏ Quyền Giam Luồng | Ràng buộc bởi Deadline / Cờ Hủy | Vừa Phải |
-| Phân Ly Pool (Separate Pools) | Xé rách Vòng Lặp Chung-Pool | Đòi hỏi Tính Toán Sức Chứa Đồng Bộ | Vừa-Cao |
-| Luồng Ảo + Cấp Phép (Permits) | Chịu Tải Tác vụ Đóng Băng Khổng Lồ | Cấp Phép che chắn Khối Phụ Thuộc | Vừa Phải |
-| Bơm Mù Hàng Đợi/Pool | Phi Chứng Minh | Trì hoãn Thời Khắc Tử Thần | Thấp nhưng Khuyết Tật |
+| Gọi Trực Tiếp (Direct Call) | Hết kẹt cứng 100% | Bị giới hạn bởi lượng luồng tối đa của Pool | Dễ òm |
+| Người Điều Phối (Leaf Tasks) | Không sợ Cha ôm luồng | Cần canh Timeout và Hủy cẩn thận | Vừa phải |
+| Tách Pool (Separate Pools) | Không kẹt vòng lặp nữa | Đau đầu tính toán sức chứa cho cả 2 Pool | Khá Cao |
+| Luồng Ảo + Cấp Phép | Chấp hết các loại ngủ đông chờ | Phải có bộ cấp phép (Permits) cản ở ngoài | Vừa phải |
+| Buff Pool/Queue to lên | Lỗi vẫn hoàn lỗi | Chỉ kéo dài sự sống thêm vài giây | Dễ, nhưng dở |
 
-## 8. Khung Giám Sát Khai Thác (Production Checklist)
+## 8. Khung Giám Sát Khi Đưa Lên Production (Production Checklist)
 
-Quy định cấu hình: Hàng đợi Giới hạn; Khước từ Rắn rỏi; Hạn mức Chiến dịch (Operation deadline); Hạn mức Tầng Thấp (Downstream timeout); Truyền dẫn Cờ Hủy (Cancel propagation); Tuyên chiến Vòng lặp chờ Chung-Pool; Hạn mức Đóng Cửa (Graceful shutdown deadline); Triển khai Hệ thống Đo lường (Metrics) Độ trễ Hàng Đợi / Khước từ / Tiến Trình; Áp dụng Bài Cào Tải (Load test) bức tử Cổng Kiểm Soát.
+- [ ] Phải dùng hàng đợi có giới hạn.
+- [ ] Từ chối dứt khoát khi quá tải.
+- [ ] Set Deadline cho toàn bộ quy trình.
+- [ ] Set Timeout cho từng cuộc gọi xuống tầng dưới.
+- [ ] Lỗi là phải truyền tín hiệu Hủy xuống tận cùng.
+- [ ] Cấm lặp vòng chung Pool.
+- [ ] Gắn đồ thị đo lường (Metrics) đầy đủ.
+- [ ] Dập Load test thẳng vào xem nó chết ở đâu trước khi release.

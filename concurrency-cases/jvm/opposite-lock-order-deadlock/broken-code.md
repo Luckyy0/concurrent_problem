@@ -48,7 +48,7 @@ public final class BrokenLocalTransferService {
 }
 ```
 
-Logic unlock đúng khi hàm tiến qua lock thứ hai. Lỗi ở đây là thứ tự phụ thuộc vai trò source và destination, nên hai thao tác chuyển ngược hướng sẽ acquire cùng hai lock theo thứ tự ngược nhau.
+Code viết `finally` để unlock thì rất chuẩn bài rồi, nhưng chết ở chỗ thứ tự lock bị phụ thuộc vào biến `source` và `destination`. A chuyển sang B thì lock A trước, B chuyển sang A thì lại lock B trước. Thế là xong đời!
 
 ## Biến thể Intrinsic-lock
 
@@ -60,24 +60,26 @@ synchronized (source) {
 }
 ```
 
-Nó tạo ra cùng chu trình chờ. Việc acquire intrinsic monitor không thể bị ngắt (interruptible); thời gian chờ hoặc lệnh hủy yêu cầu (request timeout/cancel) không buộc thread đang chờ monitor thoát ra.
+Dùng `synchronized` cũng dính chưởng y chang. Đã thế dùng thằng này còn không ngắt (interrupt) được, thread cứ chờ mãi mãi thôi.
 
 ## Điều kiện tái hiện
 
-1. Các account lock có định danh ổn định và thật sự được chia sẻ;
-2. T1 giữ A trước khi xin B;
-3. T2 giữ B trước khi xin A;
-4. Hai thread cùng giữ lock đầu tiên trước khi acquire lock thứ hai;
-5. Không có timeout hoặc nạn nhân (victim) để phá chu trình.
+Deadlock sẽ nổ ra nếu hội đủ mấy điều kiện sau:
+1. Các lock đều là thật và dùng chung.
+2. Thread 1 khóa A rồi xin B.
+3. Thread 2 khóa B rồi xin A.
+4. Hai ông cùng giữ lock đầu tiên đúng cùng một lúc.
+5. Không có timeout để dọn dẹp hiện trường.
 
 ## Những cách sửa chưa đủ
 
-- Chỉ đổi `synchronized` thành `ReentrantLock` nhưng vẫn khóa source trước.
-- Thêm timeout phía HTTP client; server thread vẫn có thể bị kẹt.
-- Bắt (Catch) exception; deadlock không ném ra exception cho khoảng chờ intrinsic hoặc `lock()`.
-- Thử lại ngay theo cùng thứ tự; có thể tái tạo chu trình hoặc livelock.
-- Dùng `Thread.stop`; không an toàn và có thể làm hỏng trạng thái.
-- Khóa theo `hashCode` mà không xử lý va chạm (collision) hoặc phân định (tie); không tạo total order chắc chắn.
-- Dùng local ordering cho các database row rồi tuyên bố đã xử lý PostgreSQL deadlock; query plan và các lock khác vẫn thuộc tầng database.
+Nhiều người hay fix sai lầm kiểu này:
+- Chuyển `synchronized` qua `ReentrantLock` nhưng vẫn giữ nguyên thứ tự khóa. Chả giải quyết gì!
+- Chặn timeout ở phía gọi API (HTTP client): Server thì vẫn đang treo cơ mà.
+- Đặt `try-catch`: Hàm `lock()` thường nó không ném lỗi timeout để mà bắt đâu.
+- Chết máy thì thử lại ngay: Bạn có thể gây ra livelock.
+- Xài `Thread.stop`: Cái này nguy hiểm, dễ làm hỏng cả trạng thái dữ liệu.
+- Khoá theo `hashCode`: Lỡ hai cái trùng hash thì sao? Chết chắc!
+- Nghĩ rằng khoá trong Code thì DB sẽ an toàn: Ở DB nó lại có luật chơi riêng nhé.
 
-> **Nói ngắn gọn:** `finally` chỉ chạy sau khi luồng thực thi (flow) thoát khỏi trạng thái chờ; nó không tự phá một wait-for cycle đang tồn tại.
+> **Nói ngắn gọn:** `finally` chỉ giúp nhả lock khi luồng code chạy qua được thôi, nếu nó kẹt cứng lúc đang xin lock thì `finally` cũng đành bất lực.

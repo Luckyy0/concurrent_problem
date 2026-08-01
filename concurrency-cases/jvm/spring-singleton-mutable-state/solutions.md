@@ -2,8 +2,7 @@
 
 ## Giải pháp khuyến nghị: singleton không giữ trạng thái request
 
-Dữ liệu của request chỉ tồn tại trong tham số hoặc biến cục bộ. Việc tạo ID
-được tách thành một dependency có hợp đồng (contract) an toàn cho nhiều luồng:
+Cách ngon nhất, sạch sẽ nhất là làm cho service "mất trí nhớ" (`stateless`). Dữ liệu của request nào thì nằm yên trong tham số hoặc biến chạy nội bộ của request đó thôi. Việc sinh ra ID thì tách riêng cho một anh bạn dependency lo, anh bạn này phải cam kết là "chấp mọi thể loại đa luồng":
 
 ```java
 package com.example.checkout;
@@ -76,24 +75,17 @@ public record ReceiptDraft(UUID id, String customerId) {
 
 ## Tại sao giải pháp hoạt động
 
-- Service không còn field thay đổi theo từng request.
-- `customerId` là biến cục bộ của một lời gọi; request khác không thể thay thế
-  giá trị này.
-- `ReceiptDraft` không thay đổi sau khi được tạo và được hoàn thiện trước khi trả
-  về.
-- `UUID.randomUUID()` hỗ trợ nhiều lời gọi đồng thời; mỗi lời gọi không thực
-  hiện chuỗi đọc–sửa–ghi trên trạng thái của service.
-- Không còn luồng bị chậm phải chờ, thất bại hoặc thử lại vì không còn xung đột trên
-  trạng thái dùng chung.
+- Service của chúng ta giờ đây sạch bóng, không còn một cái biến chung nào để tranh nhau cả.
+- `customerId` trở thành biến cục bộ. Việc của anh nào anh nấy làm, không ai quấy rầy ai.
+- Bản nháp `ReceiptDraft` khi đã tạo ra là bất di bất dịch (immutable).
+- Thằng `UUID.randomUUID()` đã được build sẵn để an toàn cho mọi mặt trận đa luồng. Cứ tự nhiên mà xài không lo đọc-sửa-ghi dẫm chân lên nhau.
+- Không còn khái niệm luồng này phải chờ luồng kia. Không có tranh chấp thì khỏi lo nghẽn cổ chai.
 
-Giải pháp loại bỏ điểm tranh chấp thay vì chỉ đặt khóa bao quanh nó.
+Mình tiêu diệt tận gốc điểm tranh chấp, chứ không phải tìm cách nhét ổ khoá vào.
 
-> **Nói ngắn gọn:** mỗi request chỉ làm việc với dữ liệu của chính nó nên request
-> khác không còn trạng thái để ghi đè.
+> **Nói ngắn gọn:** Ai có phần nấy. Dữ liệu request nào chạy theo request đó nên không có chuyện thằng này ghi đè thằng kia.
 
-Nếu ID là định danh nghiệp vụ bền vững đòi hỏi tính duy nhất tuyệt đối, UUID tại
-tầng ứng dụng vẫn phải đi cùng ràng buộc duy nhất của cơ sở dữ liệu. Nếu cần
-chuỗi tăng dần toàn cục, dùng database sequence:
+Nếu cái ID của bạn cần là duy nhất tuyệt đối theo chuẩn nghiệp vụ, bạn nên cắm thêm ràng buộc duy nhất (unique constraint) dưới database. Nếu nghiệp vụ bắt buộc phải dùng số đếm tăng dần, hãy nhường lại sân chơi cho database sequence:
 
 ```sql
 CREATE SEQUENCE receipt_draft_seq;
@@ -101,8 +93,7 @@ CREATE SEQUENCE receipt_draft_seq;
 SELECT nextval('receipt_draft_seq');
 ```
 
-Database sequence xử lý đồng thời giữa nhiều application instance, nhưng
-không cam kết chuỗi không có khoảng trống khi transaction rollback.
+Sequence của DB nó tự "chơi" đa máy chủ dễ như ăn kẹo, có điều nếu có lỗi rớt mạng hay rollback thì coi chừng số thứ tự nó nhảy cóc.
 
 ## Phương án 1: AtomicLong cho sequence cục bộ
 
@@ -119,10 +110,7 @@ public final class LocalReceiptDraftService {
 }
 ```
 
-Cách này phù hợp khi yêu cầu chỉ cần sequence duy nhất trong vòng đời một
-JVM. `customerId` vẫn phải là biến cục bộ. Không dùng bộ đếm cục bộ cho định
-danh bền vững hoặc dùng chung toàn hệ thống, vì khởi động lại làm mất trạng thái và mỗi
-node có một `AtomicLong` riêng.
+Cách này "chữa cháy" tạm ổn nếu bạn chỉ muốn lấy ID đếm trong phạm vi của 1 máy chủ đang chạy. Nhớ là `customerId` vẫn phải để làm biến cục bộ nha! Tuy nhiên, đừng bao giờ xài cách này cho các định danh quan trọng sống còn toàn hệ thống, bởi vì mỗi khi bạn khởi động lại ứng dụng là bộ đếm trên RAM cũng "về mo", và mỗi máy chủ nó lại có một cái `AtomicLong` riêng lẻ tẻ.
 
 ## Phương án 2: vùng bảo vệ bằng synchronized
 
@@ -133,42 +121,31 @@ public synchronized ReceiptDraft createDraft(String customerId) {
 }
 ```
 
-Cùng một monitor bảo đảm tại một thời điểm chỉ một luồng vào phương thức và tạo quan
-hệ xảy ra-trước giữa hai lần gọi. T2 phải chờ đến khi T1 thoát phương thức; phía gọi
-không cần thử lại (retry). Cách này đúng trong một JVM nhưng buộc mọi request chạy lần
-lượt, làm tăng độ trễ khi mức tranh chấp cao và không bảo vệ App B.
+Gắn `synchronized` vô thì hệ thống tự biến thành một cái "toilet 1 buồng", luồng thứ hai phải đứng ngoài chờ đến khi luồng thứ nhất đi ra thì mới được vào. Giải quyết gọn gàng cho 1 máy chủ, nhưng tốc độ sẽ rùa bò nếu như có quá nhiều người truy cập cùng lúc. Thêm nữa, máy A khoá thì mặc máy A, máy B nó vẫn cứ tung tăng cấp số trùng bình thường.
 
-Nếu lock bao nhiều resource hoặc phương thức gọi code có lock khác, nguy cơ deadlock
-có thể xuất hiện. Case hiện tại chỉ có một monitor nên rủi ro thấp.
+Nếu code bên trong vòng `synchronized` gọi qua các hàm có lock khác, cẩn thận kẻo dính "deadlock" (cả 2 cùng chờ nhau đến sáng). May mà trong ví dụ này chúng ta chỉ có 1 ổ khoá thôi nên cũng ít rủi ro.
 
 ## Những lựa chọn không khuyến nghị
 
-- **`volatile` counter:** tính hiển thị đúng nhưng phép cộng gộp vẫn sai.
-- **`ThreadLocal`:** dễ giữ dữ liệu trên luồng trong pool, yêu cầu dọn dẹp và che
-  giấu luồng dữ liệu; dùng tham số đã đơn giản hơn.
-- **service có phạm vi theo request:** tránh chia sẻ field nhưng tăng độ phức tạp
-  của vòng đời mà không cần thiết; stateless singleton rõ hơn.
-- **khóa phân tán (distributed lock):** quá phức tạp cho việc có thể loại bỏ trạng thái
-  dùng chung hoặc dùng bộ tạo ID chính.
+- **Xài biến `volatile`:** giúp nhìn thấy dữ liệu mới nhanh, nhưng cái đoạn cộng dồn thì vẫn nát.
+- **Xài `ThreadLocal`:** Dễ làm luồng chết ngộp hoặc sót data cũ trong thread pool. Muốn dùng phải nhớ dọn dẹp rất mất công. Cứ xài thẳng tham số (parameter) cho lành.
+- **Service đổi sang scope request:** Tránh được đụng độ nhưng lại tự làm khổ mình bằng cách kéo theo mớ bùng nhùng của lifecycle object. Stateless singleton vừa nhanh vừa rõ.
+- **Distributed lock (Khoá phân tán):** Như kiểu giết gà dùng dao mổ trâu. Đắt đỏ, cồng kềnh, trừ khi bạn không còn cách nào khác.
 
 ## So sánh các đánh đổi
 
-| Giải pháp | Mức bảo đảm | Thông lượng và độ trễ | Tranh chấp và thử lại | Nguy cơ deadlock | Độ phức tạp vận hành | Mở rộng nhiều node |
+| Giải pháp | Mức bảo đảm | Thông lượng và độ trễ | Tranh chấp và thử lại | Nguy cơ deadlock | Độ phức tạp | Mở rộng nhiều node |
 | --- | --- | --- | --- | --- | --- | --- |
-| Stateless + UUID | Cách ly request tốt; thêm DB constraint nếu cần uniqueness tuyệt đối | Cao, không có hàng chờ tại service | Không còn trạng thái dùng chung nên không cần thử lại do xung đột | Không | Thấp | Tốt |
-| `AtomicLong` + dữ liệu cục bộ | Chỉ bảo đảm trong một JVM và một vòng đời process | Cao | CAS có thể tranh chấp khi rất nóng; thường không cần phía gọi thử lại | Không | Thấp | Không phù hợp cho định danh toàn cục |
-| `synchronized` | Đúng trong một JVM nếu mọi access dùng cùng monitor | Độ trễ tăng vì các request chạy lần lượt | Luồng thứ hai phải chờ; không thử lại | Thấp với một lock, tăng khi có nhiều lock | Thấp/trung bình | Không bảo vệ nhiều node |
-| Database sequence | Cấp sequence dùng chung giữa các node | Thêm một vòng kết nối DB | Database quản lý tranh chấp; thường không cần phía gọi thử lại | Rất thấp cho một lời gọi sequence | Trung bình | Tốt khi database là ranh giới dùng chung |
-| Distributed lock | Phụ thuộc TTL, ownership và fencing | Thêm độ trễ mạng | Có chờ khóa, lỗi và thử lại | Có rủi ro từ protocol và failure mode | Cao | Quá phức tạp cho case này |
+| Stateless + UUID | Tốt lắm; nếu cần thêm DB constraint cho chắc ăn | Siêu cao, không phải chờ đợi | Hết tranh chấp, khỏi cần thử lại | Không bao giờ | Thấp | Tuyệt vời |
+| `AtomicLong` + dữ liệu cục bộ | Chỉ trong nội bộ 1 máy chủ | Cao | Chạy trâu bò quá thì có thể hơi khựng xíu | Không | Thấp | Đừng dại mà xài khi chạy nhiều node |
+| `synchronized` | Bao ngon trong nội bộ 1 máy chủ | Chậm đi vì phải xếp hàng tuần tự | Đứng chờ mòn mỏi; không retry | Ít (nếu chỉ 1 ổ khoá) | Vừa vừa | Vô dụng với đa máy chủ |
+| Database sequence | Ổn cho mọi node | Tốn thời gian gọi tới DB một chuyến | DB lo hết vụ xếp hàng rồi | Rất thấp | Vừa vừa | Tuyệt vời khi lấy DB làm mốc |
+| Distributed lock | Chờ timeout này nọ mệt mỏi | Trễ do độ trễ của mạng | Chờ khoá lòi kèn, hay lỗi và phải thử lại | Hên xui do rủi ro nghẽn mạng | Siêu cao | Phức tạp hoá vấn đề rồi |
 
 ## Lưu ý khi áp dụng thực tế
 
-- Không lưu `HttpServletRequest`, principal xác thực, dữ liệu khách hàng hoặc
-  định danh tương quan trong field của singleton.
-- Dùng tham số, đối tượng command bất biến hoặc logging MDC có vòng đời/dọn dẹp đúng.
-- Metrics dùng Micrometer/công cụ an toàn luồng thay vì bộ đếm tự viết.
-- Xác định rõ hợp đồng của ID: cục bộ hay toàn hệ thống, tạm thời hay bền vững,
-  có cần tăng dần hoặc không được có khoảng trống hay không.
-- Khả năng xử lý lặp an toàn (`idempotency`) khi phía gọi thử lại là một quy tắc khác
-  với an toàn luồng của service. Nếu nghiệp vụ yêu cầu, cần khóa idempotency và
-  bản ghi bền vững riêng.
+- Tuyệt đối không bao giờ được lưu các thứ như `HttpServletRequest`, tài khoản khách hàng, hay mấy thứ linh tinh của 1 request vào field của `singleton service`.
+- Nên xài parameter, các đối tượng bất biến (immutable), hoặc MDC của logging (nhưng nhớ dọn dẹp kỹ sau khi xài).
+- Muốn làm chỉ số mét (metrics) thì lôi `Micrometer` hay hàng làm sẵn ra, đừng tự ngồi code bộ đếm.
+- Cần biết cái ID của mình có vai trò gì: nội bộ hay xài chung, tạm bợ hay xài lâu dài, có cần đếm số hay không được mất số nào không?
+- Cái khái niệm an toàn luồng và khái niệm `idempotent` (gọi lại chục lần vẫn thế) là 2 thứ khác nhau. Nếu cần vụ gọi lại thì phải làm hẳn một cơ chế kiểm tra và lưu vết riêng.

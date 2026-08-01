@@ -2,13 +2,13 @@
 
 ## 1. Chiến Lược Kiểm Thử Cốt Lõi (Core Strategy)
 
-Quá trình thẩm định bắt buộc trả lời tường tận 4 khía cạnh:
-1. Xác minh Hai Khóa (Lock objects) Phân Biệt có Cự Tuyệt Hai Tác Nhân (Actors) cùng đột nhập hay không.
-2. Thẩm Định Hai Khóa Logic (Logical Keys) Bằng Trị Số nhưng Lệch Tham Chiếu có bị ép bám chung Một Ổ Khóa (Monitor) hay không.
-3. Khảo Sát Tính Năng Khóa Phân Dải (Striped Lock) bảo Vệ Mã Khóa Nội Bộ (Service Instance).
-4. Vạch Trần Giới Hạn của Khóa Nội Bộ khi Đa Nút Máy Chủ (Service Instances) chạm trán Kho Lưu Trữ Chung.
+Để chứng minh khóa chạy xịn hay chạy cùi, bài test của chúng ta phải trả lời được 4 câu:
+1. Xem thử 2 cái khóa (Lock objects) khác nhau có cản được 2 luồng (Actors) cùng lao vào hay không. (Chắc chắn là không).
+2. Xem thử 2 chuỗi Key nội dung giống y chang nhưng khác địa chỉ ô nhớ thì có ép dùng chung 1 khóa được không. (Cũng không luôn).
+3. Đánh giá sức mạnh của Khóa phân dải (Striped Lock) trong việc bảo vệ dữ liệu trên một máy (Service Instance).
+4. Phơi bày sự bất lực của khóa nội bộ trên một máy khi phải chống chọi trong môi trường đa máy chủ (Multi-node).
 
-Triển khai Rào chắn Giả lập (Fake Store Latch) ngay sau lệnh `exists` nhằm ép 100% Actors vào thế Quan Sát Báo Cáo "Tài Khoản Rỗng" (Chưa Tồn Tại). Loại bỏ hoàn toàn Dấu Vết của `Thread.sleep`; Đóng Mọi Rào Chắn Latch/Future Bằng Bộ Giờ Đếm Ngược Timeout.
+Mình sẽ xài cái hàng rào giả (Fake Store Latch) chắn ngang ngay sau hàm `exists` để dụ tất cả các luồng vào thấy "File chưa có". Tuyệt đối không dùng `Thread.sleep` cùi bắp; dùng Timeout đếm ngược cho chuẩn!
 
 ## 2. Thí Nghiệm 1: Trình Diễn Bế Tắc Khóa Lỗi Nhịp Mỗi Lần Gọi (Per-Call Locks)
 
@@ -40,13 +40,13 @@ void perCallLocksAllowDuplicateGeneration() throws Exception {
 }
 ```
 
-Rào Chắn (Barrier) Cố Đinh: Chỉ vỡ khi Cả 2 Actors Chạm Mốc `exists`. NẾU hệ thống Tuân Thủ Một Khóa Chuẩn Mực, Bài Test Bắt Buộc Đứt Gãy Timeout Do Nghẽn Cổ Chai. Trái Lại, Với Khóa Sinh-Mới-Mỗi-Lần, Cả 2 Lướt Qua Rào và Sinh Ra Hành Vi Nhân Bản (Duplicate Writes).
+Hàng rào (Barrier) này chỉ sụp khi cả 2 luồng cùng đến được điểm `exists`. NẾU khóa xịn, thằng đến sau phải bị Timeout cản lại. Còn đằng này, vì mỗi thằng đẻ 1 cái khóa mới nên cả 2 luồng vượt rào êm ru, tạo file 2 lần và ghi 2 lần. Toang!
 
-> **Nguyên tắc kỹ thuật:** Phép Thử không chọc ngoáy bóc tách Bản Thể Khóa (Lock Object) qua Reflection; Nó Tra Khảo Hành Vi Nghiệp Vụ Sinh Tử — Bắt Buộc Chỉ Có Thể Kích Hoạt Một Chặng Sinh Khóa (Generation Workflow) Cho Một Mã Độc Nhất.
+> **Nguyên tắc kỹ thuật:** Đừng có soi mã nguồn xem lock kiểu gì. Chạy bài test này, nếu nó cho phép 2 luồng cùng xử lý 1 file duy nhất thì code đó sai bét.
 
 ## 3. Thí Nghiệm 2: Trị Số Chuỗi Khớp (Equal) KHÔNG Bằng Đồng Nhất Tham Chiếu Khóa (Monitor)
 
-Mô Phỏng Trực Quan Ảo Giác Khóa:
+Mô phỏng lại cái Ảo giác Khóa (tưởng chuỗi giống nhau là khóa dính nhau):
 
 ```java
 @Test
@@ -79,10 +79,11 @@ void equalStringsWithDifferentIdentityUseDifferentMonitors() throws Exception {
     assertEquals(2, store.putCount());
 }
 ```
+Nhìn kìa, nội dung chuỗi giống hệt nhau, nhưng chúng là 2 object khác nhau. Kết cục? Hai luồng ôm 2 cái khóa riêng rẽ, mạnh ai nấy chạy qua cửa!
 
 ## 4. Thí Nghiệm 3: Năng Lực Trấn Thủ Của Khóa Phân Dải (Striped Lock)
 
-Lệnh Triệu Tập Thứ 2 (Second Request) Bị Ép Nghẽn Trên Dải Khóa. Sau khi Quân Chủ Lực (Request 1) Kéo Quân Xuất Bản, Kẻ Tới Sau Phải Nuốt Phản Hồi "Đã Tồn Tại" Thay Vì Tự Tiện Rẽ Hướng Cày Đè.
+Ở đây, request tới sau phải bị nghẽn lại ở dải khóa. Chờ luồng đầu tiên xuất bản file xong xuôi, thằng đến sau tỉnh mộng nhận thông báo "Có file rôi má ơi" rồi quay xe, không tính toán lại dư thừa nữa.
 
 ```java
 @Test
@@ -130,11 +131,11 @@ void stableStripeAllowsOnlyOneRenderForTheSameKey() throws Exception {
 }
 ```
 
-Xác thực Quả Ngọt Nghiệp Vụ (Business Outcome), từ chối lệ thuộc Phương thức `lock.isLocked()`. Vỏ Bọc Khóa Có Thể Sửa Đổi Mà Hệ Quả Cấu Trúc Không Rạn Nứt.
+Kết quả quá mỹ mãn! Chỉ có 1 lần tính toán (render) và 1 lần lưu (put). Hệ thống đứng vững.
 
 ## 5. Thí Nghiệm 4: Hai Bản Thể Máy Chủ Phơi Bày Giới Hạn Khóa Nội Bộ
 
-Giả lập Kiến Trúc Hai Nút Máy Chủ (Two Nodes). Mỗi Máy Sở Hữu Kho Khóa Độc Lập `StripedKeyLocks`, nhưng Tranh Cướp Chung Kho Dữ Liệu `BarrierStore`.
+Thử làm kiến trúc 2 Server. Mỗi máy có 1 bộ khóa phân dải `StripedKeyLocks` riêng biệt, nhưng cùng đâm vào cái Kho dữ liệu chung `BarrierStore`.
 
 ```java
 @Test
@@ -171,11 +172,11 @@ void twoInstancesStillGenerateTheSameArtifactTwice() throws Exception {
 }
 ```
 
-Đây là Thử Thách Tử Thần Buộc Phải Chạy Trước Khi Ảo Mộng Khóa Nội Bộ Được Đặt Phía Trước Ranh Giới Lưu Trữ Chung.
+Cú lừa ngoạn mục! Máy nào khóa máy nấy, chả liên quan gì nhau. Cả 2 cùng qua lọt, render 2 lần và ghi 2 lần lên cái Store chung. Đây là bài test bắt buộc phải có để xóa tan ảo mộng về việc dùng Khóa cục bộ bảo vệ cụm máy chủ!
 
 ## 6. Thí Nghiệm 5: Lệnh Cập Nhật Kho Khởi Tạo Có Điều Kiện Định Hình Vương Quyền Độc Tôn (Conditional Create)
 
-Bức Tường Kho Lưu Trữ Phán Quyết Vận Mệnh bằng Vũ Khí `putIfAbsent` Của Atomic:
+Bức tường Kho Lưu Trữ tự thân vận động phán xử bằng hàm Atomic `putIfAbsent`:
 
 ```java
 final class ConditionalInMemoryStore {
@@ -190,36 +191,36 @@ final class ConditionalInMemoryStore {
 }
 ```
 
-Thử Thách Ép Bộ Lọc Lỗi. Dẫu Hai Máy Cùng Nhấn Lệnh Render (Nướng CPU), Bắt Buộc Kho Lưu Trữ Dập Tắt Một Yêu Cầu (Trả vể Tồn Tại). Lộ Trình Triển Khai Thực Chiến Yêu Cầu Gắn Bó Sâu Hơn Chức Năng Cực Đoan Từ DB Store API Thực Tế.
+Dù 2 máy cùng cắm đầu chạy render tốn CPU, nhưng khi lao tới Store thì Store gạt phăng thằng chậm chân, trả về lỗi "Đã có người lưu rồi ba". Hệ thống an toàn tuyệt đối. Thực chiến là phải xài cái này nha anh em!
 
 ## 7. Khung Kiểm Định Quản Trị Khóa Mở Rộng: Timeout, Interruption, Tình Trạng Lỗi
 
-Mở Rộng Quản Trị Rủi Ro Cấu Trúc Khóa:
-- T2 Rớt Đài Sớm Nhận Lỗi `ArtifactBusyException` Dưới Áp Lực Timeout Trong Khi T1 Giam Dải Khóa.
-- Đánh Phá Ngắt Interrupt Luồng T2 Giữa Tâm Bảo `tryLock`; Kiểm Toán Lại Cờ Khôi Phục Ngắt.
-- Bộ Render Sập Bẫy Ngoại Lệ; Khóa Có Buông Tay Nhường Cơ Hội Sau Cùng Lại Cho Luồng Đuôi (Tail request).
-- Phán Quyết Mù Dưới Áp Lực Store Timeout; Đòi Hỏi Phương Pháp Khắc Phục Đối Soát (Reconcile).
-- Khung Dải Băm Góp Mặt Chung 2 Mã Artifact; Áp Lực Tuần Tự (Serialize) Không Đánh Sập Quy Tắc Bất Biến (Correctness).
-- Khóa Có Dám Sống Sót Giữa Giao Quyền Giải Phóng Cho Luồng Cấu Trúc Thứ Cấp (Callback thread)? KHÔNG!
+Đừng quên test thêm các "thế kẹt" hiểm hóc sau:
+- Luồng 2 văng lỗi `ArtifactBusyException` do đứng chờ khóa quá lâu (Timeout) trong khi Luồng 1 vẫn giữ chặt.
+- Thử gửi tín hiệu ngắt (Interrupt) cho Luồng 2 xem nó có bung ra và giữ nguyên cờ Ngắt không.
+- Làm cho đoạn code Render văng Exception, xem khóa có nhả ra đàng hoàng cho đứa sau không (hay ôm chết luôn).
+- Giả lập Kho Store bị timeout; lúc này nên cảnh báo anh em làm tính năng "Thử lại và đối soát".
+- Thử băm 2 file khác nhau vào chung một khóa phân dải xem nó có bị lỗi data không (không hề, nó chỉ chạy tuần tự lại xíu thôi).
+- Thử quăng cái khóa qua Luồng 2 bắt nó xả khóa dùm Luồng 1. KHÔNG BAO GIỜ CHO PHÉP NHÉ!
 
 ## 8. Khung Giám Sát Khai Thác Môi Trường (Production Blueprint)
 
-Đặc Tả Vận Hành (Metric):
-- Chỉ số Hao Mòn: Lock Wait Duration, Acquisition Timeout, Lượng In-flight Hiện Hành.
-- Trục Cân Bằng: Render Count So Sánh Lệnh Created Artifact Count.
-- Thống Kê Giao Chiến Khóa Liên Máy Chủ: Conditional Conflict / Lệnh `ALREADY_EXISTS`.
-- Biến Động Hàng Đợi (Queue Length Diagnostic) và Định Danh Điểm Nóng (Hot spot) Dải Khóa (Stripe contention).
+Để ý mấy chỉ số vàng này nha:
+- Thời gian phải chờ khóa, tỉ lệ bị quá hạn chờ (Timeout), số luồng đang chạy.
+- So sánh số lần render với số lần ghi file thành công.
+- Theo dõi bao nhiêu lần đâm nhau lên Kho mà bị từ chối (báo `ALREADY_EXISTS`).
+- Quan sát độ dài hàng đợi và xem có dải khóa nào bị "nhồi" nhiều quá không (Hot spot).
 
-Nghiêm Cấm Suy Đoán Quyết Định Core (Correctness signal) Dựa Lên Tham Số Dò Dẫm (Heuristic) Như Lệnh Đo Kích Cỡ Wait Queue Của ReentrantLock.
+Lưu ý nhỏ: Đừng bao giờ dựa vào cái hàm soi số luồng đang chờ của `ReentrantLock` để làm cơ sở logic, sai bét đấy.
 
 ## 9. Khung Tiêu Chuẩn Thực Nghiệm (Quality Checklist)
 
-- [ ] Phơi Trần Cấu Trúc Khóa Theo Chặng Nhờ Barrier.
-- [ ] Vạch Trần Lỗi Khóa Bằng Tham Chiếu Độc Lập Chứ Không Dùng Nội Dung.
-- [ ] Khảo Khảo Sát Một Ghi Mới Vận Hành Nhờ Lệnh Render Trấn Áp.
-- [ ] Hiện Thực Thử Đo Đạc Khóa Nội Bộ Quá Hẹp (Two-node setup).
-- [ ] Truy Bắt Ranh Giới Giao Thức Khởi Tạo Kho Có Điều Kiện.
-- [ ] Trục Xuất `Thread.sleep` Khỏi Hệ Thống Logic Phán Quyết.
-- [ ] Bó Cứng 100% Khung Latch Bằng Hạn Mức Timeout.
-- [ ] Phơi Trần Sức Trụ Vững `try-finally` Trước Gián Đoạn (Interrupt) và Vỡ Ngoại Lệ (Exception).
-- [ ] Buộc Đóng Chốt Toàn Bộ Pool (Executor) Trước Hồi Kết.
+- [ ] Phơi bày được cấu trúc khóa nhờ mấy hàng rào Latch/Barrier.
+- [ ] Vạch trần lỗi khóa khi 2 chuỗi khác địa chỉ ô nhớ.
+- [ ] Khảo sát việc ghi đè vô duyên do khóa tồi.
+- [ ] Đo thử độ tệ hại của khóa nội bộ trên 2 Server giả lập.
+- [ ] Test ranh giới của việc khởi tạo dữ liệu xài lệnh Có Điều Kiện trên Store.
+- [ ] Dẹp luôn `Thread.sleep` khỏi hệ thống test.
+- [ ] Buộc phải có giới hạn thời gian (Timeout) cho mọi hàng rào Latch.
+- [ ] Thử thách khối `try-finally` trước các sự cố văng Exception và Gián đoạn (Interrupt).
+- [ ] Đảm bảo dọn dẹp sạch sẽ mớ tiểu trình (Thread Pool) sau khi chạy test.

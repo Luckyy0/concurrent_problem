@@ -2,8 +2,7 @@
 
 ## Đoạn code gây điều kiện tranh chấp
 
-Đoạn code dưới đây mô phỏng một cách triển khai dễ gặp: lập trình viên giữ sequence
-và dữ liệu khách hàng gần nhất trong field để dùng lại giữa các lời gọi.
+Hãy xem thử đoạn code dưới đây. Đây là một sai lầm rất phổ biến: dev nhà ta thường có thói quen khai báo biến chung (field) trong service để đếm số sequence và lưu tên khách hàng cho tiện tái sử dụng.
 
 ```java
 package com.example.checkout;
@@ -44,8 +43,7 @@ public record ReceiptDraft(long sequence, String customerId) {
 }
 ```
 
-Controller dùng constructor injection nhưng mọi request vẫn đi vào cùng một service
-instance:
+Phía Controller thì xài dependency injection quen thuộc. Dù bạn gọi nó bao nhiêu lần, thì các request cũng chạy thẳng vào đúng duy nhất một instance của `ReceiptDraftService`.
 
 ```java
 package com.example.checkout;
@@ -84,28 +82,27 @@ public record CreateReceiptDraftRequest(String customerId) {
 
 ## Vì sao đoạn code trông có vẻ hợp lý
 
-- Kiểm thử đơn vị gọi tuần tự luôn thấy sequence tăng.
-- Mỗi câu lệnh Java đều ngắn nên khó nhận ra chúng tạo thành một chuỗi nhiều bước.
-- Spring khởi tạo singleton an toàn, nhưng điều này dễ bị hiểu nhầm thành mọi lần
-  truy cập sau đó cũng an toàn cho nhiều luồng.
-- Trạng thái không nằm trong database nên lập trình viên có thể bỏ qua việc phân tích vùng
-  tranh chấp và cơ chế khóa.
+- Khi bạn chạy unit test (chạy từng luồng một), số sequence luôn tăng đều đặn, nhìn rất nuột.
+- Code Java viết quá ngắn gọn, bạn nhìn dòng `++nextSequence` cứ tưởng nó là một cục nguyên khối, chứ ai ngờ nó tách ra nhiều bước ngầm bên dưới.
+- Spring quảng cáo là khởi tạo singleton rất an toàn. Nhiều người hiểu lầm "an toàn" có nghĩa là sau đó gọi hàm thoải mái không lo lỗi luồng.
+- Vì không đụng tới database, dev thường tặc lưỡi bỏ qua vụ phân tích vùng tranh chấp dữ liệu hay cơ chế khoá (lock).
 
 ## Điều kiện để lỗi xuất hiện
 
-1. Bean dùng singleton scope mặc định.
-2. Server có ít nhất hai luồng xử lý request.
-3. Hai lời gọi `createDraft` bị xen kẽ.
-4. Không có cùng một monitor/lock bao quanh toàn bộ logic nghiệp vụ (invariant).
+Để cái bug này "bật ngửa" ra, bạn chỉ cần đủ 4 yếu tố:
 
-`nextSequence` và `lastCustomerId` đều là trạng thái dùng chung có thể thay đổi.
-Không có cơ chế đồng bộ nào tạo quan hệ xảy ra-trước giữa hai luồng xử lý
-request.
+1. Spring bean đang xài scope mặc định (singleton).
+2. Server đang bật ít nhất 2 luồng để chạy request song song.
+3. Hai request xui rủi gọi hàm `createDraft` rơi đúng vào cùng một phần nghìn giây (xen kẽ nhau).
+4. Không có bất kỳ ổ khoá (lock) nào gom toàn bộ logic này lại.
 
-> **Nói ngắn gọn:** cả hai request đang đọc và ghi cùng hai field mà không có
-> khóa hoặc thao tác nguyên tử bảo vệ toàn bộ quy tắc.
+Lúc này, `nextSequence` và `lastCustomerId` trở thành các bãi chiến trường để các luồng giành nhau đọc/ghi. Không có trật tự nào cả, mạnh ai nấy chạy!
+
+> **Nói ngắn gọn:** Hai request cùng lúc lôi hai biến chung ra đọc và sửa. Không có khoá chặn lại, nên luật nghiệp vụ bị phá vỡ hoàn toàn.
 
 ## Các cách sửa tưởng đúng nhưng chưa đủ
+
+Nhiều khi thấy lỗi, chúng ta vội vàng quăng ngay vài keyword vào với hy vọng sẽ hết. Nhưng coi chừng:
 
 ### Chỉ thêm volatile
 
@@ -113,14 +110,13 @@ request.
 private volatile long nextSequence;
 ```
 
-`volatile` giúp một luồng nhìn thấy giá trị mà luồng khác đã ghi, nhưng
-`++nextSequence` vẫn gồm ba bước:
+Keyword `volatile` chỉ giúp các luồng "nhìn thấy" dữ liệu mới nhất ngay lập tức. Nhưng ngặt nỗi, biểu thức `++nextSequence` thật ra là 3 bước rời rạc:
 
 ```text
 read → add → write
 ```
 
-Hai luồng vẫn có thể cùng đọc `41` rồi cùng ghi `42`.
+Hai luồng hoàn toàn có thể cùng đọc số `41`, sau đó cùng cộng thêm 1, rồi hớn hở cùng lưu số `42` vào. Vậy là xong phim, mất một cập nhật!
 
 ### Chỉ đổi counter sang AtomicLong
 
@@ -128,9 +124,7 @@ Hai luồng vẫn có thể cùng đọc `41` rồi cùng ghi `42`.
 private final AtomicLong nextSequence = new AtomicLong(41);
 ```
 
-`incrementAndGet()` sửa lỗi của bộ đếm, nhưng `lastCustomerId` vẫn có thể bị
-request khác ghi đè. Một field an toàn cho nhiều luồng không tự bảo vệ quy tắc
-bao gồm nhiều field.
+Okay, thay bằng `AtomicLong` với hàm `incrementAndGet()` thì số đếm an toàn rồi đó. Nhưng bạn quên mất ông nội `lastCustomerId` à? Nó vẫn bị request khác ghi đè lên cái rẹt. Làm một biến an toàn không có nghĩa là toàn bộ quy trình đều an toàn đâu.
 
 ### Chỉ thêm @Transactional
 
@@ -141,5 +135,4 @@ public ReceiptDraft createDraft(String customerId) {
 }
 ```
 
-Spring transaction gắn với một luồng và database connection. Nó không buộc các
-lời gọi phương thức phải chạy lần lượt và không khóa field nằm trong Java heap.
+Đừng thần thánh hoá `@Transactional`! Nó chỉ tạo một ranh giới bảo vệ cho database connection, gắn liền với luồng hiện tại. Nó không hề có phép thuật nào để khoá lại cái biến nằm trên bộ nhớ RAM (Java heap) của bạn đâu nhé. Hai luồng vẫn sẽ dẫm chân lên nhau như thường.

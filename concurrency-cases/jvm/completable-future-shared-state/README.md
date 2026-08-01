@@ -2,30 +2,30 @@
 
 ## 1. Tóm tắt vấn đề (Overview)
 
-Kiến trúc hệ thống triển khai nhiều giai đoạn xử lý luồng (stage) hoàn tất độc lập trên các luồng tác vụ (thread) khác nhau, sau đó đồng loạt triệu gọi phương thức `add` vào chung một cấu trúc `ArrayList`. Trong kịch bản này, một giai đoạn có thể phát sinh ngoại lệ (fail) trong khi các luồng khác vẫn tiếp tục ngầm định thay đổi cấu trúc mảng (mutate), dẫn đến hậu quả phía gọi (caller) thu thập một mảnh dữ liệu dang dở (partial result).
+Chào bạn, để mình giải thích vấn đề này nhé. Khi hệ thống của chúng ta chạy nhiều luồng (thread) để xử lý dữ liệu cùng lúc, các luồng này lại cùng gọi hàm `add` để nhét kết quả vào chung một cái `ArrayList`. Rủi ro ở đây là gì? Nếu một luồng bị lỗi, các luồng khác vẫn cứ hồn nhiên nhét data vào mảng đó. Hậu quả là người gọi hàm (caller) sẽ nhận về một mớ data thiếu hụt, chắp vá.
 
-Quy tắc Bất biến (Business Invariant) yêu cầu nghiêm ngặt: 
-- Mỗi tín hiệu đầu vào phải thu về chính xác một kết quả đầu ra tương ứng;
-- Trạng thái chung cuộc "Thành công" (Final success) chỉ được phép phát hành (publish) sau khi 100% các giai đoạn hoàn thành viên mãn;
-- Trạng thái Lỗi/Hủy bỏ (Failure/Cancel) cấm tuyệt đối việc hoàn trả một danh sách mảnh vỡ có khả năng biến đổi (mutable partial list);
-- Cấu trúc kết quả đầu ra phải tuân thủ nghiêm ngặt trình tự đầu vào (input order) nếu đặc tả API có cam kết.
+Nguyên tắc nghiệp vụ của mình yêu cầu rất chặt chẽ:
+- Có input thì phải có output tương ứng.
+- Chỉ báo "Thành công" khi 100% các luồng đã xử lý xong xuôi.
+- Nếu có lỗi hay bị hủy, tuyệt đối không trả về cái mảng dở dang kia.
+- Dữ liệu trả về phải đúng thứ tự như lúc đưa vào (nếu API có hứa hẹn điều đó).
 
-> **Nguyên tắc kỹ thuật:** Đối tượng Future đóng vai trò như một khoang chứa trạng thái hoàn tất (completion container), KHÔNG phải là một cấu trúc Khóa đồng bộ (Lock) dành cho một đối tượng chia sẻ bị nhiều lệnh gọi (callback) thao túng.
+> **Nhớ nè:** Thằng `Future` sinh ra để chứa kết quả hoàn thành, chứ nó KHÔNG phải là cái khóa (lock) để bảo vệ dữ liệu dùng chung (shared object) khi bị nhiều hàm callback chọc vào đâu nhé!
 
 ## 2. Các Thuật ngữ Chuyên ngành (Terminology)
 
-| Thuật ngữ | Ý nghĩa trong ngữ cảnh |
+| Thuật ngữ | Ý nghĩa trong ngữ cảnh này |
 | --- | --- |
-| Giai đoạn hoàn tất (`completion stage`) | Phân đoạn mã nguồn được kích hoạt thi hành khi một khối future nội tại đi đến điểm kết thúc. |
-| Hợp nhất giá trị (`value composition`) | Kỹ thuật cấu trúc chuỗi giá trị trả về trực tiếp, thay vì ngầm thay đổi một trạng thái nằm ngoài luồng luân chuyển (pipeline). |
-| Rào cản hợp nhất (`allOf`) | Điểm kiểm soát đồng bộ chỉ vượt qua khi toàn bộ các future con (children) khép lại vòng đời. |
-| Kết thúc có ngoại lệ (`exceptional completion`) | Trạng thái vòng đời Future sụp đổ kèm theo một ngoại lệ hệ thống. |
-| Cô lập sở hữu (`confinement`) | Đặc quyền thay đổi cấu trúc tích lũy (accumulator) được giao phó cho duy nhất một luồng điều phối (coordinator). |
-| Khả kiến phân mảnh (`partial visibility`) | Lỗ hổng cho phép hệ thống Caller quan sát một trạng thái dữ liệu đang trong quá trình hình thành dở dang. |
+| Giai đoạn hoàn tất (`completion stage`) | Đoạn code sẽ chạy sau khi một `Future` làm xong việc của nó. |
+| Hợp nhất giá trị (`value composition`) | Gom các giá trị trả về lại với nhau thay vì đi sửa data của một biến nằm tít bên ngoài. |
+| Rào cản hợp nhất (`allOf`) | Cái chốt chặn bắt tất cả các `Future` con phải chạy xong thì mới được đi tiếp. |
+| Kết thúc có ngoại lệ (`exceptional completion`) | Khi `Future` tạch và quăng ra lỗi. |
+| Cô lập sở hữu (`confinement`) | Chỉ giao quyền sửa đổi kết quả cho đúng một luồng quản lý (coordinator) thôi. |
+| Khả kiến phân mảnh (`partial visibility`) | Lỗi do code để lộ ra trạng thái dữ liệu đang build dở dang cho bên ngoài thấy. |
 
 ## 3. Bối cảnh nghiệp vụ (Business Context)
 
-Hệ thống thiết kế một chu trình quạt rẽ nhánh (Fan-out profile) xử lý phân bổ làm giàu dữ liệu (Batch enrichment), bao hàm các truy vấn giá (Price) và định lường rủi ro (Risk). Tập hợp các Callback chia sẻ chung một cấu trúc List; điểm mấu chốt là rào cản `allOf`, luồng Callback báo lỗi và tín hiệu Hủy bỏ (Cancellation) phát sinh cạnh tranh trực diện trên chính khối tích lũy (accumulator) đó.
+Tưởng tượng hệ thống của mình phải tẻ nhánh ra (fan-out) để làm giàu dữ liệu, ví dụ như đi lấy giá (Price) và check rủi ro (Risk) cùng lúc. Khi làm xong, các callback lại chui vào dùng chung một cái List. Cái dở ở đây là cái rào `allOf`, luồng báo lỗi và luồng báo hủy lại tranh nhau nhảy vào thay đổi đúng cái List chứa kết quả đó. Rất dễ toang!
 
 ## 4. Điều hướng Tài liệu (Navigation)
 
@@ -38,13 +38,13 @@ Hệ thống thiết kế một chu trình quạt rẽ nhánh (Fan-out profile) 
 
 ## 5. Tác Động Tới Hệ Thống và Hướng Khắc Phục (Impact & Mitigation)
 
-**Hậu Quả:**
-- Thất thoát hoặc nhân bản kết quả xử lý.
-- Xáo trộn hoàn toàn trình tự (Order).
-- Phản hồi dữ liệu phân mảnh (Partial response) chứa rác.
-- Tác vụ nền (Background task) tiếp tục ngốn tài nguyên vô định sau khi hạn mức thời gian (Timeout) đã đóng.
+**Hậu quả nếu để kệ:**
+- Dữ liệu rớt mất hoặc bị duplicate.
+- Thứ tự lung tung beng hết cả lên.
+- Trả về cái đống data rác rưởi, chắp vá.
+- Task chạy ngầm cứ chạy quài tốn tài nguyên dù đã hết giờ (timeout).
 
-**Chiến Lược Khắc Phục:**
-1. Ràng buộc mỗi Future phải tự hoàn trả giá trị độc lập.
-2. Thiết lập sau rào cản `allOf`, một Điều phối viên (Coordinator) duy nhất đọc tuần tự hệ thống Future theo trình tự đầu vào gốc và kết xuất một cấu trúc danh sách Bất Biến (Immutable list).
-3. Đề ra quy chuẩn minh bạch, rõ ràng cho các chính sách Thời Hạn (Deadline), Hủy Bỏ (Cancel), và Xử lý Lỗi (Failure).
+**Cách mình fix:**
+1. Bắt mỗi `Future` phải tự trả về giá trị của riêng nó.
+2. Đặt một anh "Điều phối viên" (Coordinator) đứng chờ sau cái rào `allOf`. Anh này sẽ đọc lần lượt các `Future` theo thứ tự ban đầu và đóng gói thành một cái List không cho sửa (Immutable list).
+3. Đặt ra luật rõ ràng: bao lâu thì timeout, khi nào thì hủy (cancel), và lỗi thì xử lý ra sao.

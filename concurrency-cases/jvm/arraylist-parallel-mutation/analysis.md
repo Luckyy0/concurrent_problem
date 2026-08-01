@@ -2,119 +2,113 @@
 
 ## 1. Trạng Thái Khởi Điểm (Initial state)
 
-Cấu trúc Lô xử lý (Batch) bao gồm hai yêu cầu đầu vào được lập mục lục tuần tự:
+Giả sử hệ thống nhận được một lô xử lý (Batch) chứa hai yêu cầu đầu vào được đánh số thứ tự như sau:
 
 ```text
 Chỉ mục 0 → request-a
 Chỉ mục 1 → request-b
 ```
 
-Tập hợp `results` là cấu trúc `ArrayList` rỗng được phân bổ bộ nhớ khởi tạo ở mức 2 (capacity 2):
+Tập hợp `results` là một mảng `ArrayList` rỗng, được cấp phát sẵn bộ nhớ cho 2 phần tử (capacity = 2):
 
 ```text
 Kích thước logic (size) = 0
 Mảng vật lý (backing array) = [null, null]
 ```
 
-Tác vụ T1 xử lý kết quả A, tác vụ T2 xử lý kết quả B. Hai luồng thực thi đồng thời triệu gọi `results.add(...)` trong môi trường thiếu vắng cơ chế đồng bộ (synchronization).
+Luồng T1 chạy tác vụ xử lý cho yêu cầu A, luồng T2 xử lý yêu cầu B. Cả hai luồng cùng lúc gọi lệnh `results.add(...)` mà không có cơ chế đồng bộ (synchronization) nào.
 
-## 2. Kịch Bản Lỗi: Thất Thoát Phần Tử Do Mất Đồng Bộ (Lost Update)
+## 2. Kịch Bản Lỗi: Thất Thoát Dữ Liệu (Lost Update)
 
-Cấu trúc bên dưới trình bày logic vận hành nội tại của phương thức `add`: trích xuất biến `size` làm chỉ mục chèn (insertion index), ghi dữ liệu vào khe (slot), và cuối cùng tái cập nhật giá trị `size`. Chuỗi hành vi này không tuân thủ tính Nguyên Tử (Atomic).
+Bên dưới lớp vỏ của hàm `ArrayList.add` là ba bước thực hiện tách rời: lấy biến `size` làm vị trí chèn (insertion index), ghi giá trị vào vị trí đó trong mảng, và tăng giá trị `size` lên 1. Vì 3 bước này không được gói gọn thành một khối duy nhất không thể chia cắt (không có tính Nguyên Tử - Atomic), chúng dễ dàng bị các luồng cắt ngang.
 
-| Trình tự | Tác vụ T1 | Tác vụ T2 | Trạng thái Bộ nhớ Cục bộ |
+| Trình tự | Luồng T1 | Luồng T2 | Trạng thái Mảng Nội Bộ |
 | --- | --- | --- | --- |
-| 1 | Truy xuất `size = 0`, xác định chỉ mục 0 | | Toàn bộ mảng vật lý trống (`null`) |
-| 2 | Chuyển đổi ngữ cảnh (Context switch) | Truy xuất `size = 0`, xác định chỉ mục 0 | Xung đột hệ thống: Hai luồng nhận định chung chỉ mục 0 |
-| 3 | Cập nhật kết quả A vào khe 0 | | Mảng: `[A, null]` |
-| 4 | | Cập nhật kết quả B vào khe 0 | Mảng: `[B, null]` (A bị ghi đè) |
-| 5 | Tái cập nhật `size = 1` | Tái cập nhật `size = 1` | Kích thước mảng sai lệch so với logic (1 thay vì 2) |
-| 6 | `Future.get()` hoàn tất vòng đời | `Future.get()` hoàn tất vòng đời | Luồng điều phối tiếp nhận mảng thiếu khuyết (chỉ chứa 1 đối tượng) |
+| 1 | Đọc `size = 0`, chọn vị trí 0 | | Mảng đang rỗng: `[null, null]` |
+| 2 | Đổi luồng (Context switch) | Đọc `size = 0`, chọn vị trí 0 | Cả 2 luồng đều nghĩ vị trí tiếp theo là 0 |
+| 3 | Ghi kết quả A vào vị trí 0 | | Mảng thành: `[A, null]` |
+| 4 | | Ghi kết quả B vào vị trí 0 | Mảng thành: `[B, null]` (kết quả A đã bị ghi đè mất) |
+| 5 | Cập nhật `size = 1` | Cập nhật `size = 1` | Biến `size` là 1 thay vì 2 |
+| 6 | Kết thúc (`Future.get()` hoàn tất) | Kết thúc (`Future.get()` hoàn tất) | Luồng chính nhận mảng bị thiếu dữ liệu (chỉ có 1 kết quả) |
 
-Triển khai cấu trúc nội tại có thể biến thiên tùy phân bản JDK, tuy nhiên `ArrayList` chưa từng bảo chứng mức độ an toàn cho các thao tác thay đổi cấu trúc đa luồng. Việc lạm dụng tính năng dựa trên xác suất hoặc đặc tính hẹp của một phân bản là hành vi phản kỹ thuật.
+Tùy vào phiên bản Java (JDK) mà code bên dưới `ArrayList` có thể viết khác nhau đôi chút, nhưng tựu chung lại, `ArrayList` chưa bao giờ được thiết kế để chạy an toàn với đa luồng. Việc cầu may hay lợi dụng một phiên bản Java cụ thể nào đó để chạy mã này là phản kỹ thuật.
 
-Phương thức `Future.get()` đảm bảo thiết lập rào cản tầm nhìn (visibility barrier) lên các luồng độc lập, nhưng hành vi này diễn ra SAU khi các lỗi logic (ghi đè) đã khắc sâu vào bộ nhớ. Rào cản bộ nhớ không có năng lực truy hồi trạng thái đã bị hủy hoại.
+Mặc dù việc gọi `Future.get()` giúp đảm bảo luồng chính chờ các luồng phụ làm xong mới đi tiếp, nhưng thao tác ghi đè (ở bước 4) đã lỡ xảy ra rồi. Việc đồng bộ chờ kết thúc không thể khôi phục lại dữ liệu đã bị ghi đè.
 
-> **Nguyên tắc kỹ thuật:** Quy trình chờ kết thúc đa luồng chỉ đảm bảo tính toàn vẹn khả kiến của kết quả cuối cùng tại thời điểm chốt, nhưng không định hình tính Nguyên Tử (Atomicity) cho chuỗi hành động biến đổi dữ liệu đứt gãy bên trong.
+> **Nguyên tắc kỹ thuật:** Việc chờ luồng hoàn tất (`Future.get()`) chỉ đảm bảo luồng chính thấy được kết quả cuối cùng, chứ không giúp quá trình thêm dữ liệu `add()` bên trong trở nên an toàn (Atomic).
 
-## 3. Hiện Tượng Bất Ổn Snapshot Dữ Liệu
+## 3. Hiện Tượng Lỗi Khi Đọc Tiến Độ (Snapshot)
 
 | Trình tự | Luồng Ghi (T1) | Luồng Đọc Tiến Độ (T3) |
 | --- | --- | --- |
-| 1 | Khởi chạy `add(resultA)` | |
-| 2 | Can thiệp cấu trúc cấp thấp (Resize) | Yêu cầu kết xuất `List.copyOf(results)` |
-| 3 | Tái định hình Mảng vật lý hoặc biến kích thước | Kích hoạt chu trình duyệt qua tập tham chiếu |
-| 4 | Chốt trạng thái `add` | Phản hồi mảng đứt đoạn (Partial) hoặc Kích hoạt Exception |
+| 1 | Bắt đầu chạy `add(resultA)` | |
+| 2 | Mảng đang tự nới rộng (Resize) | Gọi lệnh copy mảng `List.copyOf(results)` |
+| 3 | Mảng cấp thấp hoặc biến size đang đổi | Bắt đầu vòng lặp duyệt qua mảng |
+| 4 | Hoàn thành lệnh `add` | Quăng lỗi `ConcurrentModificationException` hoặc trả về rác |
 
-Hành vi `ConcurrentModificationException` đóng vai trò phản hồi đứt gãy nhanh (Fail-fast signal). Trình duyệt mảng (Iterator) không chịu trách nhiệm giăng bắt mọi xung đột dữ liệu. Ngay cả khi không phát sinh Ngoại lệ, cấu trúc mảng Snapshot cũng không đủ điều kiện đảm bảo Tính Nhất Quán (Consistency).
+Lỗi `ConcurrentModificationException` đóng vai trò là một cái bẫy phát hiện sớm (Fail-fast). Iterator của Java cố gắng ném lỗi này khi phát hiện mảng bị thay đổi giữa chừng. Tuy nhiên, nó chỉ làm theo kiểu "cố gắng hết sức" (best-effort) chứ không đảm bảo 100% bắt được lỗi. Dù nó không quăng lỗi đi nữa, mảng được copy ra cũng có nguy cơ chứa toàn dữ liệu rác (null hoặc thiếu phần tử).
 
 ## 4. Đối Chiếu Kết Quả (Expected vs Actual)
 
-| Tiêu Chí | Kế Hoạch Đề Ra | Biểu Hiện Thiết Kế Lỗi |
+| Tiêu Chí | Kế Hoạch Đề Ra | Biểu Hiện Thực Tế Lỗi |
 | --- | --- | --- |
-| Quy Mô (Cardinality) | Khớp số lượng tác vụ hoàn tất | Nguy cơ thiếu hụt (Lost Update) |
-| Định Danh (Identity) | Mỗi `requestId` tồn tại độc lập duy nhất | Rủi ro biến mất định danh; Retry gây nhân bản |
-| Toàn Vẹn (Null safety) | Kết quả cuối không chứa `null` | Mảng vật lý có nguy cơ chưa chốt tham chiếu |
-| Thứ Tự (Ordering) | Tuân thủ thứ tự truy xuất đầu vào | Bị thay đổi ngẫu nhiên theo thời điểm tác vụ hoàn tất |
-| Tiến Độ (Progress) | Snapshot có cơ chế an toàn | Tiến trình đọc gây nhiễu luồng cập nhật hiện thời |
-| Lỗi Cục Bộ (Failure) | Cấm phát tán tập kết quả chưa hoàn thiện | Dữ liệu ngầm định bị sửa đổi bất chấp Lô xử lý đã hết hạn (Timeout) |
+| Quy Mô (Số lượng) | Bằng đúng số lượng tác vụ hoàn tất | Ít hơn do luồng ghi đè lên nhau (Lost Update) |
+| Định Danh (Tính duy nhất)| Mỗi `requestId` chỉ có 1 kết quả duy nhất | Kết quả bị đè mất; nếu gọi chạy lại (Retry) sẽ sinh ra tác dụng phụ |
+| Toàn Vẹn (Null safety) | Kết quả không chứa giá trị `null` | Mảng cấp thấp có thể để hở các khoảng `null` chưa kịp ghi |
+| Thứ Tự (Ordering) | Giữ đúng thứ tự như lúc đưa vào | Trả về lộn xộn theo thứ tự hoàn thành của các luồng |
+| Tiến Độ (Progress) | Có thể copy mảng an toàn để xem | Khiến ứng dụng văng lỗi khi đang duyệt mảng |
+| Lỗi Cục Bộ (Failure) | Không được trả về kết quả nửa vời | Trả về mảng bị thiếu hụt ngay cả khi Lô xử lý đã bị quá hạn (Timeout) |
 
-## 5. Phân Tích Lớp Trách Nhiệm Gây Lỗi (Root Cause Mapping)
+## 5. Phân Tích Cội Nguồn Vấn Đề (Root Cause Mapping)
 
-### Lớp Cấu Trúc ArrayList
-Cấu trúc `ArrayList` tối ưu kiến trúc bộ nhớ cho chuỗi truy xuất tuần tự, loại trừ kiểm soát tương tranh. Mối liên kết giữa sức chứa (Capacity), Mảng Vật Lý (Backing array), Chỉ số đếm (`size`) và Bộ theo dõi (Modification count) là một khối liền mạch. Thiết lập Khóa cục bộ (Lock) lên một phần tử không tạo nên tính toàn vẹn hệ thống.
+### Tại Cấu Trúc ArrayList
+`ArrayList` được thiết kế để tối ưu tốc độ đọc/ghi cho 1 luồng duy nhất, hoàn toàn không có cơ chế kiểm soát đa luồng. Biến lưu kích thước mảng (`size`), mảng chứa dữ liệu (Backing array) và biến đếm số lần sửa mảng (`modCount`) là những thứ đi liền với nhau. Nếu chỉ dùng một cái Khóa (Lock) sơ sài bọc bên ngoài một vài chỗ cũng không đảm bảo an toàn cho cả hệ thống.
 
-### Lớp Cấu Trúc Bộ Nhớ Java (Java Memory Model)
-Các luồng thao tác Read/Write vô định hình sinh ra hiện tượng Rượt đuổi dữ liệu (Data race). Biến tham chiếu tĩnh (`final`) chỉ giữ cố định đối tượng. Khóa cập nhật (`volatile`) chỉ bảo vệ liên kết vùng nhớ, không áp đặt quy chế độc quyền (Mutual exclusion) trên các phương thức nội tại của `ArrayList`. Đọc thêm về **[Kiến Trúc Java Memory Model](../../concepts/java-memory-model-and-atomicity.md)**.
+### Tại Mô Hình Bộ Nhớ Java (Java Memory Model)
+Khi nhiều luồng cùng đọc và ghi vào một vùng nhớ mà không xếp hàng, chúng tạo ra hiện tượng chạy đua (Data race). 
+Khai báo biến bằng `final` chỉ giúp biến không trỏ sang một danh sách khác. Dùng `volatile` chỉ giúp dữ liệu đồng bộ xuống bộ nhớ chính. Cả hai không hề cung cấp cái Khóa (Mutual exclusion) để bảo vệ hàm `add` của `ArrayList`. Đọc thêm về **[Kiến Trúc Java Memory Model](../../concepts/java-memory-model-and-atomicity.md)**.
 
-### Lớp Điều Phối Spring & Executor
-Mặc dù Singleton `BrokenBatchQuoteService` được thiết lập làm Cổng tiếp nhận (Gateway), khối danh sách `ArrayList` nội tại bị phát tán ranh giới kiểm soát vào các vùng Thread-pool Executor. Quy mô Bean và Vòng đời Executor không thiết lập chủ quyền quản trị lên các đối tượng truy xuất qua Lambda.
+### Tại Cách Dùng Luồng (Spring & Executor)
+Mặc dù service `BrokenBatchQuoteService` là một biến duy nhất (Singleton), nhưng nó lại vứt các tác vụ vào một Thread-pool bên ngoài xử lý. Framework Spring không tự động bao bọc và bảo vệ các đoạn mã Lambda được ném vào Executor.
 
-### Sự Đánh Tráo Giữa Cấu Trúc An Toàn Và Đặc Tả Nghiệp Vụ
-Kể cả khi xử lý chặn toàn bộ luồng `add`, thứ tự kết quả vẫn tuân thủ cơ chế Hoàn tất (Completion order). Nếu hệ thống quy định đặc tả Duy Trì Thứ Tự Đầu Vào, bắt buộc phải bảo lưu cơ chế Đánh Chỉ Số (Index) hoặc gom cụm theo Trình Tự Khởi Tạo. Tính năng An Toàn Luồng (Thread safety) và Tính Tuần Tự (Ordering) là hai khía cạnh độc lập.
+### Lẫn Lộn Giữa "An Toàn Luồng" và "Đúng Thứ Tự"
+Cho dù bạn có dùng Lock để các luồng phải xếp hàng khi gọi hàm `add()`, thì thứ tự kết quả trong mảng vẫn bị lộn xộn (ai chạy xong trước thì được ghi vào mảng trước). Nếu nghiệp vụ bắt buộc "Thứ tự ra phải giống thứ tự vào", bạn bắt buộc phải dùng mảng định sẵn vị trí (Index) hoặc chờ xong xuôi hết rồi mới gom lại. Tính an toàn đa luồng (Thread safety) và việc giữ nguyên thứ tự (Ordering) là hai chuyện hoàn toàn khác nhau.
 
-### Tính Cách Ly Giao Dịch
-Quá trình phân giải không có sự hiện diện của Cơ sở dữ liệu (Transaction, MVCC). Cơ chế `@Transactional` không có thẩm quyền khôi phục khối tài nguyên List biến thiên trên bộ nhớ RAM. Đối với các tương tác qua mạng (Remote Quote Call), yêu cầu phải có chính sách chống lặp (Idempotency) để khử độc tính nhân bản từ hệ thống gốc.
+## 6. Chiến Lược Tối Ưu
 
-## 6. Phạm Vi Áp Dụng Điểm Tối Ưu
+Mô hình "Tác vụ tự trả kết quả - Luồng chính đi thu gom":
 
-Mô hình kiến trúc "Tác Vụ Phản Hồi - Điều Phối Tổng Hợp":
+1. Luồng điều phối (Coordinator) ném các tác vụ vào Executor và nhận lại một danh sách các `Future`, danh sách này giữ đúng thứ tự ban đầu.
+2. Tác vụ (Worker) tự nó tính toán và trả về một cái `QuoteResult` độc lập, tuyệt đối không đụng chạm vào một mảng chung nào cả.
+3. Luồng điều phối sẽ chờ tất cả các `Future` chạy xong (có quản lý timeout).
+4. Sau khi các `Future` đã xong, chính tay luồng điều phối sẽ tuần tự đọc kết quả và thêm (append) vào mảng `ArrayList`. Lúc này mảng chỉ bị một luồng tác động nên hoàn toàn an toàn.
+5. Danh sách `List.copyOf(results)` cuối cùng mới là kết quả chuẩn xác.
 
-1. Bộ điều phối (Coordinator) phân bổ danh sách `Future` theo trật tự gốc.
-2. Tác vụ (Worker) độc lập thiết lập `QuoteResult`, loại bỏ sự can thiệp tập hợp kết quả.
-3. Bộ điều phối đánh giá hạn mức thời gian, giám sát từng thành phần `Future`.
-4. Luồng điều phối duy nhất tiếp nhận trách nhiệm chèn (append) dữ liệu.
-5. Snapshot `List.copyOf(results)` công bố danh mục báo giá hợp pháp cuối cùng.
+Phương pháp này gọi là **Giới hạn quyền sở hữu trong luồng (Thread confinement)**. Nhờ đó, ta chẳng cần phải xài đến mảng đa luồng (Concurrent collection) phức tạp nào cả.
 
-Cấu trúc bộ nhớ chia sẻ được đưa vào tình trạng **Cô Lập Sở Hữu (Thread confinement)**. Triệt tiêu hoàn toàn sự cần thiết của Cấu trúc Đa Luồng (Concurrent list).
+## 7. Xử Lý Các Trường Hợp Lỗi, Bỏ Lỡ Và Dữ Liệu Bị Cắt Khúc
 
-## 7. Xử Lý Phân Loại Ngoại Lệ, Bỏ Lỡ Và Dữ Liệu Phân Mảnh
+Khi làm API xử lý theo lô (Batch API), cần thống nhất quy tắc thật rõ ràng:
 
-Đặc tả Lô xử lý (Batch API) yêu cầu quyết định cấu trúc nghiêm ngặt:
+- **Luật Tất-cả-hoặc-không-có-gì (All-or-nothing):** Dừng toàn bộ lô ngay nếu có bất kỳ tác vụ nào bị lỗi hoặc quá hạn. Tuyệt đối không trả về một mảng chứa kết quả lở dở (Partial result).
+- **Luật Trả lẻ từng cái (Per-item outcome):** Vẫn trả về đúng số lượng kết quả như lúc đầu vào, tác vụ nào lỗi thì đánh dấu trạng thái riêng của nó là lỗi (Success/Failure). 
+- **Báo cáo luồng (Streaming progress):** Nếu cần báo tiến độ liên tục, hãy dùng các kênh Stream/Websocket thay vì cố gắng copy lại một danh sách cuối cùng.
 
-- **Nguyên lý Tuyệt đối (All-or-nothing):** Đình chỉ toàn bộ lô khi một tác vụ thất bại/quá hạn. Chặn đứng hành vi trả về tệp dữ liệu rác (Partial result).
-- **Nguyên lý Định Tuyến Cục Bộ (Per-item outcome):** Trả về đặc tả đa hình (Success/Failure) trên từng kết quả đơn lẻ. Giữ nguyên Quy mô đầu ra.
-- **Tiến trình Dòng Chảy (Streaming progress):** Phát tán tín hiệu tức thời qua kênh giao tiếp (Concurrent channel). Bác bỏ tư cách của một Tập hợp chung cuộc.
+Lưu ý: Gọi `Future.cancel(true)` chỉ là hình thức báo hiệu ngừng (Interrupt). Bên trong tác vụ (khi gọi API ngoài), bạn phải tự thiết lập thời gian hết hạn mạng (Read/Connect timeout) rõ ràng. Tránh tình trạng ứng dụng trả về lỗi nhưng tác vụ vẫn ngầm chạy và ăn tốn bộ nhớ.
 
-Khởi chạy `Future.cancel(true)` chỉ kiến tạo tín hiệu ngắt (Interrupt). Tiến trình xử lý (Remote call) phải tự thiết lập cơ chế giới hạn băng thông mạng (Read/Connect timeout). Không hoàn trả kết quả ảo trong khi các luồng ngầm định vẫn tiêu thụ bộ nhớ. Hạn mức thời gian (Deadline) phải quy định cho Tổng Thể Lô.
+## 8. Khái Niệm Xử Lý Đa Máy Chủ (Multi-instance Fallacy)
 
-## 8. Ứng Dụng Trên Kiến Trúc Phân Tán (Multi-instance Fallacy)
+Phân tích trên tập trung vào một máy chủ (Node). Nhưng nếu khách hàng muốn xem tiến độ qua Load Balancer và request rớt trúng một máy chủ khác, thì biến `ConcurrentHashMap` lưu tiến độ ở máy chủ hiện tại sẽ trở nên vô dụng. Lúc đó, bạn buộc phải dùng Redis hoặc Database để lưu trạng thái lô xử lý.
 
-Một tiến trình xử lý thông thường tập trung trên một Nút mạng (Node), điều này biện minh cho quyền sở hữu cục bộ. Tuy nhiên, nếu khách hàng yêu cầu dò xét Tiến độ từ hệ thống Cân bằng tải (Load Balancer) sang các Nút khác, cấu trúc `ConcurrentHashMap` hoàn toàn mất tác dụng. Bắt buộc triển khai Định tuyến Cố định (Sticky routing) hoặc Cơ sở lưu trữ ngoài (External Key-Value Store).
+## 9. Tổng Kết Hậu Quả
 
-## 9. Phân Tích Lớp Trách Nhiệm Gây Lỗi (Root Cause Mapping)
+### Hậu Quả Kỹ Thuật
+- Kích thước tập kết quả không khớp, thứ tự lộn xộn.
+- Thỉnh thoảng văng lỗi khó hiểu khi gọi API xem tiến độ.
+- Ăn mòn bộ nhớ và quá tải luồng (Executor) nếu các tác vụ treo mà không có Timeout rõ ràng.
+- Log hệ thống không có lỗi nhưng dữ liệu trả về bị thiếu hụt.
 
-### Hệ Quả Kỹ Thuật
-- Kích thước tập kết quả mất cân xứng, trật tự hệ thống sụp đổ.
-- Lỗi kích hoạt rải rác trên Snapshot giám sát.
-- Tài nguyên hệ thống (Executor) chịu áp lực nặng nề nếu loại bỏ ranh giới thời gian.
-- Sai lệch phân tích Log hệ thống vì trạng thái nội tại che đậy xung đột.
-
-### Hệ Quả Nghiệp Vụ
-- Tiến trình kiểm toán xác định Lô hoàn thành nhưng Khách hàng từ chối do thiếu hụt thông tin báo giá.
-- Tổ chức phân phát dữ liệu cấu trúc chéo gây thiệt hại về định tuyến nghiệp vụ.
-- Đối chiếu số liệu đối tác (Reconciliation) bất khả thi do hệ thống thiếu bằng chứng ngoại lệ rõ ràng.
-
-## 10. Giới Hạn Áp Dụng (Out of Scope)
-
-Tài liệu loại trừ cấu trúc đồ thị luồng xử lý (Graph composition) qua nền tảng `CompletableFuture` (Phân định riêng tại module `JVM-009`). Đồng thời, không bao quát các nghiệp vụ truy vấn cơ sở dữ liệu hay bộ trừ trùng (Deduplication) liên Server.
+### Hậu Quả Nghiệp Vụ
+- Khách hàng không chấp nhận lô dữ liệu bị hụt thông tin báo giá.
+- Hệ thống gửi thiếu dữ liệu cho các hệ thống đối tác.
+- Việc đối soát (Reconciliation) trở nên bất khả thi vì ứng dụng không hề ghi nhận là đã xảy ra lỗi.

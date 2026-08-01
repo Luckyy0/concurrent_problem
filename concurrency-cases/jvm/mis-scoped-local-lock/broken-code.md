@@ -2,7 +2,7 @@
 
 ## 1. Khởi Tạo ReentrantLock Mới Trong Mỗi Lần Triệu Gọi
 
-Quan sát đoạn mã dưới đây, cấu trúc xử lý Khóa hoàn toàn đúng về mặt cú pháp nhưng sai lệch toàn bộ về Bản Chất Đồng Bộ:
+Anh em nhìn đoạn code dưới đây, cú pháp thì chuẩn không cần chỉnh nhưng bản chất thì sai bét nhè. Mỗi lần gọi hàm lại đẻ ra một cái khóa mới tinh:
 
 ```java
 package com.example.settlement;
@@ -60,7 +60,7 @@ public class BrokenSettlementArtifactService {
 }
 ```
 
-Kiến trúc `try/finally` và Quản trị Ngắt (Interrupt) không có điểm mù, nhưng Định danh Khóa (Lock identity) bị xé nát. Từng cuộc gọi sinh ra một `ReentrantLock` tách biệt. Lẽ dĩ nhiên, 100% các Luồng đều qua cửa mà không gặp bất kỳ kháng cự nào. Khái niệm Vùng Tới Hạn (Critical section) ở đây chỉ là Lý Thuyết Suông.
+Cấu trúc `try/finally` và bắt lỗi `Interrupt` rất xịn, nhưng ổ khóa thì toang. Mỗi luồng tạo một cái `ReentrantLock` riêng biệt nên chả ai tranh giành với ai, luồng nào cũng chạy tuốt luốt qua cổng. "Vùng tới hạn" ở đây chỉ là trò đùa!
 
 ## 2. Từ Khóa `synchronized` Định Vị Sai Mục Tiêu Khóa
 
@@ -73,11 +73,10 @@ public ArtifactResult generate(String artifactKey) {
 }
 ```
 
-Hai Yêu Cầu Độc lập hoàn toàn có thể mang tới hai đối tượng `String` hoàn toàn khác nhau về Tham chiếu dẫu sở hữu Nội Dung Đỉnh Khớp. Khai báo `new String("settlement/day-1")` và một Giá trị String tái tạo (deserialized) từ HTTP có đặc quyền Trùng Lặp Bằng Giá Trị (`equals() == true`), Nhưng Bản thể Monitor là Hai Cá Thể Độc Lập.
+Nhiều người nghĩ truyền `artifactKey` vào là xong. Nhưng đời không như mơ, hai request dù truyền vào chuỗi "settlement/day-1" giống y hệt nhau, nhưng trong bộ nhớ chúng là **hai object String khác nhau**. Thế là mỗi luồng lại ôm một cái ổ khóa riêng, chạy song song bình thường.
+Đừng bao giờ xài `artifactKey.intern()` để ép chúng thành một nhé, làm thế rác bộ nhớ lắm và dễ dính chưởng xung đột khóa toàn hệ thống.
 
-Sử dụng `artifactKey.intern()` để Ép Buộc Đồng Nhất Định Danh là một thảm họa, Gây Ô Nhiễm Không Gian Bộ Nhớ Chuỗi Toàn Cục (Global string-pool), Giam Giữ Rác Nhớ, Và Xung Đột Khóa Với Mọi Cấu Trúc Độc Lập Trong Máy Ảo. CẤM sử dụng Đối Tượng do Caller khởi tạo làm Monitor Trấn Phái.
-
-> **Nguyên tắc kỹ thuật:** Khối `synchronized` niêm phong dựa trên Con Trỏ Tham Chiếu (Reference Identity), Không Chấp Nhận So Sánh Giá Trị Chuỗi dưới mọi hình thức.
+> **Nguyên tắc kỹ thuật:** Lệnh `synchronized` hoạt động dựa trên địa chỉ bộ nhớ (Reference), chứ nó không thèm quan tâm hai chuỗi có giá trị giống nhau (kiểu `equals`) hay không đâu.
 
 ## 3. Khóa Cục Bộ `this` Trên Một Dịch Vụ Không Phải Là Singleton Độc Tôn
 
@@ -87,8 +86,8 @@ public synchronized ArtifactResult generate(String artifactKey) {
 }
 ```
 
-Chiến lược này chỉ thành công nếu mọi Tác nhân Tôn sùng Một Bản thể Dịch Vụ Duy Nhất. Nó sẽ vỡ nát khi Bất kỳ đoạn mã nào tự triệu hồi lệnh `new`, Cấu hình Bean dưới dạng Prototype, Trùng lắp Đa Ngữ cảnh Spring (Application context), Hoặc Khối Test vô tình thả xích Hai Cá Thể.
-Bất cập hơn: Ngay cả khi Độc Tôn Bản Thể (Chuẩn Spring Singleton), Khóa `this` tự động Cầm Chân (Serialize) MỌI Mã Artifact. Hai Khóa Không Liên Quan cũng phải xếp hàng chờ đợi nhau.
+Viết thế này chỉ ngon khi Class của bạn là Singleton (có đúng 1 bản duy nhất). Nếu ai đó lỡ tay `new` ra một object mới, hoặc config Spring kiểu Prototype, thì cái khóa này vứt đi. 
+Thêm nữa, khóa kiểu này thì **tất cả** các request (dù là file khác nhau) đều phải xếp hàng chờ nhau. Vừa chậm vừa bất tiện.
 
 ## 4. Ranh Giới Vùng Tới Hạn Quá Hẹp (Narrow Critical Section)
 
@@ -106,7 +105,8 @@ content = renderer.render(artifactKey);
 artifactStore.put(artifactKey, content);
 ```
 
-Chiếc Khóa chỉ bảo vệ Lệnh Hỏi Mật Khẩu (Check). T1 và T2 tuần tự chứng kiến "Chưa có", Và cùng lúc Nhào Nặn Dữ Liệu rồi Thi Nhau Đẩy Lên Máy Chủ ngay sau khi Buông Khóa. 100% Cụm Hành Vi (Compound action) buộc phải bị nhốt Trong Một Vành Đai Phán Xử, Hoặc Việc Đụng Độ phải được Giao Phó Cho Kho Lưu Trữ Uy Quyền (Authoritative store).
+Anh em khóa ngắn quá! Khóa xong lúc hỏi "có file chưa?", luồng 1 và 2 đều thấy "chưa", thế là nhả khóa ra. Kết quả: cả hai anh cùng thi nhau tạo file và ghi đè lộn xộn lên Store. 
+Khóa là phải khóa trọn vẹn cụm hành động "Check -> Làm -> Lưu".
 
 ## 5. Bản Đồ Khóa Cục Bộ Bị Tháo Gỡ Quá Sớm
 
@@ -123,25 +123,30 @@ try {
 }
 ```
 
-Dòng Chảy Tai Họa: T1 Đang Giữ Khóa. T2 Móc Lấy Tham Chiếu Khóa Từ Map Và Xếp Hàng Khóa. T1 Xong Việc, Buông Khóa Rồi Tàn Nhẫn Xóa Trắng Map. T3 Châm Ngòi Lệnh Khởi Tạo Sinh Ra Ổ Khóa Mới Toanh Và Đi Vào Khóa. Hậu Quả: T2 Bám Khóa Cũ, T3 Cầm Khóa Mới. Cả Hai Đồng Thời Đi Vào Vùng Tới Hạn. Hành vi Xóa cần Giao Thức Quản Trị Đếm Tham Chiếu (Reference counting) Đàng Hoàng.
+Chuyện kinh dị như sau:
+1. Luồng 1 đang giữ khóa.
+2. Luồng 2 tới, lấy khóa từ Map và đứng chờ.
+3. Luồng 1 xong việc, mở khóa rồi... xóa cmn khóa khỏi Map.
+4. Luồng 3 lao tới, gọi Map thì thấy trống trơn nên đẻ ra một cái khóa MỚI TINH.
+Hậu quả: Luồng 2 cầm khóa cũ, Luồng 3 cầm khóa mới. Cả hai cùng chạy vào vùng tới hạn. Rất nguy hiểm! Nếu muốn xóa khóa thì phải quản lý số lượng luồng đang đợi (Reference counting) đàng hoàng.
 
 ## 6. Khóa Nội Bộ Đứng Trước Mạng Lưới Đa Nút
 
-Máy A và Máy B Sở Hữu Hai Phân Vùng Heap Biệt Lập:
+Giả sử bạn có 2 server A và B:
 
 ```text
 node A → locks[stripe] = Lock-A
 node B → locks[stripe] = Lock-B
 ```
 
-Cùng Khóa vẫn triệu tập Hai Ổ Khóa Bất Đồng. Đừng Ảo Tưởng Khóa Nội Bộ có Thẩm Quyền Phán Quyết Tính Độc Nhất Toàn Cầu trên Cấu trúc Lưu Trữ Phân Tán (Shared Object Store).
+Bọn nó có chung một mã `artifactKey`, nhưng Server A xài khóa của A, Server B xài khóa của B. Đừng ảo tưởng rằng khóa trên một máy (local lock) có thể làm cảnh sát giao thông cho tất cả các máy khác khi ghi lên một cái Storage chung. Không bao giờ!
 
 ## 7. Các Phương Án Sửa Lỗi Tạm Bợ Cần Tránh (Insufficient Fixes)
 
-- Đổi `synchronized` sang `ReentrantLock` nhưng vẫn Mù Quáng tạo trong Nội Hàm.
-- Gắn Mác Khóa Lên Tham Số Cấu Trúc Yêu Cầu (DTO/Key Object) Của Caller.
-- Biến Khóa Thành Khối Tĩnh (Static) để Hô Hào Hỗ Trợ Cụm (Cluster); Static cũng chỉ Tĩnh Nội Bộ JVM.
-- Chỉ Khóa Vòng `exists()` Rồi Buông Tay Mở Lối `render/put`.
-- Tôn Vinh `ConcurrentHashMap` Làm Sổ Đăng Ký Nhưng Trảm Dữ Liệu Sai Vòng Đời.
-- Chắp Vá Bằng `@Transactional`; Nó Hoàn Toàn Bất Lực Trước JVM Memory Barrier và Kho Đối Tượng (Object store).
-- Viện Trợ Cờ Công Bằng (Fair Lock) Chống Lặp; Nó Tuyệt Đối Không Thể Nắn Lại Định Danh Khóa Bị Sai.
+- Đổi `synchronized` sang `ReentrantLock` nhưng vẫn tạo mới trong hàm. (Vô dụng)
+- Khóa luôn cái DTO (data object) được truyền từ ngoài vào. (Nguy hiểm)
+- Đổi khóa thành biến tĩnh `static` nghĩ là khóa được nhiều server. (Static thì cũng chỉ nằm trên 1 máy thôi nha).
+- Khóa mỗi cái vòng `exists()` rồi thả cửa cho hàm `render/put`. (Lỗi cày đè như ở phần 4).
+- Tôn sùng `ConcurrentHashMap` nhưng lại xóa khóa bậy bạ.
+- Xài annotation `@Transactional`. Cái này chả có tác dụng gì với vòng khóa của JVM và Object store đâu.
+- Xài khóa công bằng (Fair Lock). Nó chỉ chống "kẹt hàng" chứ không sửa được lỗi sai ổ khóa.

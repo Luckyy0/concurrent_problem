@@ -2,6 +2,8 @@
 
 ## Trạng thái ban đầu
 
+Giả sử hệ thống đang như thế này:
+
 ```text
 limit = 10
 active = 9
@@ -9,178 +11,138 @@ pending = 0
 used = active + pending = 9
 ```
 
-Hai request T1 và T2 đồng thời muốn giữ một slot để tạo connection. Cả hai gọi
-`tryReserveCreation()` trên cùng một Spring singleton.
+Lúc này, hai request T1 và T2 cùng lúc muốn chen chân giành lấy một kết nối. Cả hai cùng gọi hàm `tryReserveCreation()` trên cái Spring singleton đó.
 
-## Interleaving thứ nhất: kiểm tra rồi increment
+## Interleaving thứ nhất: kiểm tra rồi increment (check-then-increment)
 
-| Bước | T1 | T2 | State |
+| Bước | T1 (Thread 1) | T2 (Thread 2) | Tình hình hệ thống (State) |
 | --- | --- | --- | --- |
-| 1 | đọc `active = 9` | | `active=9, pending=0` |
-| 2 | đọc `pending = 0`, tổng 9 nên vượt qua (pass) | | chưa reserve |
-| 3 | tạm dừng | đọc `active = 9` và `pending = 0`, pass | cả hai cùng tin còn slot |
-| 4 | `pending.incrementAndGet()` → 1 | | tổng 10 |
-| 5 | | `pending.incrementAndGet()` → 2 | tổng 11, vượt limit |
-| 6 | trả về `true` | trả về `true` | hai creation cùng bắt đầu |
+| 1 | Thấy `active = 9` | | `active=9, pending=0` |
+| 2 | Thấy `pending = 0`, cộng lại là 9 nên nghĩ là okay (pass) | | Vẫn chưa chốt đơn (reserve) |
+| 3 | (Khựng lại chút) | Đọc thấy `active = 9` và `pending = 0`, cũng thấy okay | Cả hai thanh niên đều tin là còn dư slot |
+| 4 | Gọi `pending.incrementAndGet()` → 1 | | Tổng lên 10 |
+| 5 | | Gọi `pending.incrementAndGet()` → 2 | Bùm! Tổng 11, vượt quá limit |
+| 6 | Trả về `true` | Trả về `true` | Cả hai cùng nhào vô tạo kết nối |
 
-Mỗi `get` và `incrementAndGet` đều có atomic/visibility guarantee của riêng nó.
-Lỗi nằm ở operation nghiệp vụ gồm việc kiểm tra (check) tổng rồi mới giữ chỗ (reserve).
+Mọi hàm `get` và `incrementAndGet` thì bản thân chúng làm rất tốt nhiệm vụ nguyên tử (atomic). Nhưng cái lỗi "chí mạng" là hành động nghiệp vụ bao gồm: kiểm tra xem còn chỗ không (check), rồi mới giành chỗ (reserve).
 
-> **Nói ngắn gọn:** hai thread không tranh chấp bên trong một lần increment;
-> chúng tranh chấp quyền quyết định rằng “slot cuối cùng vẫn còn trống”.
+> **Nói ngắn gọn:** Hai thread này không đánh nhau ở bước cộng biến đếm; tụi nó đánh nhau ở cái quyền quyết định rằng "chỗ cuối cùng này là của tui".
 
-## Interleaving thứ hai: capacity gap trong transition
+## Interleaving thứ hai: Khe hở dung lượng ảo (capacity gap)
 
-State ban đầu đã đầy:
+Giờ tình huống là nhà đã đầy:
 
 ```text
 active = 9, pending = 1, used = 10
 ```
 
-T1 hoàn tất handshake và chuyển một connection từ pending sang active. Đoạn code lỗi (broken
-code) decrement counter này rồi increment counter kia:
+T1 bắt tay (handshake) thành công và tiến hành chuyển kết nối từ `pending` sang `active`. Code bị lỗi của chúng ta sẽ làm chuyện này bằng cách giảm biến này rồi mới tăng biến kia:
 
-| Bước | Completion T1 | New request T2 | State |
+| Bước | T1 (Đang hoàn tất) | T2 (Request mới) | Tình hình hệ thống |
 | --- | --- | --- | --- |
-| 1 | `pending.decrementAndGet()` → 0 | | `active=9, pending=0`, xuất hiện gap giả |
-| 2 | tạm dừng | đọc tổng 9, reserve pending → 1 | `active=9, pending=1` |
-| 3 | `active.incrementAndGet()` → 10 | | `active=10, pending=1` |
-| 4 | hoàn tất | được chấp nhận | tổng 11 |
+| 1 | `pending.decrementAndGet()` → 0 | | `active=9, pending=0` (Ối dồi ôi, tự nhiên dư ra 1 chỗ ảo!) |
+| 2 | (Khựng lại chút) | Đọc thấy tổng là 9, nhào vô giành slot: pending → 1 | `active=9, pending=1` |
+| 3 | T1 tỉnh dậy gọi `active.incrementAndGet()` → 10 | | `active=10, pending=1` |
+| 4 | T1 hoàn thành chốt sổ | T2 cũng hớn hở vào nhà | Chúc mừng, tổng là 11 |
 
-Về nghiệp vụ, pending connection chỉ đổi trạng thái; nó không trả lại permit rồi lấy
-permit mới. Hai quá trình cập nhật counter tách rời đã làm lộ một state không tồn tại trong
-mô hình logic.
+Xét về logic nghiệp vụ, cái kết nối đang pending kia nó chỉ "biến hình" sang active thôi. Nó không có vụ trả vé rồi xin lấy vé mới. Do thao tác cập nhật của bạn bị gãy làm đôi, một trạng thái "ảo tung chảo" chưa từng tồn tại đã lòi ra cho thiên hạ thấy.
 
 ## Kết quả mong đợi và kết quả thực tế
 
-| Khía cạnh | Mong đợi | Mã triển khai lỗi (Broken implementation) |
+| Điểm cần xét | Lẽ ra phải thế này (Mong đợi) | Code bị lỗi nó lại thế này |
 | --- | --- | --- |
-| Capacity | `active + pending <= limit` ở mọi thời điểm | Tổng có thể vượt limit |
-| Reservation | Chỉ một tác nhân (actor) thắng slot cuối | Nhiều actor cùng trả về `true` |
-| Transition | Pending sang active bảo toàn tổng | Lộ gap giả giữa decrement và increment |
-| Snapshot | Health view là một state nhất quán | Hai `get()` có thể thuộc hai thời điểm khác nhau |
-| Release | Một vòng đời (lifecycle) trả đúng một slot | Callback lặp có thể làm counter âm hoặc tạo capacity giả |
-| Failure | Quá trình tạo thất bại trả lại pending slot đã sở hữu | Aggregate counter không xác nhận định danh (identity) của reservation |
+| Sức chứa (Capacity) | `active + pending <= limit` mọi lúc mọi nơi | Tổng lâu lâu lại vượt limit |
+| Giành slot (Reservation)| Slot cuối chỉ một người được ăn | Cả đám xúm vào và cùng tưởng mình đã có slot (`true`) |
+| Chuyển trạng thái | Pending hóa active thì tổng số vé vẫn vậy | Lòi ra khe hở dung lượng ảo do giảm xong mới tăng |
+| Xem nhanh (Snapshot) | Health check xem là phải ra số chuẩn | Gọi `get()` hai lần rải rác có thể ghép ra kết quả tào lao |
+| Nhả slot (Release) | Xong một vòng đời (lifecycle) thì nhả đúng 1 slot | Callback gọi đúp làm số bị âm hoặc tạo ra slot ma |
+| Hủy (Failure) | Tạo thất bại thì tự giác nhả slot pending đó ra | Mấy cái biến đếm tổng cục này làm sao biết slot đó thuộc về ai |
 
 ## Nguyên nhân theo từng lớp
 
 ### Volatile
 
-Volatile read nhìn thấy volatile write theo ordering của Java Memory Model. Nhưng
-`used++` gồm việc đọc, cộng và ghi. Một thread có thể chen vào giữa; visibility không
-đồng nghĩa với atomicity.
+Đọc volatile thì luôn thấy giá trị mới nhất, đúng luật Java Memory Model. Nhưng cái trò `used++` lại gồm tới ba bước: đọc, cộng, ghi. Thread khác hoàn toàn có thể chen ngang. Nhìn thấy mọi thứ (visibility) không có nghĩa là không ai được xen vào (atomicity).
 
 ### AtomicInteger
 
-`AtomicInteger` cung cấp operation atomic cho một integer. Nó không tạo transaction
-trên hai instance và không kéo một biểu thức bên ngoài như
-`active.get() + pending.get()` vào cùng một linearization point.
+Nó chỉ bảo vệ cho đúng một số nguyên thôi. Đừng mơ nó tự tạo ra một cái lồng bảo vệ (transaction) cho 2 biến đếm cùng lúc hay gom cái đám `active.get() + pending.get()` lại thành một thao tác liền mạch.
 
-Ngay cả `view()` cũng đọc active rồi pending riêng biệt. Nếu transition xảy ra giữa
-hai lần đọc, view có thể kết hợp hai giá trị chưa từng cùng tồn tại trong một
-logical state.
+Ngay cả cái hàm `view()` cũng đọc active rồi tới pending. Lỡ như ở giữa 2 lần đọc đó có cái transition nào chạy ngang, thì hàm `view` có thể bốc nhầm râu ông nọ cắm cằm bà kia.
 
-Xem nền tảng tại
-[Java Memory Model, volatile và atomic variable](../../concepts/java-memory-model-and-atomicity.md).
+Để hiểu sâu hơn, ghé đọc [Java Memory Model, volatile và atomic variable](../../concepts/java-memory-model-and-atomicity.md).
 
-### Compound invariant
+### Compound invariant (Quy tắc ghép)
 
-Invariant thuộc về toàn bộ `BudgetState`, nên ranh giới đồng bộ hóa (synchronization boundary) cũng phải bao
-trọn state đó. Có ba cách phổ biến:
-
-- mã hóa (encode) nhiều field trong một immutable object và CAS reference;
-- dùng một lock bảo vệ mọi field/transition;
-- giảm mô hình về một permit counter duy nhất nếu nghiệp vụ chỉ cần tổng.
+Quy tắc này nằm ở một `BudgetState` tổng thể, thế nên vòng bảo vệ cũng phải bao trọn cái state đó. Có 3 cách hay xài:
+- Gom tất cả vào một object bất biến (immutable) và xài CAS trên đó.
+- Xài một cái lock (ổ khóa) để bảo vệ tất cả.
+- Đổi cách làm: nếu chỉ quan tâm tới tổng số vé, quy nó về một biến đếm duy nhất thôi.
 
 ### Spring
 
-Singleton chỉ khiến mọi phía gọi (caller) dùng cùng một budget; nó không serialize các method call.
-Scheduled health check, request và connection callback có thể chạy trên các
-thread khác nhau.
+Gắn Singleton thì mọi thằng đều gọi chung một cái budget, nhưng nó KHÔNG hề bắt tụi nó xếp hàng (serialize) gọi hàm. Mấy cái thread tạo request, check health, hay callback đều có thể đâm chém nhau loạn xạ.
 
 ### Transaction
 
-Không có database transaction hoặc rollback. `@Transactional` không khóa heap
-state và exception sau quá trình increment không tự trả lại slot. Việc dọn dẹp (cleanup) phải là một phần của
-connection lifecycle.
+Ở đây không có database transaction hay rollback gì ráo. `@Transactional` không có phép thần thông khóa mấy biến trong heap của Java lại đâu. Còn dọn dẹp lỗi thì phải tự code tử tế vào lifecycle của kết nối.
 
-## Linearization point của lời giải CAS
+## Linearization point (Điểm chốt sổ) của lời giải CAS
 
-Với `AtomicReference<BudgetState>`:
+Nếu dùng `AtomicReference<BudgetState>`:
+1. Thread lấy một trạng thái bất biến (chứa cả active và pending).
+2. Kiểm tra quy tắc và tính toán trạng thái tiếp theo lưu vào một biến nội bộ.
+3. Chơi trò `compareAndSet(hiện_tại, tiếp_theo)` để cập nhật.
+4. Nếu thất bại (do có ai nhanh tay hơn), đọc lại từ đầu.
 
-1. thread đọc một immutable state chứa cả active và pending;
-2. kiểm tra invariant và tạo state kế tiếp trong local variable;
-3. `compareAndSet(current, next)` thử công bố toàn bộ transition;
-4. nếu state đã đổi, CAS thất bại và thread đọc lại thay vì dùng quyết định cũ.
+Cái khoảnh khắc CAS thành công chính là linearization point. Tại đó việc kiểm tra sức chứa và giữ chỗ diễn ra như một cái chớp mắt. Lúc chuyển từ pending sang active cũng gom 2 biến lại đổi cùng lúc, dẹp luôn cái khe hở dung lượng ma kia.
 
-CAS thành công là linearization point. Tại đó việc kiểm tra capacity và reserve pending
-cùng có hiệu lực. Transition từ pending sang active cũng đổi cả hai field trong một
-lần swap reference nên không làm lộ capacity gap.
-
-Hàm tính state mới có thể chạy lại nhiều lần khi có contention. Nó phải thuần túy,
-không gọi remote service, không ghi log nghiệp vụ một lần duy nhất và không tạo
-side effect ra bên ngoài.
+Cái hàm tính toán trạng thái có thể chạy lại chục lần, nên đừng có rảnh mà bỏ log nghiệp vụ hay gọi API lung tung trong đó nhé (không sinh ra side effect).
 
 ## Kẻ thua cuộc (Loser), thử lại (retry) và contention
 
-- Actor thua CAS sẽ retry với state mới nhất.
-- Nếu state mới đã đầy, actor trả về `false`; đây là sự từ chối do quá tải capacity (capacity rejection), không phải
-  lỗi kỹ thuật (technical error).
-- CAS loop không bảo đảm tính công bằng (fairness). Một thread có thể retry nhiều lần dưới
-  tình trạng contention cao.
-- Không retry vô hạn quá trình tạo remote connection; CAS chỉ retry các transition ngắn
-  trong memory.
-- Nếu contention/fairness quan trọng hơn khả năng tiến triển không bị chặn (non-blocking progress), lock hoặc
-  semaphore thường dễ vận hành hơn.
+- Thằng nào thua CAS sẽ phải lóc cóc chạy lại với data mới nhất.
+- Nếu thấy hết chỗ (full) thì nó trả về `false`; đây là báo hết quota (capacity rejection), không phải lỗi hệ thống (technical error).
+- Vòng lặp CAS không thèm quan tâm chuyện công bằng (fairness). Đứa nào xui thì retry mệt xỉu luôn.
+- Đừng lặp CAS cho những thứ dính tới kết nối mạng xa xôi; nó chỉ dành cho những cú chớp nhoáng trong memory thôi.
+- Nếu bạn đề cao tính công bằng và không muốn bị chiếm tài nguyên, thì xài Lock hoặc Semaphore cho lẹ.
 
 ## Thất bại (Failure), timeout, crash và double callback
 
-Reservation phải tồn tại trước khi bắt đầu remote handshake:
+Phải xí chỗ trước khi đi bắt tay (handshake):
+- Thành công: pending hóa active, tổng số vé giữ nguyên.
+- Thất bại/timeout: nhả 1 pending.
+- Đóng kết nối: nhả 1 active.
+- Callback vô tình gọi đúp: phải có cách chặn lại (ví dụ dùng token), cấm được trừ biến đếm hai lần.
 
-- handshake thành công: chuyển pending thành active, không đổi tổng used;
-- handshake thất bại/timeout: giảm pending đúng một lần;
-- connection đóng: giảm active đúng một lần;
-- callback trùng lặp: phải bị từ chối hoặc không có tác dụng (no-op) dựa theo một lifecycle token, không được
-  trừ aggregate counter thêm lần nữa.
+Mấy cái biến đếm tổng (aggregate counter) thì đếm mù thôi, nó chả biết callback này của thằng nào. Nếu bạn sợ vụ callback đúp, hãy xài permit handle (như `AtomicBoolean released`) hoặc gán ID cho từng reservation.
 
-Aggregate counter chỉ biết số lượng, không biết callback thuộc về reservation nào.
-Nếu duplicate/out-of-order callback là khả năng thực tế có thể xảy ra, dùng permit handle có
-`AtomicBoolean released`, hoặc state machine được định danh (keyed) theo reservation ID.
-
-Process crash làm mất local counter. Hệ điều hành (OS) thường đóng connection của process,
-nhưng provider có thể cần timeout để nhận biết. Đây không phải là durable lease và
-không có log phục hồi (recovery log).
+Nếu hệ thống sập (crash) thì biến đếm trong máy bay màu. HĐH sẽ ngắt kết nối, nhưng provider bên kia có thể sẽ phải chờ timeout mới biết. Nhớ là chúng ta không có tính lưu trữ dài lâu (durable lease) ở đây.
 
 ## Khi có nhiều application instance
 
-Mỗi JVM có budget riêng. Nếu ba node đều cấu hình limit là 10, toàn bộ deployment có
-thể mở tới khoảng 30 connection. Local CAS, lock và semaphore không phối hợp giữa
-các node.
+Mỗi cái JVM tự quản budget riêng. Giả sử 3 con server cấu hình limit là 10, thì hệ thống bạn mở tới 30 kết nối. Mấy cái CAS, lock hay semaphore này chả biết đi tán dóc với server khác đâu.
 
-Nếu provider quota là 10 cho toàn bộ deployment, phải chia quota tĩnh theo node
-hoặc dùng sự phối hợp (coordination) bên ngoài với lease/expiry/fencing phù hợp. Tình huống này chỉ
-bảo vệ capacity của một process.
+Nếu provider chỉ cho 10 kết nối tổng cộng cho cả cụm server, thì bạn phải chia đều quota ra cho từng server, hoặc xài công cụ bên ngoài (Redis, Zookeeper...) để quản lý. Bài này chỉ nói chuyện trong phạm vi 1 máy chủ thôi.
 
 ## Hậu quả
 
 ### Hậu quả kỹ thuật
 
-- đăng ký vượt mức (oversubscription), connection storm và bị provider throttling;
-- metric được ghép từ hai thời điểm khác nhau;
-- counter âm hoặc capacity rò rỉ (leak) do lifecycle callback sai;
-- CAS spin hoặc lock contention khi hệ thống bão hòa (saturated);
-- lỗi khó tái hiện vì chỉ xảy ra khi sát limit.
+- Bão kết nối, vượt định mức, bị provider cấm cửa (throttling).
+- Số liệu (metric) lấy sai bét do đọc lở dở giữa chừng.
+- Counter bị âm hoặc rò rỉ dung lượng (leak) do gọi nhầm callback.
+- Khi hệ thống đầy tràn (saturated), CPU bị đốt do vòng lặp CAS hoặc nghẽn lock.
+- Bug chập chờn, chỉ lộ mặt khi limit sát nút.
 
 ### Hậu quả nghiệp vụ
 
-- request latency tăng và tỷ lệ lỗi (error rate) lan sang các luồng (flow) khác;
-- quota của provider bị vượt, ảnh hưởng mọi người bán (merchant) trên node;
-- autoscaling/alerting phản ứng theo số liệu không nhất quán;
-- retry sau timeout có thể tạo connection dư thừa;
-- sự cố cục bộ bị hiểu nhầm là provider outage.
+- Lag sấp mặt, lỗi lan rộng ra các hệ thống khác.
+- Lố quota của provider, các cửa hàng (merchant) khác trên cùng server chịu vạ lây.
+- Alert/Autoscaling nhận data sai và hành động tào lao.
+- Timeout xong retry lại càng sinh rác kết nối.
+- Lỗi tại mình nhưng sếp tưởng do provider sập.
 
 ## Phạm vi không được giải quyết trong tình huống này
 
-Tình huống không bảo vệ inventory bền vững, account balance, database row hoặc quota
-phân tán. Nó cũng không cung cấp lease/fencing sau khi crash. Trọng tâm là compound
-state trong một JVM.
+Chúng ta KHÔNG bàn chuyện kho bãi (inventory) lưu dài hạn, tiền nong (account balance), transaction của database, hay quota cho hệ thống phân tán. Cái chúng ta lo là quy tắc chùm (compound state) trong một căn nhà (JVM) thôi.

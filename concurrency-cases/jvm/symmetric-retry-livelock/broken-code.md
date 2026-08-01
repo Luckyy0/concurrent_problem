@@ -64,32 +64,35 @@ public final class Channel {
 }
 ```
 
-T1 gọi `swap(A, B)`, T2 gọi `swap(B, A)`. `tryLock` ngăn hai thread bị block vô hạn, nhưng vòng lặp không có deadline hay attempt limit. Việc sử dụng fixed backoff giữ các luồng ở cùng một chu kỳ (phase) nên có thể liên tục tái tạo conflict.
+Hãy nhìn đoạn code trên: T1 thì gọi `swap(A, B)`, còn T2 gọi `swap(B, A)`. Dùng `tryLock` thì đúng là giúp luồng không bị block cứng đơ ngàn năm (deadlock). Tuy nhiên, cái vòng lặp `while(true)` lại vô tận, chẳng có deadline cũng chẳng đếm số lần thử. Kết hợp với việc chờ một khoảng thời gian cố định `fixedBackoff`, tụi nó cứ chạy song song, đụng nhau rồi lại thử lại theo cùng một nhịp. Bùm, bạn có livelock!
 
 ## Lý do đoạn code trông có vẻ hợp lý
 
-- không có thread nào giữ lock rồi bị block vô hạn;
-- mọi attempt thất bại đều thực hiện unlock trong khối `finally`;
-- operation chỉ thực hiện mutation sau khi có đủ hai lock;
-- backoff có vẻ giúp giảm contention;
-- unit test với một worker luôn pass.
+Nếu chỉ nhìn lướt qua, bạn sẽ thấy code này "tưởng không lỏ mà lỏ không tưởng", vì:
+- Chẳng có luồng nào ôm khư khư khóa rồi ngủ quên (không có deadlock).
+- Lỗi hay không thì khóa cũng được nhả ra đàng hoàng trong block `finally`.
+- Dữ liệu (mutation) chỉ được đổi khi đã nắm chắc cả 2 khóa trong tay.
+- Có chờ (backoff) đàng hoàng để giảm tranh chấp chứ bộ.
+- Chạy Unit test với 1 worker thì xanh lè (pass) mượt mà.
 
-> **Nói ngắn gọn:** đoạn code đã bảo vệ được safety nhưng chưa bảo đảm được liveness hay progress.
+> **Nói ngắn gọn:** Code này chạy an toàn không làm hỏng dữ liệu, nhưng xui cái là có thể nó... chẳng thèm làm xong việc (không có liveness hay progress).
 
 ## Điều kiện tái hiện
 
-1. hai actor chọn lock đầu tiên đối nghịch nhau;
-2. cả hai acquire thành công lock đầu tiên trong cùng một chu kỳ (phase);
-3. cả hai đều không lấy được lock thứ hai và tiến hành release gần như đồng thời;
-4. cơ chế backoff hoặc CPU scheduling giữ chúng lặp lại cùng nhịp;
-5. cơ chế retry không có điểm dừng (terminal budget).
+Làm sao để ra được cái lỗi củ chuối này? Cần 5 bước tụ hội:
+1. Hai anh worker chọn thứ tự lấy khóa ngược nhau (người A-B, người B-A).
+2. Cả hai anh đều nhanh tay túm được cái khóa đầu tiên cùng một lúc.
+3. Chợt nhận ra cái khóa thứ hai đã bị tên kia nẫng mất, cả hai cùng bực mình nhả khóa đầu tiên ra.
+4. Cơ chế chờ (backoff) hoặc cách hệ điều hành xếp lịch cho CPU làm cho cả hai anh cứ gặp nhau ở cùng một nhịp lặp đi lặp lại.
+5. Vòng lặp xui xẻo này lại không có điểm dừng.
 
 ## Các cách sửa chữa không triệt để
 
-- Chỉ đổi `lock()` thành `tryLock()`; khi đó deadlock có thể biến thành livelock.
-- Sử dụng fixed backoff giống hệt nhau cho mọi actor.
-- Sử dụng random jitter nhưng vẫn cho phép retry vô hạn.
-- Tăng số lượng thread; contention trên cùng hai resource vẫn không biến mất.
-- Ghi log cho mỗi lần retry ở mức WARN; điều này có thể tạo ra logging storm.
-- Catch interrupt rồi vẫn tiếp tục vòng lặp; khi đó việc huỷ request (cancellation) sẽ mất hiệu lực.
-- Thực hiện mutate một phần trước khi lấy lock thứ hai rồi mới rollback; khi đó các side effect của retry trở nên khó chứng minh tính đúng đắn và có thể để lộ trạng thái trung gian (intermediate state).
+Nhiều khi vội, anh em hay chắp vá theo mấy cách này, nhưng nó không giải quyết tận gốc đâu nhé:
+- Đổi mỗi `lock()` thành `tryLock()`: Chúc mừng, bạn vừa biến deadlock thành livelock!
+- Cho thời gian chờ cố định: Mọi người chờ giống nhau thì lại đụng nhau tiếp thôi.
+- Random thời gian chờ nhưng... cho thử lại vô hạn: Rủi ro là nó vẫn kẹt lâu ơi là lâu.
+- Tăng số thread lên: Càng đông càng tắc đường chứ được gì, tài nguyên vẫn chỉ có 2 cái.
+- Bắn log WARN mỗi lần retry: Chờ tới lúc log ngập tràn ổ cứng (logging storm) nhé.
+- Bắt lỗi interrupt rồi... chạy tiếp: Thế này thì ai mà huỷ được request khi cần.
+- Sửa đại dữ liệu trước khi lấy khóa thứ hai rồi tính đường lùi (rollback) sau: Code sẽ rất phức tạp và nguy cơ lộ dữ liệu dở dang (intermediate state) cực cao.

@@ -2,19 +2,16 @@
 
 ## Chiến lược kiểm thử
 
-Case dùng hai tầng kiểm thử:
+Case này chúng ta áp dụng luôn hai đòn hiểm để kiểm thử:
 
-1. kiểm thử có kiểm soát dùng `CyclicBarrier` để buộc hai tác nhân cùng đọc một trạng thái
-   trước khi được phép ghi;
-2. kiểm thử nhiều luồng dùng `CountDownLatch` trên code đã sửa để kiểm tra ID không
-   trùng và dữ liệu của từng request không bị lẫn.
+1. Chạy test "đặt bẫy": Dùng `CyclicBarrier` ép hai luồng phải phanh lại sau khi đọc dữ liệu, chờ nhau rồi mới cùng ghi đè. Cố tình gây lỗi để xem nó nát cỡ nào.
+2. Chạy test đa luồng đạn đạo: Dùng `CountDownLatch` trên bản code xịn (đã sửa) để spam request xem ID có bị trùng và dữ liệu khách hàng có bị râu ông nọ cắm cằm bà kia không.
 
-Không cần Testcontainers vì case không phụ thuộc vào hành vi của database.
+Trường hợp này không cần động đến `Testcontainers` (database thật chạy trong docker) vì lỗi này xuất phát từ code trên RAM, không liên quan gì đến DB cả.
 
 ## Tái hiện lỗi có kiểm soát
 
-Service có điểm điều phối dưới đây chỉ được dùng trong kiểm thử. Barrier dừng hai
-luồng sau bước đọc, nhờ đó tái hiện ổn định chuỗi đọc–sửa–ghi bị lỗi:
+Dưới đây là một đoạn code chèn thêm cái "bốt gác" chỉ dùng để test. Cái rào chắn (barrier) này sẽ chặn cổ 2 luồng lại sau khi đọc dữ liệu, giúp ta chủ động gây ra cái sự cố "đọc-sửa-ghi" cực kỳ ổn định, lần nào chạy cũng lỗi đều như vắt chanh:
 
 ```java
 package com.example.checkout;
@@ -101,17 +98,13 @@ class BrokenReceiptDraftServiceConcurrencyTest {
 }
 ```
 
-`CyclicBarrier` tạo quan hệ xảy ra-trước giữa các thao tác trước và sau
-`await()`. Nhờ vậy, kiểm thử kiểm soát thứ tự bằng cơ chế đồng bộ thay vì đoán thời
-điểm bằng `Thread.sleep`.
+Cái `CyclicBarrier` đóng vai trò "cảnh sát giao thông", tạo trật tự rõ ràng giữa các thao tác trước và sau hàm `await()`. Thay vì ngồi đoán mò xài `Thread.sleep` (rất dễ xịt), chúng ta điều phối luồng một cách chắc cú.
 
-> **Nói ngắn gọn:** kiểm thử chủ động đặt hai luồng đúng vào cửa sổ gây lỗi, nên kết
-> quả không phụ thuộc vào may rủi của bộ lập lịch.
+> **Nói ngắn gọn:** Test này cố tình ép 2 luồng lọt hố cùng lúc, nên kết quả bao giờ cũng sai như dự đoán chứ không phụ thuộc vào hên xui nữa.
 
 ## Kiểm thử hồi quy cho code đã sửa
 
-Kiểm thử này cho 100 lời gọi bắt đầu cùng thời điểm, sau đó kiểm tra các quy tắc bắt
-buộc: đủ kết quả, ID không trùng và dữ liệu khách hàng không bị lẫn giữa các request.
+Đoạn test này sẽ nhét 100 ông khách vào chung vạch xuất phát, hô "chạy" một phát là cả 100 ông đồng loạt lao lên gọi service. Cuối cùng, mình chỉ việc chốt sổ xem có đủ 100 kết quả không, ID có ông nào bị trùng không và dữ liệu của ai có về đúng tay người đó không.
 
 ```java
 package com.example.checkout;
@@ -197,13 +190,11 @@ class ReceiptDraftServiceConcurrencyTest {
 }
 ```
 
-`ReceiptDraftService` và `DraftIdGenerator` ở kiểm thử dùng đúng mã đã sửa trong
-[solutions](solutions.md).
+Dĩ nhiên, `ReceiptDraftService` và `DraftIdGenerator` trong đoạn test này là hàng chuẩn cơm mẹ nấu ở file [solutions](solutions.md) rồi nhé.
 
 ## Kiểm thử tải đồng thời bổ sung
 
-Có thể chạy cách triển khai lỗi với nhiều tác nhân và nhiều vòng lặp rồi
-so sánh:
+Nếu rảnh, bạn có thể bê đoạn code bị lỗi chạy qua nhiều luồng lặp đi lặp lại rồi soi thông số:
 
 ```text
 tổng số lời gọi
@@ -211,34 +202,32 @@ số lượng sequence khác biệt
 result.customerId == input customerId
 ```
 
-Kiểm thử tải đồng thời có thể không phát hiện lỗi ở mọi máy hoặc mọi lần chạy.
-Nó chỉ là bằng chứng bổ sung và không thay thế kiểm thử có thứ tự được kiểm soát.
+Nhưng lưu ý, test tải kiểu này tuỳ máy tuỳ thời điểm, hên thì ra lỗi xui thì nó pass xanh lè. Nên xem nó như đồ chơi xem thêm thôi, không thay thế được cái test gài bẫy có kiểm soát ở trên đâu.
 
 ## Kiểm tra lỗi và khả năng tiến triển
 
-- Mọi latch/barrier wait phải có timeout.
-- Dùng `Future.get(timeout)` nếu task có thể bị deadlock.
-- Luôn đóng executor trong `finally`.
-- Kiểm thử phải thất bại khi thiếu kết quả, không chỉ khi phát hiện ID trùng.
-- Phải khôi phục trạng thái ngắt (interrupt status) khi bắt `InterruptedException`.
+- Mấy trò xài latch/barrier wait là **bắt buộc** phải có timeout (thời gian chờ tối đa). Không là treo luôn máy.
+- Gắn thêm `Future.get(timeout)` đề phòng luồng nó bị nghẽn đơ ra đó (deadlock).
+- Luôn nhớ dọn rác, tắt executor trong khối `finally`.
+- Đã test thì phải check kỹ thiếu sót kết quả nữa, chứ đừng chăm chăm mỗi vụ trùng ID.
+- Lỡ bắt được `InterruptedException` thì nhớ đánh cờ lại (khôi phục interrupt status) cho luồng nhé.
 
 ## Xác minh trong môi trường thực tế
 
-Theo dõi các tín hiệu sau:
+Đem lên production thì ráng mà ngồi canh me các dấu hiệu tà đạo này:
 
-- định danh nghiệp vụ hoặc định danh tương quan bị trùng bị ràng buộc database từ chối;
-- sự không khớp giữa khách hàng đã xác thực và chủ sở hữu kết quả;
-- số lần thử lại cùng request/khóa idempotency;
-- hàng đợi của thread pool và độ trễ của request;
-- khởi động lại hoặc triển khai có làm sequence cục bộ tái sử dụng hay không.
+- Database báo lỗi văng miểng vì ràng buộc (constraint) trùng ID;
+- Của người này mà tên người kia;
+- User bấm cháy cả chuột vì request báo lỗi liên tục;
+- Hàng đợi (queue) đầy nhóc, request chạy rùa bò;
+- Lâu lâu deploy hoặc khởi động lại, ID lại quay xe về cấp số cũ.
 
-Không ghi trực tiếp dữ liệu khách hàng nhạy cảm vào log chỉ để chẩn đoán tranh
-chấp. Dùng ID của request và trường kiểm toán có cấu trúc phù hợp.
+Lưu ý: Đừng có lanh chanh in luôn dữ liệu cá nhân nhạy cảm của khách ra log chỉ để soi cho lẹ. Gom ID request với các cấu trúc log đàng hoàng mà xài.
 
 ## Checklist chất lượng của case
 
-- [x] Xen kẽ tất định (deterministic interleaving) không dùng sleep.
-- [x] Mã đã sửa được chạy với nhiều luồng.
-- [x] Khẳng định tính duy nhất và tính độc lập của request.
-- [x] Timeout/dọn tiết được khai báo.
-- [x] Không dùng H2/Testcontainers vì không có hành vi database.
+- [x] Lắp bẫy gài luồng xịn xò, không thèm xài `sleep` hên xui.
+- [x] Chạy đa luồng te tua với code đã sửa.
+- [x] Đã chốt kiểm tra tính độc lập và chống trùng lặp.
+- [x] Timeout/chống treo đồ đạc dọn dẹp cẩn thận.
+- [x] Không nhúng H2/Testcontainers vì lỗi này không ăn nhậu gì tới database.

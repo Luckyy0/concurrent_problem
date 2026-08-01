@@ -1,8 +1,8 @@
-# Giải Pháp Kiến Trúc Tối Ưu: Cô Lập Trạng Thái Và Quản Trị Hệ Thống Tương Tranh
+# Giải Pháp: Cô Lập Trạng Thái Và Quản Trị Hệ Thống Tương Tranh
 
-## 1. Phương Pháp Số 1: Mô Hình Uỷ Quyền Kết Quả Cho Bộ Điều Phối Lô (Task Returns Value, Coordinator Merges)
+## 1. Phương Pháp 1: Mô Hình Uỷ Quyền (Tác vụ trả kết quả, Luồng chính gộp lại)
 
-Được khuyến nghị làm chuẩn thiết kế nền tảng (Default choice). Hệ thống tác vụ (Worker) không tiếp cận mảng phân bổ bộ nhớ tổng hợp. Cấu trúc Điều phối viên (Coordinator) lưu trữ danh mục `Future` theo trật tự gốc, thiết lập vòng giới hạn chung, và thu thập tuần tự sau hoàn tất.
+Đây là **cách được khuyến nghị dùng làm tiêu chuẩn (Default choice)**. Theo cách này, các tác vụ con (Worker) hoàn toàn không biết đến sự tồn tại của mảng dùng chung. Luồng chính (Coordinator) sẽ tạo ra danh sách các `Future` theo đúng thứ tự ban đầu, đặt một thời gian chờ chung (timeout) cho toàn lô, rồi sau đó đi gom kết quả từng cái một.
 
 ```java
 package com.example.quote;
@@ -48,14 +48,14 @@ public class BatchQuoteService {
 
         try {
             for (QuoteRequest request : input) {
-                // Đóng gói đối tượng phản hồi vào Future, không tham chiếu mảng lưu trữ
+                // Tác vụ chỉ lo lấy dữ liệu và bọc trong Future, không được đụng vào mảng chung
                 futures.add(quoteExecutor.submit(
                         () -> quoteClient.fetch(request)));
             }
         } catch (RuntimeException submissionFailure) {
-            cancelAll(futures); // Đình chỉ luồng hệ thống
+            cancelAll(futures); // Hủy các tác vụ lỡ gửi nếu có lỗi giữa chừng
             throw new BatchQuoteException(
-                    "Sự cố hệ thống không cấp phát toàn bộ cấu trúc lô",
+                    "Không thể đẩy hết toàn bộ tác vụ của lô vào Executor",
                     submissionFailure
             );
         }
@@ -67,26 +67,26 @@ public class BatchQuoteService {
             for (Future<QuoteResult> future : futures) {
                 long remaining = deadline - System.nanoTime();
                 if (remaining <= 0) {
-                    throw new TimeoutException("Vượt quá ngân sách thời gian xử lý lô");
+                    throw new TimeoutException("Vượt quá thời gian cho phép của lô");
                 }
-                // Đồng bộ hóa việc lấy phần tử theo trật tự Mảng Future đã xếp
+                // Đợi và lấy kết quả đúng theo thứ tự các Future đã được xếp hàng
                 results.add(future.get(remaining, TimeUnit.NANOSECONDS));
             }
             completed = true;
             return List.copyOf(results);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            throw new BatchQuoteException("Gián đoạn luồng xử lý lõi", exception);
+            throw new BatchQuoteException("Luồng chính bị ngắt ngang", exception);
         } catch (ExecutionException exception) {
             throw new BatchQuoteException(
-                    "Tác vụ xử lý báo giá thất bại",
+                    "Một tác vụ xử lý báo giá bị lỗi",
                     exception.getCause()
             );
         } catch (TimeoutException | CancellationException exception) {
-            throw new BatchQuoteException("Đứt gãy hợp đồng tiến trình Lô xử lý", exception);
+            throw new BatchQuoteException("Lô xử lý thất bại do quá hạn hoặc bị hủy", exception);
         } finally {
             if (!completed) {
-                cancelAll(futures); // Dọn dẹp tài nguyên treo
+                cancelAll(futures); // Dọn dẹp tài nguyên treo nếu có lỗi
             }
         }
     }
@@ -97,7 +97,7 @@ public class BatchQuoteService {
 }
 ```
 
-Kiến trúc Lớp Ngoại Lệ Nghiệp Vụ:
+Lớp Exception dùng riêng cho bài toán này:
 
 ```java
 package com.example.quote;
@@ -109,26 +109,26 @@ public final class BatchQuoteException extends RuntimeException {
 }
 ```
 
-### Cơ Sở Đảm Bảo Cấu Trúc Bất Biến (Invariant Safeness)
+### Tại sao cách này an toàn tuyệt đối?
 
-- **Quyền Sở Hữu (Ownership):** Tác vụ (Worker) đóng gói cục bộ `QuoteResult` và chuyển giao thẩm quyền qua `Future`.
-- **Giới Hạn Tác Động:** Duy nhất luồng Điều phối cấu trúc hệ thống (Request Thread) tiến hành tác động `results`.
-- **Rào Cản Vận Hành (Visibility):** Cơ chế `Future.get` xây dựng Rào cản Công Bố (Safe publication) chắc chắn cho mọi kết quả.
-- **Bảo Toàn Trật Tự:** Khối mảng `Futures` duy trì Cấu trúc Trật tự Hệ Thống; Output không bẻ cong do Trật tự Hoàn Tất (Completion order).
-- **Phân Phát Duy Nhất:** Quá trình `List.copyOf` chỉ xuất hiện và chốt sổ sau khi xác lập Vòng đời Lô thành công.
-- **Xóa Bỏ Cục Bộ Rác Dữ Liệu:** Một tác vụ Thất bại (Timeout/Error) dẫn đến quá trình Hủy Lô Đơn Môn (All-or-Nothing); ngăn chặn hiện tượng rò rỉ (Partial list).
+- **Quyền Sở Hữu (Ownership):** Tác vụ (Worker) tự tạo `QuoteResult` và chuyển giao nó thông qua `Future`.
+- **Chỉ 1 luồng được ghi:** Duy nhất luồng chính (Coordinator) mới có quyền gọi `.add()` vào mảng `results`.
+- **Rào Cản Hiện Thị (Visibility):** Việc gọi `Future.get` giống như một điểm chốt chặn an toàn (Safe publication), đảm bảo luồng chính sẽ thấy được kết quả mới nhất mà luồng phụ đã làm.
+- **Giữ nguyên thứ tự:** Mảng `futures` được tạo dựa trên thứ tự ban đầu. Nhờ đó, kết quả trả ra cũng y hệt thứ tự đó, mặc kệ luồng nào chạy xong nhanh hơn.
+- **Không trả về mảng rác:** Lệnh `List.copyOf` chỉ chạy khi toàn bộ lô đã thành công 100%. Nếu không, mảng sẽ bị vứt đi.
+- **Dọn dẹp triệt để:** Áp dụng luật "Tất-cả-hoặc-không-có-gì". Nếu bị lỗi hay quá hạn, toàn bộ `Future` sẽ bị hủy, không có chuyện ứng dụng trả về lỗi nhưng luồng vẫn chạy ngầm tốn RAM.
 
-> **Nguyên tắc kỹ thuật:** Cắt đứt luồng Truy xuất dùng chung (Shared writer) là hệ phương thức hoàn hảo và đáng tin cậy hơn mọi thủ thuật bao bọc Lock/Collection đồng thời nào.
+> **Nguyên tắc kỹ thuật:** Việc ngăn chặn luồng phụ đụng vào biến dùng chung là giải pháp sạch sẽ và đáng tin cậy hơn bất cứ trò khóa luồng (Lock) hay cấu trúc Collection đa luồng nào.
 
-### Cảnh Báo Khai Thác Mở Rộng
+### Cảnh báo thêm
 
-- Lệnh `cancel(true)` chỉ ban phát cảnh báo phối hợp (Cooperative); yêu cầu `QuoteClient` xây dựng Cấu trúc Timeout I/O nội bộ.
-- Xử lý Remote Call có nguy cơ lưu vết Side-effect dù có bị báo Cancellation; Kỹ thuật Retry bắt buộc phân phối mã Khóa (Idempotency Key).
-- Hiện tượng Dội Tải (Overload): Khởi chạy quy mô Lô lớn bắt buộc có lớp Phòng ngự Tải (Admission control) và giới hạn kích cỡ Pool hệ thống.
+- Lệnh `cancel(true)` chỉ là một tín hiệu đề nghị ngưng chạy. Muốn ngưng hẳn thì bên trong `QuoteClient` phải có cơ chế cấu hình Timeout khi gọi mạng (I/O).
+- Lệnh gọi mạng (Remote Call) có nguy cơ gây ảnh hưởng tới dữ liệu ở server đối tác ngay cả khi đã bị cancel. Cần truyền theo Khóa Chống Trùng (Idempotency Key) để an toàn khi thử lại.
+- Tránh sập nguồn (Overload): Cần thiết lập giới hạn số lượng tác vụ trong Thread Pool để hệ thống không bị "nghẽn cổ chai" khi gửi lô quá to.
 
-## 2. Phương Pháp Số 2: Định Tuyến Chỉ Mục Khe Cố Định (Indexed Slots)
+## 2. Phương Pháp 2: Chia Trước Vị Trí Cố Định (Indexed Slots)
 
-Tương tác cấu trúc xác định tổng thể độ dài đầu vào. Áp dụng Mảng tham chiếu Nguyên Tử (`AtomicReferenceArray`) cho từng tác vụ chiếm hữu một Slot cục bộ.
+Cách này dùng khi ta biết chính xác mảng đầu vào có bao nhiêu phần tử. Ta dùng `AtomicReferenceArray` và phân công cho mỗi tác vụ một vị trí cố định (Slot) để ghi.
 
 ```java
 public List<QuoteResult> quoteIntoIndexedSlots(
@@ -142,7 +142,7 @@ public List<QuoteResult> quoteIntoIndexedSlots(
     for (int index = 0; index < requests.size(); index++) {
         int ownedIndex = index;
         QuoteRequest request = requests.get(index);
-        // Mỗi Thread làm chủ quyền Ghi trên một tọa độ độc lập
+        // Mỗi Thread được phân quyền ghi vào một vị trí index duy nhất của nó
         futures.add(quoteExecutor.submit(() ->
                 slots.set(ownedIndex, quoteClient.fetch(request))));
     }
@@ -154,7 +154,7 @@ public List<QuoteResult> quoteIntoIndexedSlots(
         QuoteResult result = slots.get(index);
         if (result == null) {
             throw new BatchQuoteException(
-                    "Thất thoát điểm dữ liệu tại chỉ mục " + index,
+                    "Thất thoát dữ liệu tại vị trí " + index,
                     null
             );
         }
@@ -163,12 +163,13 @@ public List<QuoteResult> quoteIntoIndexedSlots(
     return List.copyOf(ordered);
 }
 ```
+*(Code này bỏ bớt hàm `awaitAllOrCancel` vì nó giống hệt giải pháp 1)*. 
 
-Bỏ qua hàm trợ giúp `awaitAllOrCancel` để tránh dư thừa (Kế thừa giải pháp 1). `AtomicReferenceArray` cấp phép khả năng đọc tiến độ, song vẫn cần lưu tâm rủi ro truy xuất Mảnh dữ liệu chưa hoàn chỉnh (Partial State).
+Mảng `AtomicReferenceArray` cho phép API giám sát đọc mảng một cách an toàn mà không sợ quăng lỗi, nhưng người xem tiến độ có thể thấy một mảng lở dở với nhiều chỗ còn là `null` (Partial State).
 
-## 3. Phương Pháp Số 3: Giao Quyền Quản Trị Bằng Framework Mảng Cấp Cấu (Parallel Stream)
+## 3. Phương Pháp 3: Dùng Sức Mạnh Của Framework (Parallel Stream)
 
-Khuyến nghị sử dụng hệ thống luồng dữ liệu (Transformation) nặng tính toán lõi CPU, vắng bóng I/O độ trễ, loại bỏ sự điều phối thủ công:
+Nếu các tác vụ của bạn chủ yếu là tính toán nặng bằng CPU (như mã hóa, giải thuật) chứ không phải đi gọi API qua mạng (chờ I/O), thì đây là cách ngắn gọn và thanh lịch nhất:
 
 ```java
 public List<QuoteResult> calculateLocally(List<QuoteRequest> requests) {
@@ -177,15 +178,14 @@ public List<QuoteResult> calculateLocally(List<QuoteRequest> requests) {
             .toList();
 }
 ```
+Framework Java Stream sẽ tự động lo việc chia nhỏ mảng, giao cho các luồng xử lý, rồi gộp lại đúng thứ tự ban đầu (`Encounter order`). Bạn không phải viết code quản lý gì cả.
 
-Khung Pipeline cách ly Môi trường cấu trúc ngoài. Hệ Framework chịu toàn quyền phân cụm (Partition), gom nhặt và Hợp nhất. Trình tự cấu trúc đầu ra (`Encounter order`) được bảo tồn hoàn thiện.
+**Lưu ý:** `parallelStream()` hoàn toàn khác với việc xài `Concurrent collection`. Stream xài bộ nhớ riêng của nó, không đưa mảng chia sẻ ra ngoài cho các luồng thi nhau xé.
+Tuy nhiên, cẩn thận không dùng cái này nếu tác vụ phải gọi qua mạng (I/O). Java dùng chung một cái `ForkJoinPool` ngầm cho mọi Stream. Gây kẹt mạng ở đây sẽ làm tê liệt toàn bộ các chỗ khác xài parallelStream trong ứng dụng.
 
-Ghi Chú: Phân biệt `parallelStream()` khác biệt với cơ chế `Collector.Characteristics.CONCURRENT`. Khối xử lý luồng (Stream) quản trị bộ nhớ kín, không triển khai cấu trúc Tự-Đồng-Bộ vào không gian bộ nhớ.
-Cảnh báo: Hạn chế dùng `ForkJoinPool` ngầm định của Java khi chưa đo đếm các bài toán Hạn mức độ trễ hệ thống.
+## 4. Phương Pháp 4: Hàng Đợi (ConcurrentLinkedQueue)
 
-## 4. Phương Pháp Số 4: Đánh Bắt Tiến Độ Hoàn Tất Thời Gian Thực Bằng Hàng Đợi (ConcurrentLinkedQueue)
-
-Khi môi trường sản xuất nhiều thông tin và cấu trúc trật tự xếp hạng hoàn thành (Completion Order):
+Cách này chỉ nên dùng khi bạn muốn lấy ngay kết quả của những thằng chạy xong sớm (không quan tâm thằng nào vào trước).
 
 ```java
 ConcurrentLinkedQueue<QuoteResult> completed =
@@ -200,51 +200,48 @@ awaitAllOrCancel(futures, timeout);
 List<QuoteResult> finalSnapshot = List.copyOf(completed);
 ```
 
-Cấu trúc bảo bọc thao tác Ghi (`add`); Nhưng tính Nhất Quán Yếu (Weakly consistent) của Iterator sẽ tạo ra phản hồi không đầy đủ trong chặng giữa. Đặc tả Snapshot Đóng Gói (Final snapshot) buộc triển khai ngay sau Chốt Rào Cản. Bắt buộc tạo lập `IndexedQuoteResult` để trả về đúng chuẩn Input Order nếu hệ thống yêu cầu.
+Vì Queue này an toàn nên các luồng gọi `add()` thoải mái. Tuy nhiên, nếu bạn vừa add vừa lấy list ra đọc (iterator), kết quả trả về đôi khi không đầy đủ vì tính chất của nó là "Nhất quán yếu" (Weakly consistent). Nếu bạn muốn kết quả trả về đúng thứ tự như lúc vào, bạn phải nhét cả `Index` vào trong biến `QuoteResult` rồi xếp lại.
 
-## 5. Phương Pháp Số 5: Phân Phối Khoảng Đồng Bộ (Collections.synchronizedList)
+## 5. Phương Pháp 5: Bọc Khóa Bằng Collections.synchronizedList
 
-Tránh phương pháp này, dù có thể áp dụng đặc tả gói an toàn của hệ Monitor:
+Đừng dùng cách này, trừ khi bí bách:
 
 ```java
 List<QuoteResult> results =
         Collections.synchronizedList(new ArrayList<>());
 
-// Luồng Tác Vụ
+// Luồng Tác Vụ thi nhau gọi hàm này
 results.add(result);
 
-// Thiết Lập Đọc Giám Sát
+// Thiết Lập Đọc Giám Sát (phải nhớ tự bọc lock)
 List<QuoteResult> snapshot;
 synchronized (results) {
     snapshot = List.copyOf(results);
 }
 ```
 
-Tuần tự hóa tại lệnh Điền `add`, song cấu trúc duyệt bắt buộc thiết lập cơ chế khóa Ngoài (External synchronization). Phá vỡ trật tự cấu trúc gốc (Completion Order) và làm tăng rủi ro Tắc nghẽn nút cổ chai (Monitor contention). Lỗ hổng tiềm tàng nếu tham chiếu trượt qua nhiều Lớp phát triển phần mềm khác.
+Tuy hàm `add` đã được bọc lại cho an toàn, nhưng khi duyệt danh sách thì framework không tự bọc cho mình, bắt buộc bạn phải viết thêm `synchronized (results)`. Hệ quả là kết quả lộn xộn theo thời gian hoàn thành (không đúng thứ tự ban đầu) và các luồng chen lấn chờ ghi (Monitor contention) làm chậm ứng dụng. Rất dễ sinh lỗi nếu một ông dev khác ở file khác lỡ gọi danh sách này mà quên bọc block `synchronized`.
 
-## 6. Ma Trận Đánh Đổi Hiệu Suất Hệ Thống
+## 6. So Sánh Các Giải Pháp
 
-| Giải Pháp Kỹ Thuật | Phương Án Correctness | Đặc Điểm Ordering | Áp Lực Contention | Độ Trễ Cục Bộ (Failure) | Khả Năng Mở Rộng |
+| Giải Pháp | Tính Đúng Đắn | Thứ Tự | Xung Đột Khóa | Quản Lý Lỗi/Timeout | Dùng Khi Nào |
 | --- | --- | --- | --- | --- | --- |
-| Điều phối Tổng hợp `Future.get` (Vị Trí #1) | Bền vững hệ thống (All-or-Nothing) | Bảo toàn thứ tự gốc | Zero Lock trên Accumulator | Chính sách hợp nhất, hủy dễ | Cục bộ JVM |
-| Chỉ mục Tĩnh (Indexed slots) | Mỗi tác vụ một Khe | Bảo toàn thứ tự Slot | Không giành giật Vị trí Khe | Cần Chốt Hủy Đồng Bộ | Cục bộ JVM |
-| Cấu trúc Hệ Thống (Parallel stream) | Độc quyền xử lý tác vụ Lõi CPU | Định dạng tuần tự Encounter | Framework chia sẻ bộ nhớ | Thiếu linh hoạt quy tắc Lỗi | Vùng JVM chung (Pool) |
-| Hàng Đợi Hoàn Tất (`ConcurrentLinkedQueue`) | Giám sát tác vụ thời gian thực | Phụ thuộc tốc độ hoàn thành | Mở Rộng Non-blocking | Buộc rào cản Final Snapshot | Cục bộ JVM |
-| Trình Đồng Bộ (`synchronizedList`) | Kỹ thuật chắp nối đồng bộ mảng | Phụ thuộc tốc độ hoàn thành | Cổ chai tài nguyên (Lock) | Thiếu tương tác Lô | Cục bộ JVM |
+| Điều phối Tổng hợp `Future.get` (Cách #1) | Rất an toàn (All-or-Nothing) | Chuẩn 100% như lúc gửi | Không có | Rất dễ hủy và gom lỗi | Tiêu chuẩn cho hầu hết dự án |
+| Vị trí cố định (Indexed slots) | An toàn | Chuẩn 100% | Không có | Phải tự chốt chặn đồng bộ | Khối lượng input luôn cố định |
+| Parallel stream | Độc quyền xử lý CPU | Chuẩn theo Encounter order | Framework lo | Hơi khó bắt lỗi linh hoạt | Chỉ tính toán (CPU bound), không xài API ngoài |
+| `ConcurrentLinkedQueue` | Giám sát tác vụ thời gian thực | Xếp lộn xộn theo ai xong trước | Rất ít (Non-blocking) | Buộc tạo snapshot mới lúc xong | Cần xem tiến độ realtime |
+| `synchronizedList` | Dễ bị quên bọc synchronized | Lộn xộn | Gây kẹt luồng (Cổ chai) | Thiếu tương tác Lô | Hạn chế xài |
 
-## 7. Khuyến Nghị Phân Phối Khai Thác
+## 7. Khuyên Dùng Thế Nào Cho Hợp Lý?
 
-- Ưu tiên phương án Số 1 (Bộ điều phối hợp nhất) cho các kết quả Lô hoàn thiện định hình cấu trúc dữ liệu theo khuôn mẫu Trật tự và Khống chế Rủi ro.
-- Khai thác Phương án Khe phân tầng tĩnh khi Khối lượng Input không biến thiên.
-- Áp dụng cấu trúc Parallel cho hệ tính toán Khối tài nguyên CPU nguyên chất.
-- Dùng Concurrent Queue khi cấu trúc Giám sát Mảnh dữ liệu đòi hỏi tốc độ Cập nhật.
+- Luôn ưu tiên dùng **Cách Số 1** (Luồng chính đi thu gom) vì nó đáp ứng đầy đủ yêu cầu giữ đúng thứ tự và xử lý lỗi ngon lành.
+- Dùng **Parallel stream** nếu code của bạn không có kết nối ra ngoài (chỉ xử lý dữ liệu nặng trong bộ nhớ RAM/CPU).
+- Dùng **Concurrent Queue** nếu bạn đang xây dựng một ứng dụng kiểu Streaming, cần thấy kết quả nẩy lên màn hình liên tục khi có thằng chạy xong.
 
-## 8. Chuẩn Phân Cấp Triển Khai Thực Tế
+## 8. Các Lưu Ý Khi Đưa Lên Production
 
-- Tối giản số lượng đầu vào lô và số tác vụ bay lơ lửng (In-flight); Virtual Thread không khử giới hạn phần cứng (Heap, Rate limit).
-- Phân tách cấu trúc Vòng hết hạn (Deadline chung hệ Lô) với Hạn mức Ngoại vi Remote Client (Read/Timeout).
-- Tập trung theo dõi hệ thống Đo lường (Metrics): `input_count`, `success_count`, `failure_count`, Cường độ bão hòa Queue (Saturation).
-- Validation Hệ thống: Kiểm chứng Số lượng bản ghi, Định danh không đụng độ, loại bỏ `null`, và đánh giá cấu trúc Đầu Ra có trùng lặp Input.
-- Không phát tán Trạng Thái Biến Thiên (Mutable/Live view) tới Tầng Điều Khiển API.
-- Quét sạch Danh bạ lưu trữ cấu trúc Task sau kỳ xử lý.
-- Khi Remote Task có mang hiệu ứng vật lý, bổ sung đặc tả Khóa Giao Dịch (Idempotency Key).
+- Giới hạn số lượng `Future` bay qua lại (In-flight). Dù bạn có xài Virtual Thread thì RAM vẫn có giới hạn.
+- Đặt thời gian hết hạn của luồng chờ (Deadline lô xử lý) lớn hơn một chút so với thời gian hết hạn mạng (Read timeout) để luồng chính không bị sập trước khi luồng phụ báo kết nối mạng thất bại.
+- Luôn cắm các loại theo dõi (Metrics): Đếm số đầu vào, số lượng thành công, thất bại, và tỷ lệ lấp đầy Queue.
+- Luôn kiểm định lại cuối cùng: Check số lượng records, loại bỏ `null`, xem dữ liệu có bị lặp hay không trước khi trả về cho khách.
+- Khi tác vụ phải đụng đến server người khác hoặc ghi Database (Side-effect), bạn phải chắc chắn gửi kèm một Khóa định danh (Idempotency Key) để phòng trường hợp ứng dụng phải Retry.

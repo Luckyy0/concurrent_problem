@@ -2,9 +2,9 @@
 
 ## Tóm tắt
 
-Hai worker cần giữ đồng thời hai local resource lock. Worker T1 thử `A → B`, còn T2 thử `B → A`. Khi không lấy được lock thứ hai, cả hai "lịch sự" release lock đầu tiên, chờ (backoff) cùng một khoảng thời gian rồi retry. Do hành vi hoàn toàn đối xứng, chúng có thể liên tục va chạm mà không có operation nào hoàn tất.
+Tưởng tượng bạn có hai worker cần lấy hai cái khóa (lock) cùng lúc để làm việc. Anh T1 thử lấy khóa A rồi đến B, còn anh T2 thì thử lấy B rồi đến A. Chuyện gì xảy ra nếu mỗi anh lấy được một khóa? Cả hai đều không lấy được khóa thứ hai, nên rất "lịch sự" nhả khóa đầu tiên ra, chờ một chút rồi thử lại. Khổ nỗi, vì cả hai cùng chờ và cùng thử lại giống hệt nhau, nên cứ va chạm nhau hoài mà chẳng ai làm xong việc cả.
 
-Tình huống bảo vệ các **progress invariant**:
+Để hệ thống thực sự "chạy tiến lên" (progress invariant), chúng ta cần:
 
 ```text
 Mỗi operation phải hoàn tất hoặc trả về một terminal failure trước deadline.
@@ -13,41 +13,41 @@ Mọi lock của attempt thất bại phải được release trước khi retry
 Không thực hiện business mutation trước khi acquire đủ resource.
 ```
 
-> **Nói ngắn gọn:** hệ thống có hoạt động không đồng nghĩa với việc có tiến triển; hai worker có thể liên tục nhường nhau nhưng cùng không tới đích.
+> **Nói ngắn gọn:** Hệ thống trông có vẻ đang bận rộn, nhưng thực ra chả làm được gì sất. Hai worker cứ nhường nhau mãi mà không ai tới đích.
 
 ## Thuật ngữ cần biết
 
 | Thuật ngữ | Giải thích dễ hiểu |
 | --- | --- |
-| livelock | Actor vẫn chạy và chuyển state nhưng không có operation nào hoàn tất |
-| deadlock | Các actor đứng chờ nhau theo vòng (cycle) và không thể tiếp tục chạy |
-| starvation | Một actor trong thời gian dài không được cấp resource dù các actor khác có thể tạo ra tiến triển |
-| progress guarantee | Cam kết operation sẽ hoàn tất hoặc kết thúc trong một giới hạn nhất định |
-| bounded retry | Retry bị giới hạn bởi số attempt và/hoặc deadline |
-| randomized backoff | Thời gian chờ có độ trễ ngẫu nhiên (jitter) để actor không lặp lại cùng nhịp |
-| symmetry breaking | Làm cho actor đưa ra các quyết định khác nhau khi xảy ra conflict |
-| retry budget | Phần deadline hoặc số lượng attempt được phép sử dụng cho retry |
+| livelock | Chương trình vẫn chạy, vẫn đổi state nhưng chả có việc nào xong. Giống như hai người đi ngược chiều cứ nhường đường qua lại hoài. |
+| deadlock | Các luồng (thread) đứng chờ nhau tạo thành vòng tròn, cứng ngắc luôn. |
+| starvation | Một luồng xui xẻo cứ phải chờ hoài không đến lượt, trong khi các luồng khác vẫn tà tà làm việc. |
+| progress guarantee | Lời hứa rằng kiểu gì cái operation này cũng sẽ kết thúc (thành công hoặc báo lỗi) trong thời gian cho phép. |
+| bounded retry | Thử lại nhưng có điểm dừng (giới hạn số lần thử hoặc deadline). |
+| randomized backoff | Chờ một khoảng thời gian ngẫu nhiên để các luồng không bị "đụng hàng" nhau ở lần thử kế tiếp. |
+| symmetry breaking | Làm cách nào đó để các luồng đưa ra quyết định khác nhau khi xảy ra va chạm. |
+| retry budget | Tổng quỹ thời gian hoặc số lần cho phép để thử lại. |
 
 ## Bối cảnh nghiệp vụ
 
-Hai worker cục bộ cần hoán đổi quyền sở hữu (ownership) của hai in-memory channel:
+Ở đây, hai worker đang cố đổi chủ (ownership) của hai in-memory channel cho nhau:
 
-- T1 ưu tiên channel A rồi đến B;
-- T2 ưu tiên channel B rồi đến A;
-- cả hai đều dùng `tryLock` ở chế độ non-blocking để tránh deadlock;
-- khi xảy ra conflict, chúng release ngay lập tức và retry;
-- thời gian chờ cố định (fixed backoff) giống nhau vô tình đồng bộ hoá các lần thử tiếp theo.
+- T1 khoái lấy channel A trước, rồi mới tới B.
+- T2 thì ngược lại, thích lấy B trước, A sau.
+- Cả hai đều xài `tryLock` kiểu không block để né deadlock.
+- Hễ đụng nhau là nhả khóa ra liền rồi thử lại.
+- Oái oăm là cả hai có chung một khoảng thời gian chờ (fixed backoff), vô tình làm chúng nó cứ lặp đi lặp lại nhịp điệu va chạm.
 
 ## Trạng thái dùng chung và contention point
 
-| Thành phần | Giá trị |
+| Thành phần | Dành cho người mới |
 | --- | --- |
-| Shared resource | Lock-A và Lock-B |
-| Actor | Hai worker hoặc request thread |
-| Conflict | Mỗi actor giữ một lock, không lấy được lock còn lại |
-| Lỗi (Broken reaction) | Cùng release, cùng delay, cùng retry |
-| Trạng thái quan sát được (Observable state) | Số lần retry và mức sử dụng CPU tăng nhưng số operation hoàn tất bằng 0 |
-| Phạm vi (Scope) | Một JVM; database retry storm thuộc về `LOCK-002` hoặc `DB-009` |
+| Shared resource | Khóa Lock-A và Lock-B. |
+| Actor | Hai worker (hoặc thread xử lý request). |
+| Conflict | Mỗi anh cầm một khóa, anh nào cũng móm không lấy được khóa còn lại. |
+| Lỗi (Broken reaction) | Cùng nhả khóa, cùng chờ, cùng thử lại một lượt. |
+| Trạng thái quan sát được | CPU chạy vèo vèo, log báo retry liên tục nhưng số việc làm xong bằng 0. |
+| Phạm vi (Scope) | Nằm trong một máy ảo Java (JVM). Đừng nhầm với database retry storm nhé. |
 
 ## Điều hướng
 
@@ -60,20 +60,21 @@ Hai worker cục bộ cần hoán đổi quyền sở hữu (ownership) của ha
 
 ## Hậu quả trên production
 
-- Mức sử dụng CPU và số lần retry cao nhưng throughput bằng 0 hoặc rất thấp;
-- request sử dụng hết deadline trong vòng lặp retry cục bộ (local retry);
-- số lượng log và metric liên quan đến conflict tăng mạnh;
-- hệ thống downstream chưa bị gọi nhưng thread capacity vẫn bị tiêu thụ;
-- retry đồng bộ giữa nhiều request tạo ra làn sóng tranh chấp (contention wave).
+- CPU vọt lên tận nóc, retry đếm không xuể nhưng chả có request nào được xử lý xong.
+- Request cứ bị ngâm trong vòng lặp retry đến khi hết hạn (timeout).
+- Log và metric về conflict tăng đột biến, nhìn báo động đỏ lòm.
+- Dù chưa gọi gì tới hệ thống phía sau (downstream) nhưng thread của bạn đã bị chiếm dụng sạch.
+- Các request rủ nhau retry đồng loạt tạo ra một làn sóng tranh chấp cực lớn.
 
 ## Hướng sửa khuyến nghị
 
-Nếu có thể, hãy dùng một deterministic total order để mọi worker chọn cùng một lock trước; đây là một kỹ thuật symmetry breaking có thể chứng minh được tính đúng đắn. Khi conflict vốn không thể phân định thứ tự (order), hãy dùng bounded attempts, operation deadline và exponential backoff có jitter. Sau khi sử dụng hết ngân sách (budget), trả về lỗi overload hoặc conflict thay vì retry vô hạn.
+Ngon nhất là ép tụi nó lấy khóa theo một thứ tự duy nhất (deterministic total order) - ai cũng phải bốc khóa A trước chẳng hạn. Đây là cách giải quyết gọn gàng, chắc cú. 
+Nếu vì lý do gì đó mà bạn không thể sắp xếp thứ tự, thì bắt buộc phải giới hạn số lần thử lại (bounded attempts), đặt deadline cho operation và thêm chút thời gian chờ ngẫu nhiên (exponential backoff with jitter). Hết "ngân sách" thì quăng lỗi overload hoặc conflict luôn, đừng bắt hệ thống ráng sức dã tràng nữa.
 
 ## Khi nào dùng từng phương án
 
-- Total order: nhiều local lock có khoá định danh duy nhất ổn định (stable unique key).
-- Single owner hoặc queue: resource có thể được tuần tự hoá (serialize) theo ownership.
-- Bounded randomized retry: conflict mang tính tạm thời, operation có tính idempotent và ordering không thể biểu diễn được.
-- Fail-fast hoặc admission control: mức độ contention cho thấy hệ thống đã quá tải (saturated).
-- Database retry policy: conflict thuộc tầng transaction hoặc database, không dùng local loop của tình huống này.
+- **Total order:** Dùng khi các khóa nội bộ có ID duy nhất và ổn định.
+- **Single owner / Queue:** Dùng khi tài nguyên có thể xếp hàng tuần tự giải quyết.
+- **Bounded randomized retry:** Khi va chạm chỉ là tạm thời, việc chạy lại không làm sai dữ liệu và bạn không thể quy định thứ tự lấy khóa.
+- **Fail-fast / Admission control:** Khi hệ thống đã quá tải nặng, từ chối luôn cho lẹ.
+- **Database retry policy:** Xài khi lỗi ở tầng DB hoặc transaction, không dùng cho vòng lặp lấy lock nội bộ kiểu này.

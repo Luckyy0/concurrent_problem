@@ -2,6 +2,8 @@
 
 ## Trạng thái ban đầu
 
+Giả sử ban đầu hệ thống của chúng ta đang có thông số thế này:
+
 ```text
 nextSequence  = 41
 lastCustomerId = null
@@ -10,13 +12,15 @@ T1 input = "alice"
 T2 input = "bob"
 ```
 
-Biểu thức `++nextSequence` nhìn như một câu lệnh, nhưng thực tế gồm ba bước:
+Bạn nhìn dòng code `++nextSequence` có vẻ vô hại như một câu lệnh đơn, nhưng máy ảo nó xử lý thành 3 bước thế này:
 
 ```text
 read nextSequence → add 1 → write nextSequence
 ```
 
 ## Thứ tự thực thi xen kẽ
+
+Chuyện gì xảy ra khi hai ông luồng (thread) chạy song song và tranh nhau xử lý? Nó sẽ giống như vầy:
 
 ```text
 T1: alice                                  T2: bob
@@ -37,115 +41,101 @@ return ReceiptDraft(42, "bob")
 
 ## Kết quả mong đợi và kết quả thực tế
 
+Cái chúng ta hy vọng:
+
 ```text
 Expected:
   alice -> ReceiptDraft(42, "alice")
   bob   -> ReceiptDraft(43, "bob")
   unique sequences = 2
+```
 
+Và đời không như mơ:
+
+```text
 Actual:
   alice -> ReceiptDraft(42, "bob")
   bob   -> ReceiptDraft(42, "bob")
   unique sequences = 1
 ```
 
-Hai quy tắc bắt buộc cùng bị phá:
+Thế là toang cả hai quy tắc sống còn của chúng ta:
+- Cái ID `42` bị lấy xài tận 2 lần vì luồng nọ ghi đè luồng kia (`lost update`).
+- Tội nghiệp cô Alice, bản nháp trả về tự nhiên lại cõng cái tên "bob".
 
-- sequence `42` được cấp phát hai lần vì một cập nhật đã bị ghi đè (`lost update`);
-- dữ liệu khách hàng của T1 bị thay bằng dữ liệu của T2.
-
-> **Nói ngắn gọn:** hai request cùng đọc sequence cũ, sau đó cùng ghi một giá
-> trị mới; đồng thời request B thay thế dữ liệu khách hàng đang được request A sử dụng.
+> **Nói ngắn gọn:** Hai luồng thi nhau đọc con số cũ, thi nhau ghi đè con số mới. Đã vậy ông B còn nhanh tay sửa cái tên trước khi ông A kịp trả kết quả ra ngoài.
 
 ## Nguyên nhân theo từng lớp
 
 ### Vòng đời Spring bean
 
-`@Service` mặc định có singleton scope trong một `ApplicationContext`. Spring
-không tạo service mới cho từng HTTP request và cũng không buộc các lời gọi phương thức
-phải chạy lần lượt. Việc bean được công bố an toàn sau khởi tạo không bảo vệ các
-field tiếp tục bị thay đổi trong lúc xử lý request.
+Class đánh `@Service` trong Spring thì vòng đời mặc định là `singleton` - tức là chỉ có duy nhất 1 cục object. Spring không tạo mới service cho mỗi HTTP request. Do đó, nếu bạn có biến gì trong cục service đó, các request cứ thế mà dùng chung. Spring chỉ đảm bảo lúc khởi tạo nó an toàn thôi, còn lúc request lao vào thì bạn tự lo.
 
 ### JVM và Java Memory Model
 
-Có **tranh chấp dữ liệu** (`data race`) vì hai luồng cùng truy cập một field, ít
-nhất một luồng thực hiện ghi, nhưng không có cơ chế đồng bộ tạo quan hệ
-xảy ra-trước giữa chúng.
+Đây gọi là tình trạng **tranh chấp dữ liệu** (`data race`). Hai luồng cùng sờ vào một biến, có ít nhất một đứa nhảy vào sửa, mà chẳng có khoá (lock) gì cả để xếp hàng.
 
-Hai lỗi độc lập:
+Tổng hợp lại ta có hai cái lỗi bự:
+1. `++nextSequence` tưởng là một bước nhưng lại là 3 bước đọc-sửa-ghi, nên rất dễ đụng hàng.
+2. `lastCustomerId` đáng lẽ phải là đồ riêng của từng request, bạn lại đem lưu vào biến chung, đợi lúc đọc lại thì nó đã bị đứa khác sửa mất tiêu rồi.
 
-1. `++nextSequence` là thao tác read-modify-write không nguyên tử;
-2. `lastCustomerId` là dữ liệu request được lưu trong field dùng chung rồi đọc lại sau
-   một khoảng xen kẽ (interleaving).
-
-Chuỗi thao tác gây lỗi chính xác là:
+Quá trình "phá hoại" diễn ra theo trình tự này:
 
 ```text
 shared field write → interleaving → compound update/read shared field
 ```
 
-Vì vậy, nguyên nhân không chỉ là “có nhiều request cùng lúc”, mà là các request
-cùng sửa trạng thái qua một chuỗi không nguyên tử.
+Tóm lại, không phải cứ có đông request mới sinh lỗi, mà là do các request nhảy vào sửa trạng thái chung mà không thèm "đóng cửa phòng" lại.
 
 ### Spring transaction, Hibernate và database
 
-Case này không truy cập database nên không có persistence context, MVCC hoặc
-row lock. Ngay cả khi method có `@Transactional`, mỗi request vẫn chạy trong một
-transaction riêng nhưng cùng truy cập Java object. Database rollback cũng không
-khôi phục giá trị của field trong Java heap.
+Trong ví dụ này chúng ta không dùng DB, nên mấy cái xịn xò như `persistence context`, `MVCC` hay `row lock` đều vứt. Dù bạn có quăng `@Transactional` vào thì mỗi request vẫn mở một transaction riêng, nhưng chúng lại trỏ về cùng cái object trên RAM. Database có rollback đi nữa thì mấy cái biến trên Java heap cũng chẳng thể quay về giá trị cũ đâu.
 
 ## Ảnh hưởng của commit, rollback, timeout và crash
 
-- **Commit/rollback:** không áp dụng cho các field cục bộ; không có transaction log
-  để phục hồi chúng.
-- **Ngoại lệ (Exception):** nếu phương thức lỗi sau khi tăng sequence, sequence bị bỏ trống;
-  không tự rollback.
-- **Timeout/retry:** phía gọi (client) thử lại sẽ tạo một bản nháp mới; đây không phải là
-  luồng công việc an toàn khi lặp lại (idempotent workflow).
-- **Tiến trình gặp sự cố/khởi động lại:** bộ đếm cục bộ trở về giá trị ban đầu và có thể tái sử
-  dụng sequence cũ.
+- **Commit/rollback:** Nó chỉ tác dụng với database thôi. Mấy biến cục bộ chạy trên RAM không có "sổ ghi nợ" (transaction log) để khôi phục đâu.
+- **Lỗi (Exception):** Nếu hệ thống đang đếm sequence lên mà bị dính lỗi cái ầm, số đó sẽ bị hụt mất, và không ai thèm rollback lại.
+- **Timeout/retry:** Request bị timeout, client bấm gọi lại (retry), hệ thống lại đẻ ra thêm một bản nháp mới tinh. Vụ này không chuẩn `idempotent` (chạy lại n lần vẫn ra 1 kết quả) chút nào.
+- **Sập nguồn/Restart:** Bùm, bộ đếm trên RAM quay về số không, và thế là nó lại lôi mấy sequence cũ ra cấp lại từ đầu.
 
-Các đặc tính này cho thấy bộ đếm cục bộ không phù hợp làm định danh nghiệp vụ bền vững.
+Đấy, bạn thấy biến bộ đếm trên RAM lỏng lẻo cỡ nào chưa? Đừng bao giờ dùng nó để tạo ID quan trọng nhé.
 
 ## Khi có nhiều application instance
 
-Nếu production có hai application instance:
+Bây giờ sếp bắt chạy hệ thống ra 2 máy chủ (node) khác nhau:
 
 ```text
 App A: nextSequence = 41, monitor/AtomicLong A
 App B: nextSequence = 41, monitor/AtomicLong B
 ```
 
-Ngay cả khi dùng `synchronized` hoặc `AtomicLong`, hai node vẫn có thể cấp cùng
-sequence. Cơ chế phối hợp cục bộ chỉ có hiệu lực trong JVM đang sở hữu nó.
+Dù bạn có nhét `synchronized` hay xài `AtomicLong` khét lẹt trên code, thì cả 2 máy chủ cũng vẫn cấp ra cái sequence y chang nhau thôi! Ổ khoá nhà ông A làm sao mà khoá cửa nhà ông B được?
 
-> **Nói ngắn gọn:** khóa trong App A không khóa được code đang chạy ở App B.
+> **Nói ngắn gọn:** Khoá cục bộ (local lock) không có cửa khi chạy đa máy chủ.
 
 ## Hậu quả
 
 ### Hậu quả kỹ thuật
 
-- trùng lặp sequence và mất cập nhật (lost update);
-- rò rỉ dữ liệu chéo giữa các request;
-- log và dữ liệu tương quan không đáng tin;
-- hành vi thay đổi theo bộ lập lịch (scheduler);
-- không có cam kết phục hồi sau sự cố.
+- Mất cập nhật, sequence trùng nhau rần rần;
+- Dữ liệu bị cắm sừng, râu ông nọ cắm cằm bà kia;
+- Nhìn log chẳng khác gì nồi cám heo, không truy vết được;
+- Bug này "hên xui" theo lịch trình chạy của hệ điều hành, có lúc bị lúc không;
+- Server sập phát là bay sạch dữ liệu.
 
 ### Hậu quả nghiệp vụ
 
-- khách hàng nhận bản nháp chứa định danh của khách hàng khác;
-- hệ thống phía sau (downstream) khi loại bỏ trùng lặp/tương quan có thể gộp sai thao tác;
-- kiểm toán và tái hiện sự cố sai;
-- rủi ro riêng tư nếu field dùng chung chứa dữ liệu nhạy cảm.
+- Khách hàng hốt hoảng khi thấy dữ liệu của người khác trong tài khoản mình;
+- Dữ liệu rác đẩy xuống các hệ thống liên quan gây loạn cào cào;
+- Việc điều tra sự cố gặp bế tắc vì log ghi sai bét;
+- Rò rỉ dữ liệu (data leak) cực kỳ nguy hiểm.
 
 ## Vì sao lỗi khó tái hiện bằng kiểm thử đơn vị thông thường
 
-Một kiểm thử đơn vị (unit test) tuần tự luôn tạo ra thứ tự hoàn chỉnh:
+Nếu bạn chỉ viết unit test tuần tự kiểu:
 
 ```text
 call A hoàn tất → call B bắt đầu
 ```
 
-Test như vậy không tạo được cửa sổ giữa bước đọc và bước ghi. Kiểm thử hồi quy
-cần barrier hoặc latch để chủ động điều phối thứ tự xen kẽ; xem
-[phần kiểm thử](experiments.md).
+Thì làm sao bạn chọc đúng vào cái tích tắc giữa bước đọc và bước ghi được? Để móc được cái lỗi luồng này ra ánh sáng, bạn phải dùng các chiêu trò ép ép (barrier, latch) để các luồng đụng nhau đúng thời điểm. Bí kíp nằm ở [phần kiểm thử](experiments.md) nhé!

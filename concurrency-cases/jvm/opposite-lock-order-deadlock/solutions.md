@@ -38,9 +38,9 @@ public final class OrderedLocalTransferService {
 }
 ```
 
-`accountId` phải là duy nhất, bất biến và dùng cùng comparator ở mọi nơi gọi (call site). Thứ tự acquire không còn phụ thuộc hướng chuyển. Việc thay đổi (mutation) balance chỉ chạy sau khi có cả hai lock; tiến hành release theo thứ tự ngược.
+Mẹo của các bậc thầy: So sánh chuỗi ID để xếp hạng. Thằng ID nhỏ luôn bị khóa trước. Làm thế thì dù chuyển tiền qua hay lại, lộ trình đi qua lock đều giống nhau tăm tắp, chả bao giờ kẹt được! Cập nhật dữ liệu thì cứ đợi khi cầm chắc cả 2 lock rồi hẵng làm. Nhớ unlock theo trình tự ngược lại lúc lock.
 
-> **Nói ngắn gọn:** thứ tự chuẩn biến hai hướng chuyển thành cùng một đường đi qua đồ thị lock, nên không thể tạo cạnh chờ ngược.
+> **Nói ngắn gọn:** Đặt quy tắc xếp hàng cố định sẽ xoá sổ tình trạng kẹt xe.
 
 ## Giải pháp 2: định hướng kết hợp với acquire có thể ngắt và giới hạn thời gian
 
@@ -81,31 +81,31 @@ public boolean transferWithin(
 }
 ```
 
-Các hàm hỗ trợ (helper) chọn thứ tự ID và thay đổi trạng thái giống giải pháp 1; exception là một lỗi nghiệp vụ (domain exception) kế thừa `RuntimeException`. Thời hạn chung ngăn tổng thời gian chờ bị nhân đôi. Yêu cầu vượt thời gian chờ sẽ release lock đã giữ và phía gọi quyết định thử lại; không thử lại bên trong khoảng giữ lock.
+Vẫn xài ID để xếp hàng, nhưng ta "lên đồ" thêm time out (thời gian giới hạn chờ). Nếu ngâm quá lâu thì nhả cờ rồi làm ván khác. Đảm bảo an toàn không để client phải mòn mỏi.
 
 ## Phương án 3: một lock chung (coarse lock)
 
-Một private final monitor cho toàn registry sẽ loại bỏ chu trình nhiều lock và dễ chứng minh, nhưng nó chạy tuần tự các thao tác chuyển trên các account không liên quan. Phù hợp với trạng thái nhỏ, contention thấp; không mở rộng ra khỏi một JVM.
+Dùng một cái lock to đùng khóa luôn cả sổ. Cách này không lo kẹt xe nhưng hiệu năng bèo bọt vì làm tuần tự từng đơn hàng một. Khuyên dùng cho trường hợp bé xíu xiu, ít tranh chấp.
 
 ## Phương án 4: không giữ nhiều lock
 
-Phân chia account theo single owner, gửi lệnh qua hàng đợi hoặc tác nhân (actor), hoặc đổi mô hình trạng thái để một coordinator thực hiện thay đổi. Cách này loại bỏ tình trạng hold-and-wait nhưng sẽ thay đổi kiến trúc, độ trễ và ngữ nghĩa khi có lỗi (failure semantics).
+Xài hàng đợi (queue) hoặc Actor. Thay vì chia lẻ thì bắt một anh điều phối xử lý lần lượt. Sẽ phải đập đi xây lại cấu trúc, nhưng khỏi lo hold-and-wait.
 
 ## So sánh đánh đổi
 
 | Phương án | Tránh deadlock (Deadlock prevention) | Độ trễ (Latency) | Thông lượng (Throughput) | Độ phức tạp | Multi-node |
 | --- | --- | --- | --- | --- | --- |
-| Total order + `lock()` | Phá chu trình chờ vòng tròn (circular wait) | Có thể chờ khi contention cao | Các account độc lập có thể chạy song song | Thấp | Không |
-| Order + timed `tryLock` | Phòng ngừa + giới hạn thời gian chờ | Có thời hạn và tự chối | Có chi phí thử lại (retry overhead) | Vừa | Không |
-| Coarse lock | Chỉ dùng một lock | Gây chặn ở hàng đợi (Head-of-line blocking) | Thấp hơn | Rất thấp | Không |
-| Actor/single owner | Không giữ nhiều lock | Phụ thuộc vào hàng đợi (Queueing) | Dựa vào số phân vùng (partition) | Cao | Cần giao thức riêng |
+| Total order + `lock()` | Chặn đứng kẹt xe | Lúc đông thì hơi lâu | Xử lý các tài khoản rời thì mượt | Thấp | Không |
+| Order + timed `tryLock` | Chặn + có mốc thời gian | Tự huỷ khi quá lâu | Tốn chi phí thử lại | Vừa | Không |
+| Coarse lock | Một lock cân tất | Tắc đường cục bộ dài | Tốc độ chậm | Siêu dễ | Không |
+| Actor/single owner | Khỏi xin xỏ nhiều | Phụ thuộc vào Hàng đợi | Dựa vô thiết kế cấu trúc | Khá khoai | Phải có giao thức riêng |
 
 ## Thử lại và chính sách trên production
 
-- Chỉ thử lại sau khi đã dọn dẹp, sử dụng thời hạn thao tác và giới hạn số lượt thử.
-- Khoảng lùi (Backoff) cần có độ trễ ngẫu nhiên (jitter) để tránh hai tác nhân tái va chạm.
-- Không thử lại các lỗi do không đủ balance hoặc validation thất bại.
-- External side effect cần khóa lũy đẳng (idempotency key).
-- Số liệu: thời gian chờ lock, số timeout, số lượt thử lại, số lượng detector và khoảng thời gian chạy critical-section.
-- Thread dump phải lưu stack của owner và waiter khi có sự cố.
-- Không dùng giải pháp local cho việc chuyển tiền trên database; xem tình huống `DB-008` và các trường hợp ngân hàng.
+- Rớt đài thì nhớ dọn dẹp trước khi thử lại. Giới hạn số lần thôi.
+- Nhớ chờ một khoảng ngẫu nhiên (jitter) rồi hẵng chui vào lại.
+- Lỗi hết tiền hay nhập sai thì đừng có thử lại làm gì cho mệt xác.
+- Thao tác thì phải có khóa lũy đẳng (idempotency key) cho chắc.
+- Metric đầy đủ: chờ bao lâu, rớt bao lần...
+- Chết thì phải có thread dump kẹp theo.
+- Lên production bằng Database thì đừng chơi chiêu này nhé, Database nó lo được.

@@ -1,6 +1,8 @@
 # Giải pháp ordering, bounded retry và chính sách bảo đảm progress
 
-## Giải pháp 1: deterministic lock ordering
+## Giải pháp 1: Sắp xếp thứ tự lấy khóa (Deterministic lock ordering)
+
+Đây là chiêu "ăn tiền" nhất. Thay vì mạnh ai nấy lấy, mình bắt buộc tụi nó phải xếp hàng. 
 
 ```java
 package com.example.channel;
@@ -11,11 +13,13 @@ public final class OrderedChannelSwapService {
         if (left == right) {
             return;
         }
+        // So sánh ID để xác định ai lớn ai nhỏ
         int comparison = left.channelId().compareTo(right.channelId());
         if (comparison == 0) {
             throw new IllegalArgumentException("channelId must be unique");
         }
 
+        // Đứa nào nhỏ hơn thì ưu tiên lấy trước
         Channel first = comparison < 0 ? left : right;
         Channel second = first == left ? right : left;
 
@@ -23,6 +27,7 @@ public final class OrderedChannelSwapService {
         try {
             second.lock().lock();
             try {
+                // Đủ 2 khóa rồi mới bắt đầu đổi
                 String owner = left.owner();
                 left.changeOwner(right.owner());
                 right.changeOwner(owner);
@@ -36,13 +41,13 @@ public final class OrderedChannelSwapService {
 }
 ```
 
-Cả hai hướng gọi (call direction) sử dụng chung một thứ tự (order), do đó không còn xảy ra symmetric collision. Đây là lựa chọn mặc định khi resource có khoá định danh duy nhất ổn định (stable unique key).
+Bất kể T1 hay T2 gọi swap kiểu gì, mã code này cũng ép cả hai phải tranh nhau cái khóa "đứng trước" (dựa theo thứ tự từ điển của ID). Không bao giờ có chuyện đụng nhau ngớ ngẩn (symmetric collision) nữa. Chỉ xài được chiêu này khi dữ liệu của bạn có ID cố định và duy nhất nhé.
 
-> **Nói ngắn gọn:** việc phân định thứ tự (ordering) khiến một actor phải chờ ở cửa đầu tiên, nhường cho actor thắng cuộc lấy cửa thứ hai và hoàn tất công việc.
+> **Nói ngắn gọn:** Sắp xếp thế này khiến một anh phải đợi anh kia làm xong mới được vô cửa, trị dứt điểm cái bệnh "nhường nhau" vớ vẩn.
 
-## Giải pháp 2: bounded randomized backoff
+## Giải pháp 2: Giới hạn số lần thử và chờ ngẫu nhiên (Bounded randomized backoff)
 
-Khi conflict không thể bị loại bỏ thông qua total order, cơ chế retry phải được cấu hình một terminal budget:
+Lỡ xui mà không thể sắp xếp thứ tự thì sao? Thì xài chiêu "Retry có ý thức" - thử lại nhưng có giới hạn, không chày cối.
 
 ```java
 public SwapOutcome trySwap(
@@ -55,9 +60,11 @@ public SwapOutcome trySwap(
     if (timeout.isZero() || timeout.isNegative() || maxAttempts <= 0) {
         throw new IllegalArgumentException("invalid retry budget");
     }
+    // Chốt deadline
     long deadline = System.nanoTime() + timeout.toNanos();
 
     for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Có ai gọi giật ngược (interrupt) không?
         if (Thread.currentThread().isInterrupted()) {
             return SwapOutcome.INTERRUPTED;
         }
@@ -78,13 +85,17 @@ public SwapOutcome trySwap(
         }
 
         long remaining = deadline - System.nanoTime();
+        // Hết giờ hoặc hết lượt thì nghỉ
         if (remaining <= 0 || attempt == maxAttempts) {
             return SwapOutcome.CONTENDED;
         }
+        
+        // Chờ lâu dần đều, nhưng có mức trần
         long cap = Math.min(
                 remaining,
                 Math.max(1, backoffCapNanos(attempt))
         );
+        // Random để trật nhịp với thằng kia
         long delay = random.nextLong(cap);
         LockSupport.parkNanos(delay);
     }
@@ -92,28 +103,26 @@ public SwapOutcome trySwap(
 }
 ```
 
-`backoffCapNanos` sử dụng thuật toán tính toán theo cấp số mũ có giới hạn (saturating/capped exponential calculation), không sử dụng phép dịch bit (shift) để tránh gây ra lỗi overflow. Đối tượng `RandomGenerator` được inject vào để phục vụ cho các bài kiểm tra mang tính tất định. Nếu một interrupt xảy ra bên trong `parkNanos`, vòng lặp tiếp theo sẽ trả về `INTERRUPTED` và không thực hiện xoá cờ interrupt (clear interrupt flag).
+Hàm `backoffCapNanos` sẽ tính toán thời gian chờ tăng dần (mũ), nhưng được gài trần để không bị tràn số (overflow). Truyền vào cục `RandomGenerator` cũng tiện lợi nếu bạn muốn viết test mô phỏng cứng. Khác với cách 1, cách này chỉ mang tính xui rủi (giảm thiểu khả năng va chạm) chứ không chắc 100% là chia đều phần (fairness) cho các thread đâu nhé.
 
-Random backoff giúp giảm xác suất va chạm, trong khi deadline và giới hạn attempt (attempt cap) sẽ bảo đảm việc dừng vòng lặp (termination). Nó không đảm bảo fairness cho từng actor.
+## Giải pháp 3: Chỉ định một Owner duy nhất hoặc xài Queue
 
-## Giải pháp 3: single owner hoặc queue
-
-Một bộ điều phối (coordinator) sẽ sở hữu cả hai channel và xử lý các lệnh hoán đổi (swap command) một cách tuần tự. Bằng cách này, hệ thống không còn các vòng lặp multi-lock retry, nhưng bù lại sẽ cần quản lý queueing, tính sẵn sàng của owner (owner availability) và các chính sách backpressure. Phương pháp này phù hợp khi các yếu tố như fairness hoặc việc kiểm toán (audit) quan trọng hơn so với parallel mutation.
+Cách này là bạn gom mọi request ném vào một hàng đợi (Queue), sau đó có một anh Coordinator đứng ra lần lượt lấy từng cặp xử lý. Thế là dẹp luôn nỗi lo kẹt khóa! Bù lại, hệ thống của bạn sẽ chạy chậm đi một chút vì phải xếp hàng, và bạn phải tốn công quản lý thêm mớ lùng bùng của Queue. Phù hợp cho những hệ thống cần tính tuần tự, dễ theo dõi (audit) hơn là hì hục chạy song song.
 
 ## So sánh đánh đổi
 
-| Phương án | Progress | Latency | Fairness | Complexity |
+| Phương án | Khả năng tiến triển (Progress) | Độ trễ (Latency) | Độ công bằng (Fairness) | Độ phức tạp |
 | --- | --- | --- | --- | --- |
-| Total lock order | Loại bỏ symmetric cycle | Chờ khi có contention | Theo lock scheduler | Thấp |
-| Bounded jitter retry | Có terminal deadline, tỷ lệ success mang tính xác suất | Biến động | Không bảo đảm | Vừa |
-| Fair/coarse lock | Không xảy ra retry collision | Chờ trong queue | Có thể tốt hơn | Thấp-vừa |
-| Single owner queue | Tuần tự, có tính quan sát (observable) | Xếp hàng trong queue | Policy rõ ràng | Cao hơn |
+| Lock order theo thứ tự | Hết cửa kẹt luôn | Phải chờ nếu đông | Hên xui tùy hệ điều hành | Dễ òm |
+| Retry có deadline + Jitter | Dừng khi hết hạn, hên xui mới thành công | Giật cục, biến động | Không có | Vừa vừa |
+| Single owner / Queue | Xử lý lần lượt, dễ theo dõi | Phải xếp hàng nên hơi trễ | Rất rõ ràng | Phức tạp hơn |
 
 ## Chính sách retry và vận hành trên production
 
-- Ưu tiên các biện pháp ngăn chặn mang tính cấu trúc (structural prevention) trước khi thực hiện điều chỉnh retry (retry tuning).
-- Chỉ thực hiện retry đối với các trường hợp conflict đã được phân loại; không retry với các lỗi validation hoặc business failure.
-- Sử dụng chung một deadline, có bounded attempt, jitter và admission control.
-- Không giữ lock trong thời gian backoff; không thực hiện side effect trước khi quá trình acquire hoàn tất toàn bộ (full acquisition).
-- Các số liệu (metric) cần theo dõi: tỷ lệ attempt trên success, exhausted, interrupted, delay, lock conflict và completed state version.
-- Thực hiện load test đối với các symmetric hot key; phát cảnh báo (alert) khi tỷ lệ attempt trên completion tăng lên trong khi throughput không thay đổi.
+Để ăn ngon ngủ yên khi đẩy code lên Prod:
+- Nếu sửa được tận gốc bằng cấu trúc (như cách 1) thì múc ngay, đừng đâm đầu vào tinh chỉnh hàm retry.
+- Phân biệt rõ loại lỗi nào mới cần retry. Đừng có lỗi rành rành ra đó (kiểu sai nghiệp vụ) mà cũng đem đi retry thì toang.
+- Bắt buộc phải có: Deadline chung, giới hạn số lần thử, chờ ngẫu nhiên (jitter).
+- Tuyệt đối không ôm khóa trong lúc ngồi chờ (backoff); và không đụng chạm dữ liệu khi chưa nắm đủ bộ khóa.
+- Theo dõi sát sao: Lượng retry/success, có đụng khóa nhiều không, CPU có thở nổi không.
+- Nhớ stress-test với các khóa nóng (hot key); cài báo động (alert) nếu thấy tỉ lệ retry tăng vụt mà tỉ lệ thành công vẫn giậm chân tại chỗ.

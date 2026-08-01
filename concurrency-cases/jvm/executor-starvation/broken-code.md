@@ -2,7 +2,7 @@
 
 ## 1. Tác Vụ Cha Chờ Đợi Tác Vụ Con Trên Chung Một Executor
 
-Đoạn mã bộc lộ rõ tư duy thiết kế luồng sai lệch:
+Đoạn code dưới đây cho thấy sai lầm điển hình khi làm việc với luồng:
 
 ```java
 @Service
@@ -28,7 +28,7 @@ public class BrokenEnrichmentService {
 }
 ```
 
-Và tại thượng tầng (Caller), yêu cầu tiếp tục bị đóng gói đệ trình:
+Ở phía gọi (Caller), người ta lại bọc thêm một lớp nữa:
 
 ```java
 // Tác vụ Cha chiếm dụng Luồng Công Nhân đầu tiên
@@ -36,7 +36,7 @@ Future<EnrichedOrder> result = enrichmentExecutor.submit(
         () -> enrichmentService.enrich(order));
 ```
 
-Khảo sát cấu hình Cấu trúc Pool/Hàng đợi phổ biến:
+Cùng xem cấu hình Pool thường gặp:
 
 ```java
 new ThreadPoolExecutor(
@@ -46,22 +46,23 @@ new ThreadPoolExecutor(
 );
 ```
 
-Kịch bản sụp đổ: Hai Tác vụ Cha lao vào chiếm giữ hoàn toàn hai Luồng Công Nhân. Cả hai nhả hai Tác vụ Con vào Hàng đợi. Lập tức, cả hai Tác vụ Cha tự phong tỏa bằng lệnh `get()` vô thời hạn. Sức chứa khổng lồ 100 của Hàng đợi chỉ làm chậm thời điểm phát lệnh Từ chối (Rejection); Nó tuyệt đối không có năng lực tự sinh ra Luồng Công Nhân mới để cứu vớt các Tác vụ Con.
+**Kịch bản sập nguồn:** Hai request Cha vào giành mất 2 luồng công nhân. Cả 2 ném tiếp 2 việc Con xuống hàng đợi. Rồi 2 anh Cha gọi `get()` và đứng im. Hàng đợi có 100 chỗ chỉ làm hệ thống báo lỗi chậm hơn thôi, chứ không tự đẻ ra luồng mới để chạy mấy việc Con kia được.
 
-> **Nguyên tắc kỹ thuật:** Hàng đợi có giới hạn (Bounded queue) là lá chắn bảo vệ Bộ nhớ (Memory), nhưng nó hoàn toàn vô hại đối với một Đồ thị Phụ thuộc (Dependency graph) khuyết tật, nơi mà một tác vụ đang chạy lại treo sinh mạng vào một tác vụ bị xếp vế sau chính nó.
+> **Mẹo nhỏ:** Hàng đợi giới hạn (Bounded queue) giúp chống tràn RAM, nhưng chả có tác dụng gì nếu luồng đang chạy lại đi ngóng luồng đang xếp hàng.
 
 ## 2. Các Phương Án Sửa Lỗi Tạm Bợ Cần Tránh (Insufficient Fixes)
 
-- **Tăng Quy Mô Pool/Queue Tùy Hứng:** Dưới áp lực tải cao, hệ thống rốt cuộc cũng sẽ va phải bức tường bế tắc cũ, chỉ là tốn thêm tài nguyên vô ích.
-- **Xóa Bỏ Giới Hạn Hàng Đợi (Unbounded Queue):** Che giấu triệu chứng Từ chối, đổi lấy thảm họa Phình to Độ trễ (Latency) và Sập Bộ nhớ (Memory).
-- **Trang Bị Hạn Mức Cho Khối Chờ (`get(timeout)`):** Cô lập sự cố tốt hơn, song vẫn phung phí Luồng Công Nhân và sinh ra chuỗi biến động Timeout/Retry hỗn loạn (Churn).
-- **Áp Dụng Chính Sách `CallerRunsPolicy` Mù Quáng:** Có thể ngẫu nhiên ép Tác vụ Con chạy nối tiếp (Inline) và phá vỡ cấu trúc bế tắc trong một vài nhịp độ (Timing) may mắn, nhưng gây nhiễu loạn hoàn toàn Độ trễ và Đặc tính bám luồng (Thread-affinity); Đây không phải là một chiến lược thiết kế nền tảng (Design proof).
-- **Lạm Dụng Luồng Ảo (Virtual Thread) Không Kiểm Soát:** Nên nhớ rằng, bất chấp số lượng Luồng Ảo, các cấu trúc Tương tác Ngoại vi (External dependency) vẫn bị trói buộc bởi Hạn Mức Tải (Quota).
-- **Tách Cấu Trúc Pool Nhưng Thiếu Giảm Áp (Backpressure):** Nếu cho phép Pool của Tác vụ Cha phình to hơn năng lực xử lý của Tác vụ Con mà không có cơ chế hãm phanh, Hàng đợi của Tác vụ Con sẽ nhanh chóng rơi vào trạng thái Ách Tắc (Bão hòa).
+- **Tăng Pool/Queue mù quáng:** Khi tải tăng lên, hệ thống vẫn sẽ kẹt như cũ, chỉ tốn thêm RAM vô ích thôi.
+- **Dùng hàng đợi vô hạn (Unbounded Queue):** Giấu đi lỗi từ chối, nhưng hệ thống sẽ càng lúc càng chậm và dễ văng lỗi Out of Memory.
+- **Thêm Timeout cho `get()` (`get(timeout)`):** Đỡ kẹt cứng hơn, nhưng vẫn phí tài nguyên luồng và gây ra bão Retry làm rối hệ thống.
+- **Dùng `CallerRunsPolicy`:** Thỉnh thoảng may mắn ép được luồng hiện tại chạy luôn tác vụ Con, giúp phá bế tắc, nhưng nó làm rối loạn hoàn toàn thời gian phản hồi. Đừng dùng nó như cách sửa lỗi tận gốc.
+- **Dùng Luồng Ảo (Virtual Thread) bừa bãi:** Luồng ảo rẻ thật, nhưng request ra ngoài (ví dụ gọi DB) vẫn bị giới hạn quota kết nối.
+- **Tách Pool nhưng không hãm phanh (Backpressure):** Pool Cha đẩy việc quá nhanh mà Pool Con xử lý không kịp thì hàng đợi Pool Con vẫn chết ngập.
 
 ## 3. Tiền Đề Kích Hoạt Lỗ Hổng (Conditions for Replication)
 
-1. Số lượng Tác vụ Cha đang thi hành đạt tới giới hạn tổng số Luồng Công Nhân.
-2. Mỗi Tác vụ Cha tự tay ném ít nhất một Tác vụ Con vào chính Executor đang giam giữ nó.
-3. Tác vụ Cha tự khóa bản thân chờ Tác vụ Con.
-4. Không có bất kỳ Luồng Công Nhân nào thoát vòng lặp, hoặc không có cơ chế Timeout/Cancel can thiệp.
+Lỗi này sẽ nổ khi hội tụ đủ 4 yếu tố:
+1. Số lượng tác vụ Cha đang chạy lấp đầy số luồng tối đa của Pool.
+2. Cha ném tác vụ Con vào chung cái Pool đó.
+3. Cha gọi hàm để ngồi chờ Con hoàn thành.
+4. Không có luồng nào rảnh rỗi, và cũng chẳng có Timeout hay Cancel nhảy vào cứu bồ.

@@ -2,17 +2,17 @@
 
 ## 1. Chiến Lược Kiểm Thử (Testing Strategy)
 
-Mô hình kiểm định khai thác 3 lớp phòng ngự:
+Để test vụ này, mình sẽ dùng 3 chiêu như sau:
 
-1. Thiết lập kịch bản đan xen luồng nhằm ép cấu trúc lỗi sinh ra dư thừa tài nguyên (2 Resource) cho chung 1 Key định danh.
-2. Giả lập hiệu ứng bầy đàn (Mass actors) triệu gọi trực diện `computeIfAbsent` để thẩm định rằng cơ chế Factory chỉ bị kích hoạt 1 lần duy nhất.
-3. Kịch bản đánh giá quy trình gỡ bỏ đối tượng Điền Trống (Placeholder) trong trường hợp hệ thống sụp đổ (Failed), mở đường cho tiến trình Thử lại (Retry).
+1. Ép các luồng chạy đan xen nhau để cố tình tạo ra tình huống 1 Key đẻ ra tới 2 tài nguyên.
+2. Dùng một "bầy" luồng (Mass actors) lao vào gọi hàm `computeIfAbsent` cùng lúc để xem thử Factory có bị gọi lố hơn 1 lần không.
+3. Test kịch bản luồng cắm mỏ neo (Placeholder) nhưng bị lỗi giữa chừng xem nó có biết tự nhổ mỏ neo đi để luồng sau còn vào được không.
 
-Không vận hành `Testcontainers` do trạng thái cấu trúc này giới hạn nghiêm ngặt trong phạm vi Java Heap. Toàn bộ các mỏ neo điều phối (latch, barrier, future) bắt buộc cấp thiết lập ngắt thời gian (timeout); cấm tuyệt đối cơ chế `Thread.sleep` thay thế logic luồng.
+Bài này mình không cần xài tới `Testcontainers` (do lỗi nằm trong bộ nhớ Java thôi). Chú ý là mọi chỗ đứng đợi (như latch, barrier) đều phải cài thời gian chờ tối đa (timeout) nhé. Tuyệt đối không dùng `Thread.sleep()` để mô phỏng luồng chạy.
 
 ## 2. Thí Nghiệm 1: Định Hình Cơ Chế Thất Thoát (Deterministic Lost Update)
 
-Thiết kế mô phỏng (Factory Barrier) trì hoãn các tiến trình cho tới khi 2 luồng cùng giao cắt vào vùng `open(...)`. Bằng chứng đanh thép xác định 2 luồng đã cùng "Nhìn thấy" Key vắng mặt trước khi kịp thực thi `put`:
+Mình sẽ viết một cái rào cản (Barrier) ngầm để ép 2 luồng bị kẹt lại ngay lúc chuẩn bị gọi hàm `open(...)`. Mục đích là làm cho cả 2 luồng cùng thấy Map đang rỗng trước khi kịp lưu vào:
 
 ```java
 package com.example.registry;
@@ -48,13 +48,13 @@ class BrokenManagedResourceRegistryConcurrencyTest {
             ManagedResource second = secondFuture.get(5, TimeUnit.SECONDS);
             ManagedResource stored = registry.find("tenant-a");
 
-            // Xác thực: Hệ thống phải gánh chịu 2 lần tạo tài nguyên
+            // Rành rành là Factory bị gọi 2 lần (lỗi nặng)
             assertEquals(2, factory.openCalls());
-            // Ảo ảnh: Map chỉ ghi nhận 1
+            // Nhưng check Map thì thấy size = 1 (Lừa đảo thật!)
             assertEquals(1, registry.size());
-            // Cảnh báo: Các luồng trả về 2 kết quả hoàn toàn phân kỳ
+            // 2 luồng nhận về 2 object khác hẳn nhau
             assertNotSame(first, second);
-            // Một đối tượng bị loại trừ ra khỏi Registry vĩnh viễn
+            // Một đối tượng bị bỏ rơi, không nằm trong Map
             assertTrue(stored == first || stored == second);
             assertEquals(
                     1,
@@ -78,7 +78,7 @@ class BrokenManagedResourceRegistryConcurrencyTest {
         public ManagedResource open(String resourceKey) {
             int call = calls.incrementAndGet();
             bothCallsEntered.countDown();
-            await(bothCallsEntered); // Giam lỏng để chờ luồng 2
+            await(bothCallsEntered); // Bắt thằng 1 đứng đợi thằng 2 vô luôn rồi mới chạy tiếp
             return new TestResource(resourceKey + "-" + call);
         }
 
@@ -106,13 +106,13 @@ class BrokenManagedResourceRegistryConcurrencyTest {
 }
 ```
 
-Quan sát thấy chỉ số `map.size() == 1` là một lời nói dối ngụy trang, không thể khẳng định code chạy đúng. Nòng cốt cần khẳng định: Factory đã kích hoạt trái phép 2 lần và chỉ một Caller nhận được tài nguyên còn chịu sự giám sát.
+Kết quả: Chỉ check `map.size() == 1` thì chả nói lên được gì cả. Chỗ chết là Factory bị gọi 2 lần và có 1 object rác nằm trôi nổi ngoài kia.
 
-> **Nguyên tắc kỹ thuật:** Không kiểm định việc Map có bị biến dạng vật lý, mà phải kiểm định khâu cấp phát tài nguyên có rò rỉ và có bị xóa sổ danh tính quản trị khỏi Registry hay không.
+> **Nguyên tắc kỹ thuật:** Đừng chỉ chăm chăm soi xem Map có lưu đúng 1 dòng hay không. Bạn phải test xem có bị đẻ lố tài nguyên và rò rỉ hay không mới quan trọng.
 
 ## 3. Thí Nghiệm 2: Đánh Giá Phương Thức computeIfAbsent
 
-Tạo đợt tấn công từ 32 luồng độc lập đồng bộ thời khắc kích hoạt (Start point). Rào cản Factory chủ đích kéo dãn cửa sổ rủi ro, tuy nhiên phải đảm bảo chỉ định duy nhất 1 Luồng thành công vượt ải:
+Giờ mình tạo ra tận 32 luồng để spam cùng lúc vào 1 Key. Dùng cái rào cản chặn lại để hở toang cái cửa sổ lỗi ra. Nhưng kết quả phải là chỉ có 1 luồng duy nhất được tạo tài nguyên:
 
 ```java
 package com.example.registry;
@@ -165,7 +165,7 @@ class ManagedResourceRegistryConcurrencyTest {
             }
 
             assertTrue(ready.await(5, TimeUnit.SECONDS));
-            start.countDown(); // Phát động đồng thanh
+            start.countDown(); // Phát súng ra lệnh cả 32 thằng cùng xông lên
             assertTrue(attemptingRegister.await(5, TimeUnit.SECONDS));
             assertTrue(factory.openEntered.await(5, TimeUnit.SECONDS));
             factory.allowOpenToFinish.countDown();
@@ -173,11 +173,11 @@ class ManagedResourceRegistryConcurrencyTest {
 
             assertTrue(failures.isEmpty());
             assertEquals(actors, results.size());
-            // Tuyệt đối chỉ 1 luồng lọt qua
+            // Tuyệt đối chỉ 1 thằng được gọi Factory
             assertEquals(1, factory.openCalls());
             assertEquals(1, registry.size());
 
-            // 100% Caller trả về duy nhất 1 Định danh tham chiếu
+            // Đảm bảo 32 anh em đều xài chung 1 object
             ManagedResource expected = results.peek();
             assertTrue(results.stream().allMatch(result -> result == expected));
         } finally {
@@ -228,7 +228,7 @@ class ManagedResourceRegistryConcurrencyTest {
 
 ## 4. Thí Nghiệm 3: Thẩm Định Năng Lực Hồi Phục Khối FutureTask
 
-Kịch bản thiết lập: Tác vụ kiến tạo đổ vỡ ngay vòng 1 nhưng phục hồi ở vòng 2. Hệ thống bắt buộc phải giải trừ khối Placeholder độc hại trước khi đón luồng thứ 2.
+Mình giả vờ test vụ nhổ mỏ neo: Lần 1 gọi lỗi cố ý, lần 2 gọi thì phải tạo thành công. Chứng tỏ mỏ neo lỗi ở lần 1 đã bị nhổ bỏ.
 
 ```java
 @Test
@@ -244,13 +244,13 @@ void removesFailedPlaceholderBeforeNextAttempt() {
 
     var registry = new FutureManagedResourceRegistry(flakyFactory);
 
-    // Kích hoạt ngoại lệ Lần Đầu
+    // Lần đầu quăng lỗi
     assertThrows(
             ResourceRegistrationException.class,
             () -> registry.register("tenant-a")
     );
 
-    // Cơ chế gỡ chốt thành công - Phục hồi tiến trình
+    // Lần sau chạy lại ngon lành, mỏ neo đã bị xoá
     ManagedResource recovered = registry.register("tenant-a");
 
     assertEquals("tenant-a-ready", recovered.id());
@@ -258,41 +258,41 @@ void removesFailedPlaceholderBeforeNextAttempt() {
 }
 ```
 
-Môi trường Production yêu cầu hoàn thiện thêm cấu trúc đa Caller đồng loạt hứng chịu Exception từ một Future, kết hợp cấu hình Retry Policy giới hạn cấp số nhân thay vì thả nổi vòng lặp.
+Trong thực tế, bạn cần làm khắt khe hơn: Quản lý xem đám luồng đang đứng đợi có cùng nhận được cái lỗi này không, và nhớ chỉnh Policy để tự động thử lại kiểu thời gian tăng dần (exponential backoff).
 
 ## 5. Kiểm Định Các Phương Án Kiến Trúc Khác
 
 ### Cơ Chế `putIfAbsent` Cùng Cleanup
-Dùng khối Factory có khả năng đếm (open/close counter) và đánh giá:
+Bạn viết cái Factory có thêm bộ đếm (tạo bao nhiêu lần, đóng bao nhiêu lần). Nếu test ngon nó sẽ ra vầy:
 ```text
 open count   = 2
 close count  = 1
 registry size = 1
-Mọi Caller quy tụ vào đúng phiên bản hợp pháp của Registry
+Mọi người đều dùng 1 object giống hệt nhau
 ```
-Cảnh báo: Nếu hàm đếm `close count == 0`, hệ thống đã rò rỉ bất kể Map chỉ bảo lưu 1 tài nguyên.
+Cảnh báo: Nếu bạn soi thấy `close count == 0` là hiểu luôn rồi đấy, rác vẫn đang đầy đầy ngoài kia kìa!
 
 ### Khối Độc Quyền `synchronized`
-Thiết lập 2 Key độc lập để quan sát độ trễ bị Serialization hóa. Đánh giá này đo đếm mức độ suy giảm Thông lượng (Contention trade-off), không phân định tiêu chí Correctness.
+Muốn test cái này, bạn gọi 2 Key hoàn toàn khác nhau cùng lúc. Bạn sẽ thấy thằng đằng sau phải đợi thằng đằng trước chạy xong mới được chạy. Nghĩa là hiệu suất rất tệ, nhưng chắc chắn là đúng (không có chuyện tạo lố tài nguyên).
 
 ## 6. Giám Sát Môi Trường Khai Thác (Production Metrics)
 
-Các thông số cần đo lường liên tục:
+Lên server thực tế thì nhớ đo lường mấy thứ này để còn biết mà đỡ:
 
-- Biến đếm: Số vòng đời thực thi hàm Factory dựa trên chuẩn `resourceKey`.
-- Độ lệch số lượng Active Resource thực tế so sánh với Registry Size.
-- Số vụ Cleanup Failure (Hủy tài nguyên dư thất bại).
-- Quỹ thời gian Caller nằm chờ cho các Request cùng Key.
-- Khối lượng báo lỗi Mapping Function kích hoạt tiến trình Retry.
-- Theo dõi Thread/Socket/File descriptor sau các đợt tăng tải đột biến (Traffic spike).
+- Xem Factory nó được gọi bao nhiêu lần cho cùng 1 key.
+- Có bao nhiêu tài nguyên thực tế đang sống so với số lượng báo cáo trong Map.
+- Báo động ngay lập tức nếu hàm Cleanup bị lỗi.
+- Người dùng (caller) phải đứng chờ bao lâu cho cùng 1 Key.
+- Đếm số lần Factory lỗi khiến luồng sau phải Retry lại từ đầu.
+- Trực tiếp soi xem Thread/Socket/File descriptor có bị nhảy múa bất thường sau mỗi lần tải cao hay không.
 
-Khai báo Log bắt buộc chứa `resourceKey`, định danh tài nguyên (resource ID) và kết quả đăng ký; Chống chỉ định ghi log định dạng mã hóa Credential hoặc Tenant secret.
+Khi ghi log, nhớ ghi luôn cái `resourceKey`, cái ID của tài nguyên và kết quả. Tuyệt đối không lưu log mấy cái nhạy cảm như Mật khẩu hay Chuỗi khoá bảo mật của Khách hàng nhé!
 
 ## 7. Khung Tiêu Chuẩn Thực Nghiệm (Quality Checklist)
 
-- [x] Broken test phơi bày lỗi 2 lệnh gọi Factory mà không dùng ngắt `sleep`.
-- [x] Test Phương án Đúng phải truy vết chỉ một cuộc gọi Factory và đồng bộ Định danh duy nhất (Object Identity).
-- [x] Mọi thao tác chờ buộc phải cấp phép Timeout.
-- [x] Bộ thử nghiệm đánh giá sự cố Tài Nguyên Rò Rỉ (Orphan), không dựa vào kết quả `map.size()`.
-- [x] Đánh giá đầy đủ năng lực Tự phục hồi hệ thống khi dùng khối Placeholder.
-- [x] Loại trừ nền tảng `Testcontainers` vì cơ chế hoàn toàn xoay quanh hệ Java Semantics.
+- [x] Test ra được cái lỗi 2 thằng gọi Factory bằng rào cản luồng (không dùng trò ngủ `sleep` gian lận).
+- [x] Chạy cách giải pháp đúng thì thấy Factory chỉ gọi đúng 1 lần, các anh em cầm đúng 1 ID.
+- [x] Mấy cục đợi như latch/barrier đều có gắn ngòi nổ thời gian (Timeout).
+- [x] Tập trung rình rập vụ rò rỉ rác (tài nguyên lọt lưới), chả thèm quan tâm cái `map.size()`.
+- [x] Test kỹ năng "Tự phục hồi" sau cú vấp ngã khi xài Placeholder.
+- [x] Hất cẳng `Testcontainers` ra khỏi danh sách vì lỗi này xử lý nguyên tuý trong não của Java (Heap).

@@ -2,8 +2,7 @@
 
 ## Giải pháp 1: CAS trên một BudgetState bất biến (immutable)
 
-Gom hai counter vào một object bất biến và chỉ công bố state bằng CAS trên một
-`AtomicReference`.
+Chiêu này cực hay: gom cả hai biến đếm vào chung một cái object bất biến (không thể sửa đổi sau khi tạo). Xong rồi chỉ dùng `AtomicReference` để cập nhật cả cục này thông qua CAS.
 
 ```java
 package com.example.connection;
@@ -51,10 +50,12 @@ public class ProviderConnectionBudget {
                 return false;
             }
 
+            // Tạo state mới dựa trên state cũ
             BudgetState next = new BudgetState(
                     current.active(),
                     current.pending() + 1
-            );
+                );
+            // Thử chốt đơn, ai nhanh tay thì thắng
             if (state.compareAndSet(current, next)) {
                 return true;
             }
@@ -121,33 +122,26 @@ public class ProviderConnectionBudget {
 }
 ```
 
-### Vì sao invariant được bảo vệ
+### Vì sao cách này lại xịn?
 
-- `BudgetState` chứa một snapshot nhất quán của cả hai counter.
-- Bước kiểm tra limit và quá trình reserve dùng chung một state; quá trình CAS thành công là linearization point.
-- Transition pending-to-active được công bố bằng một quá trình hoán đổi tham chiếu (reference swap) và bảo toàn `used`.
-- Thread thua cuộc (loser) trong CAS sẽ đọc lại state mới nhất trước khi đưa ra quyết định.
-- `view()` đọc reference một lần, không ghép các counter từ hai thời điểm khác nhau.
-- Tình trạng underflow bị từ chối thay vì âm thầm tạo ra capacity giả.
+- `BudgetState` luôn giữ một bức ảnh (snapshot) cực kỳ chính xác và đồng bộ của cả 2 biến đếm.
+- Thao tác check limit và giữ chỗ diễn ra cùng lúc trên một trạng thái duy nhất. Cú CAS ăn điểm chính là "khoảnh khắc quyết định" (linearization point).
+- Chuyển từ pending sang active diễn ra cái vèo qua một lần tráo đổi (swap), tổng số vé luôn được bảo toàn nguyên vẹn.
+- Nếu thread nào thao tác trễ nhịp (thua CAS), nó tự động đọc lại số mới nhất rồi tính tiếp.
+- `view()` chỉ lấy snapshot đúng 1 lần, không còn vụ ghép 2 con số từ 2 thời điểm khác nhau.
+- Không sợ biến đếm bị âm lén lút, vì sai là nó báo lỗi (throw exception) liền.
 
-> **Nói ngắn gọn:** muốn atomicity cho một quy tắc gồm nhiều field, hãy thực hiện CAS một state
-> chứa đủ các field đó, không CAS từng mảnh riêng lẻ.
+> **Nói ngắn gọn:** Muốn an toàn cho bộ quy tắc gồm nhiều biến, cứ bỏ chung tụi nó vào 1 gói rồi dùng CAS cả gói. Đừng có táy máy update lẻ tẻ từng món.
 
-### Điều kiện của CAS loop
+### Điều kiện của vòng lặp CAS
 
-`operation.apply(current)` có thể chạy lại nhiều lần nếu CAS thất bại, nên lambda phải
-không có side-effect. Việc log “connection activated”, phát hành sự kiện (publish event) hoặc gọi remote API
-chỉ được thực hiện sau khi transition thành công, ở bên ngoài hàm có khả năng retry (retryable function).
+Hàm `operation.apply(current)` có thể bị gọi đi gọi lại mấy vòng liền nếu bị tranh giành. Thế nên, cấm tuyệt đối việc bỏ code có "tác dụng phụ" (side-effect) vào đây. Viết log, gửi sự kiện (event), hay gọi API ngoài thì chờ hàm transition chạy xong xuôi, cầm chắc phần thắng rồi hẵng làm nhé.
 
-CAS bảo vệ invariant tổng hợp (aggregate invariant) nhưng không xác nhận định danh (identity) của callback. Nếu
-một callback xử lý trường hợp reservation thất bại chạy hai lần trong khi một reservation khác vẫn đang
-pending, lần chạy thứ hai có thể lấy nhầm slot của reservation kia. Khi callback có
-thể duplicate/out-of-order, cần một permit handle hoặc state machine cho reservation.
+Nhược điểm: CAS ngon nhưng nó vẫn không nhận diện được từng giao dịch (identity). Nếu một cái callback xui xẻo chạy đúp 2 lần, nó vẫn có thể trừ nhầm slot của anh khác. Muốn trị dứt điểm cái này phải dùng thẻ cấp phép (permit handle) hoặc state machine đính kèm ID.
 
-## Giải pháp 2: một ReentrantLock bảo vệ toàn bộ state
+## Giải pháp 2: Một cái ổ khóa (ReentrantLock) bảo vệ tất cả
 
-Lock là lựa chọn rõ ràng khi quá trình transition phức tạp hoặc cần tính công bằng (fairness). Dùng plain
-`int`; không cần AtomicInteger ở bên trong cùng một lock.
+Lock là giải pháp cực kỳ dễ thở khi nghiệp vụ đổi trạng thái rối rắm hoặc bạn cần phân định rõ ràng trước sau (fairness). Đã dùng lock rồi thì mấy biến bên trong xài `int` thường là đủ, vứt `AtomicInteger` đi cho rảnh.
 
 ```java
 @Component
@@ -214,17 +208,13 @@ public class LockedProviderConnectionBudget {
 }
 ```
 
-`connectionClosed()` phải dùng chung một lock và kiểm tra `active > 0`; đoạn method đó
-được lược đi vì giống `creationFailed()`. Remote handshake luôn chạy ở bên ngoài lock.
-Không giữ lock trong quá trình xử lý network I/O.
+Hàm `connectionClosed()` thì tương tự như `creationFailed()` thôi, mình cắt đi cho gọn. Chú ý: Kết nối mạng, gọi API từ xa thì **tuyệt đối phải làm bên ngoài khối lock** nhé. Khóa rồi mới gọi API, mạng nó rớt cái là cả đám chết đứng chôn chân chờ nhau.
 
-Nếu cần thời gian chờ có giới hạn (bounded wait), hãy dùng `tryLock(timeout, unit)`, xử lý
-`InterruptedException`, khôi phục trạng thái ngắt (interrupt status) và định nghĩa rõ việc lock timeout
-là một sự từ chối hay là lỗi kỹ thuật.
+Nếu muốn đợi một chút rồi thôi, xài `tryLock(timeout, unit)` và nhớ xử lý ngắt (interrupt) tử tế.
 
-## Giải pháp 3: một AtomicInteger cho tổng số used slots
+## Giải pháp 3: Một AtomicInteger quản lý mọi slot
 
-Nếu tính đúng đắn (correctness) chỉ phụ thuộc vào tổng số lượng slot, hãy giảm bớt phần state cần synchronize:
+Nếu cuối cùng bạn cũng ngộ ra rằng cái bạn quan tâm duy nhất là "Tổng vé là bao nhiêu?", thì hãy dẹp bớt sự rườm rà đi:
 
 ```java
 public final class AtomicSlotBudget {
@@ -265,14 +255,11 @@ public final class AtomicSlotBudget {
 }
 ```
 
-Quá trình tạo connection giữ lại slot từ lúc pending đến lúc active; việc transition không
-đụng chạm tới counter. Các số liệu (metric) Active/pending có thể được theo dõi riêng như một khả năng quan sát (observability)
-xấp xỉ, nhưng không được đưa ngược vào để quyết định việc phân bổ capacity.
+Từ pending sang active thì cũng kệ tía nó, tổng vẫn y chang nên mình chả cần đụng vô counter làm gì. Muốn vẽ vời active/pending thì đếm riêng chỉ để hóng chuyện (observability) thôi, đừng lấy nó ra làm luật.
 
-## Giải pháp 4: Semaphore và permit handle
+## Giải pháp 4: Chơi hẳn Semaphore và vé thông hành (permit handle)
 
-`Semaphore` mô hình hóa capacity một cách trực tiếp. Một permit được giữ xuyên suốt quá trình pending và
-active, rồi được release đúng một lần thông qua một handle:
+`Semaphore` thì đúng sinh ra để mô phỏng "sức chứa" rồi. Lấy 1 vé, giữ đó xài từ lúc pending cho tới active, xong xuôi thì nhả ra (release) đúng 1 lần:
 
 ```java
 public final class ConnectionPermit implements AutoCloseable {
@@ -286,6 +273,7 @@ public final class ConnectionPermit implements AutoCloseable {
 
     @Override
     public void close() {
+        // Có thả vé ngàn lần thì cũng chỉ nhả 1 lần thôi nha cưng
         if (released.compareAndSet(false, true)) {
             semaphore.release();
         }
@@ -314,54 +302,45 @@ public final class SemaphoreConnectionBudget {
 }
 ```
 
-Quá trình tạo connection thất bại sẽ gọi `permit.close()`. Khi quá trình tạo thành công, connection object
-sở hữu permit đó và tự đóng nó lại trong vòng đời (lifecycle) `close()`. `AtomicBoolean` làm cho quá trình duplicate
-close trở thành no-op và ngăn chặn việc over-release.
+Với trò dùng `AtomicBoolean` ở trên, ai có trót tay gọi close 2 lần thì hệ thống vẫn tỉnh rụi (no-op), đảm bảo không nhả thừa vé.
 
-Semaphore giải quyết bài toán về tổng capacity, không tự cung cấp snapshot phân tách active/pending.
-Một fair semaphore có thể giảm tình trạng đói tài nguyên (starvation) nhưng thường làm giảm thông lượng (throughput); chỉ nên bật khi
-tính công bằng (fairness) là một yêu cầu (requirement) đã được đo lường cẩn thận.
+Semaphore tập trung vào tổng thể, nó không phân loại rành rọt pending hay active. Bạn có thể bật chế độ công bằng (fair semaphore) để tránh mấy thanh niên chen lấn, nhưng đánh đổi lại thì hiệu suất (throughput) sẽ rớt thê thảm. Chú ý nhé.
 
 ## So sánh các đánh đổi
 
-| Phương án | Invariant | Thread thua cuộc (Loser) | Contention/fairness | Khả năng quan sát (Observability) | Multi-instance |
+| Phương án | Bảo vệ quy tắc (Invariant) | Kẻ thua vòng lặp (Loser) | Tranh chấp/Công bằng | Độ hóng chuyện (Observability) | Dùng nhiều máy |
 | --- | --- | --- | --- | --- | --- |
-| `AtomicReference<BudgetState>` | Chính xác trên nhiều counter | CAS retry rồi reject nếu đã đầy (full) | Lock-free, không đảm bảo fairness | Snapshot active/pending chính xác | Chỉ một JVM |
-| `ReentrantLock` | Chính xác trên nhiều counter/transition | Bị block hoặc timeout | Có thể cấu hình fairness | Có snapshot nếu lấy dưới lock | Chỉ một JVM |
-| Một `AtomicInteger used` | Chính xác trên tổng lượng slot | CAS retry rồi reject | Đơn giản, không đảm bảo fairness | Việc chia tách chi tiết (breakdown) chỉ nên là metric phụ | Chỉ một JVM |
-| `Semaphore` + handle | Chính xác theo permit lifecycle | `tryAcquire` fail hoặc chờ với một bounded wait | Fair/non-fair tùy theo cấu hình | Chỉ biết lượng permit khả dụng, không có breakdown | Chỉ một JVM |
-| Hai `AtomicInteger` độc lập | Không bảo vệ được compound invariant | Có thể có nhiều actor cùng thắng | Nhanh nhưng sai | Snapshot không có tính nhất quán | Chỉ một JVM |
+| `AtomicReference<BudgetState>` | Cực chuẩn xác cho nhiều biến | Chạy lại CAS rồi báo Full | Chớp nhoáng, không rảnh xếp hàng | Xem active/pending cực chuẩn | 1 máy JVM |
+| `ReentrantLock` | Chuẩn đét, bao trọn gói | Bị chặn hoặc chờ đợi mỏi mòn | Có thể setup bắt xếp hàng | Dữ liệu đúng nếu lấy trong lock | 1 máy JVM |
+| Một `AtomicInteger used` | Chuẩn đét phần tổng vé | Chạy lại CAS rồi báo Full | Đơn giản, không xếp hàng | Chia active/pending chỉ mang tính minh họa | 1 máy JVM |
+| `Semaphore` + vé thông hành | Chuẩn theo chu kỳ vé | Fail hoặc ngồi chờ có hạn | Bật/tắt xếp hàng tùy ý | Chỉ biết còn nhiêu vé, chả biết trạng thái | 1 máy JVM |
+| Dùng 2 cái `AtomicInteger` (Code lỗi) | Thua, vứt vô sọt rác | Vài thằng cùng nghĩ mình thắng | Nhanh đấy nhưng sai lè | Số liệu lộn xộn, ghép nối bậy bạ | 1 máy JVM |
 
-Không có thông số cụ thể chung nào cho throughput/latency. Việc lựa chọn nên dựa trên contention thực tế,
-mức độ phức tạp của transition, tính fairness và mức quan trọng của exact breakdown.
+Cứ đo đạc tình hình thực tế rồi hẵng chốt hạ. Đừng cố đấm ăn xôi theo lý thuyết.
 
-## Các chính sách về Failure, retry và lifecycle
+## Các chính sách về Lỗi (Failure), thử lại (retry) và vòng đời (lifecycle)
 
-- Giữ chỗ (reserve) trước khi thực hiện handshake; nếu không còn slot, hãy fail-fast hoặc đưa vào queue có giới hạn.
-- Handshake phải có thời gian timeout; trường hợp thất bại (failure) phải thực hiện release pending/permit đúng một lần.
-- Trường hợp thành công (success) sẽ chuyển quyền sở hữu (ownership) của reservation đó sang cho connection.
-- Quá trình đóng (close) phải idempotent; các callback trùng lặp không được release slot thuộc về vòng đời của reservation khác.
-- Việc CAS retry chỉ được phép bao quanh các quá trình transition cục bộ; tuyệt đối không đặt remote call vào bên trong một vòng lặp CAS loop.
-- Nếu cập nhật state thành công nhưng quá trình phát hành sự kiện (publish event) thất bại, hãy retry event đó một cách độc lập;
-  không được chạy lại transition một cách mù quáng.
+- Xin số (reserve) xong xuôi mới đi bắt tay. Không có số thì báo lỗi liền hoặc cho vào hàng đợi xíu xiu.
+- Bắt tay (Handshake) nhớ phải có timeout; lỡ đứt gánh thì nhả vé pending ra cho người khác xài.
+- Nếu thành công, sang tên vé đó cho cái kết nối chính thức xài.
+- Lúc đóng cửa (close) thì gọi mấy lần cũng kệ nó; đừng có kiểu gọi trùng mà đi nhả nhầm vé của thằng khác.
+- Lặp CAS thì chỉ ôm mấy thứ chạy lẹ trong máy; còn gọi API đi xa thì vứt ra ngoài lặp, cấm cãi.
+- Nếu update state ngon lành mà lỡ bước báo cáo sự kiện (event) bị xịt, thì lo đi retry cái event đó thôi. Đừng khùng mà rã nguyên khối state ra chạy lại.
 
-## Khi nào nên dùng
+## Khi nào nên dùng chiêu gì
 
-- Chọn `AtomicReference` khi yêu cầu cần có exact active/pending snapshot.
-- Chọn lock khi code cần ưu tiên mức độ dễ chứng minh, có nhiều transition phức tạp hoặc cần tính năng condition.
-- Chọn single counter/semaphore khi capacity permit mới chính là invariant cốt lõi.
-- Thêm một định danh cho reservation (reservation identity) khi các callback có thể bị retry hoặc out-of-order.
-- Chuyển sang sự điều phối tập trung bên ngoài (external coordination) nếu quota được dùng chung giữa nhiều node.
+- Xài `AtomicReference` nếu sếp bắt phải coi rành rọt active với pending mọi lúc mọi nơi.
+- Xài lock (ReentrantLock) khi quy tắc đổi chác nhức đầu quá, hoặc phải đảm bảo công bằng. Code dễ bảo trì hơn vạn lần.
+- Xài biến đếm tổng (single counter) hoặc semaphore khi thứ cốt lõi nhất chỉ là "nhà còn bao nhiêu chỗ?".
+- Ném thêm cái ID vào nếu sợ mấy cái callback chạy loăng quăng không đúng thứ tự.
+- Qua nhà hàng xóm (Redis, ZooKeeper...) nếu cục quota đó cần xài chung cho chục cái server.
 
-## Lưu ý khi áp dụng thực tế
+## Lưu ý khi ra trận (áp dụng thực tế)
 
-- Số liệu (Metric): `active`, `pending`, `used`, `limit`, số lượng bị từ chối, số lần retry CAS,
-  số lượng timeout/failure trong quá trình handshake và các lần đóng trùng lặp (duplicate close).
-- Tạo cảnh báo (alert) khi `used > limit` hoặc số counter bị âm; đây là những vi phạm invariant, không chỉ
-  đơn giản là metric bất thường.
-- Ghi lại nhật ký (log) các quá trình transition thất bại kèm theo mã định danh vòng đời/reservation, không log các thông tin xác thực (credential).
-- Endpoint health check phải đọc từ một state snapshot, không được gọi liên tiếp nhiều getter độc lập.
-- Giới hạn thời gian (duration) pending; những reservation bị treo quá lâu phải bị timeout và dọn dẹp.
-- Không tự động “sửa” counter bằng cách set lại về mức limit; cần phải điều tra vấn đề về rò rỉ vòng đời (lifecycle leak) và
-  đối soát lại với connection owner.
-- Khi diễn ra shutdown, ngừng nhận các reservation mới rồi tiến hành đóng có kiểm soát các active connection; state cục bộ không cần tính bền vững để rollback (durable rollback).
+- Sắm đủ bộ đo lường: `active`, `pending`, `used`, limit, tỷ lệ chối từ, số lần retry CAS, số lần timeout.
+- Cài còi báo động (alert) liền nếu `used > limit` hoặc số tự dưng âm (dấu hiệu của cái bug bự chứ hông phải chuyện giỡn).
+- Ghi log đàng hoàng mấy cú sập kèm theo ID giao dịch, nhưng nhớ che giấu token đồ đạc (credential) lại nhé.
+- Cái hàm check health chỉ nên chớp nhoáng chụp một tấm ảnh (snapshot) là ra về, đừng rảnh mà ngồi đọc lẻ tẻ từng con số.
+- Cái nào pending quá hạn thì mạnh tay dọn dẹp (cleanup), đừng để nó chiếm dụng vô duyên.
+- Không có chơi trò "hacker lỏ" tự reset counter về ban đầu nha, hãy truy lùng thằng nào đang leak vòng đời (lifecycle leak).
+- Khi server tắt máy đi ngủ (shutdown), khóa cửa không nhận khách (reserve) nữa rồi cho bà con đang active từ từ rời sân. Khỏi cần tốn công lưu trữ (durable rollback) làm chi.

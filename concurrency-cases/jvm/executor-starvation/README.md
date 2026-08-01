@@ -2,44 +2,44 @@
 
 ## 1. Tóm tắt vấn đề (Overview)
 
-Thiết lập một bộ điều phối giới hạn (Bounded executor) sở hữu 2 luồng công nhân (worker). Hệ thống phát sinh hai tác vụ cha (parent task) chiếm dụng toàn bộ cả hai luồng này. Mấu chốt sai lầm nằm ở việc mỗi tác vụ cha tiếp tục đẩy (submit) các tác vụ con (child task) ngược trở lại chính bộ điều phối đó và tự đưa mình vào trạng thái đóng băng chờ đợi qua lệnh `Future.get()`. 
-Kết quả: Các tác vụ con bị dồn vào hàng đợi (queue) nhưng hoàn toàn không còn bất kỳ luồng công nhân nào rảnh rỗi để xử lý chúng. Hệ thống sụp đổ vào trạng thái **đói tài nguyên (starvation)** mặc dù không hề tồn tại bất kỳ vòng lặp khóa (lock cycle) kinh điển nào.
+Tưởng tượng em có một đội 2 công nhân (Bounded executor với 2 threads). Có 2 công việc lớn (tác vụ cha) được giao cho họ, thế là cả 2 anh công nhân đều bận. Nhưng ngặt nỗi, mỗi anh lại tự tạo thêm một việc nhỏ (tác vụ con) quăng lại vào hàng đợi của chính đội mình và đứng im đợi kết quả (`Future.get()`).
+Kết quả là gì? Các việc nhỏ thì nằm chờ dưới hàng đợi, còn 2 anh công nhân thì cứ đứng ngóng việc nhỏ hoàn thành. Chẳng ai chịu nhúc nhích! Hệ thống bị **đói tài nguyên (starvation)** dù không hề bị dính deadlock theo kiểu truyền thống.
 
-Quy tắc Bất biến (Business Invariant) yêu cầu nghiêm ngặt:
+Một số quy tắc bắt buộc (Business Invariant):
 
 ```text
-- Các tác vụ đã được tiếp nhận (Accepted work) bắt buộc phải vươn tới một trong ba trạng thái: hoàn tất, thất bại hoặc bị hủy bỏ, trong giới hạn Hạn mức thời gian vận hành (Operation deadline).
-- Tuyệt đối cấm luồng công nhân tự khóa chờ một tác vụ con mà tác vụ con đó chỉ có thể được thi hành trên chính bộ điều phối đã cạn kiệt tài nguyên (exhausted executor) này.
-- Hàng đợi (Queue) bắt buộc phải có giới hạn (bounded), và trạng thái quá tải (overload) phải có chính sách từ chối (rejection) / giảm áp (backpressure) minh bạch.
-- Tín hiệu hủy tác vụ (Task cancellation) phải được truyền dẫn xuyên suốt xuống các luồng phụ thuộc đang nằm chờ.
+- Các tác vụ đã nhận thì phải xong, fail hoặc bị hủy trong một khoảng thời gian nhất định (deadline).
+- Tuyệt đối không cho phép công nhân tự khóa mình lại để chờ một tác vụ con nằm trong chính cái hàng đợi đang hết chỗ đó.
+- Hàng đợi phải có giới hạn. Nếu quá tải thì phải có chính sách từ chối hoặc ép giảm tốc độ (backpressure) rõ ràng.
+- Hủy tác vụ thì phải báo cho các luồng bên dưới biết để dừng theo.
 ```
 
-> **Nguyên tắc kỹ thuật:** Hàng đợi còn không gian trống không bảo chứng cho việc hệ thống còn khả năng tiến bước; các luồng công nhân đang chiếm giữ tài nguyên hệ thống rất có thể chính là nguyên nhân phong tỏa các tác vụ đang mòn mỏi chờ đợi dưới hàng đợi.
+> **Mẹo nhỏ:** Hàng đợi còn chỗ không có nghĩa là mọi thứ đang chạy ổn. Nhiều khi mấy anh công nhân đang ngậm tài nguyên mới chính là nguyên nhân chặn đứng các tác vụ khác đó.
 
 ## 2. Các Thuật ngữ Chuyên ngành (Terminology)
 
-| Thuật ngữ | Ý nghĩa trong ngữ cảnh |
+| Thuật ngữ | Hiểu đơn giản là |
 | --- | --- |
-| Ách tắc (`saturation`) | Mọi luồng công nhân đều bận rộn và sức chứa tiếp nhận tác vụ mới đã cạn kiệt. |
-| Đói tài nguyên (`starvation`) | Tác vụ bị tước đoạt quyền cấp phát luồng/tài nguyên, không thể tiếp tục thực thi. |
-| Chờ lồng nhau (`nested blocking`) | Luồng công nhân ủy thác tác vụ con rồi tự đóng băng để chờ đồng bộ kết quả từ chính tác vụ con đó. |
-| Giảm áp (`backpressure`) | Ép bộ phận sản xuất (Producer) giảm tốc hoặc từ chối dịch vụ thay vì tích tụ hàng đợi vô hạn độ. |
-| Chính sách từ chối (`rejection policy`) | Giao thức xử lý khi hệ thống Pool/Queue từ chối tiếp nhận thêm tác vụ. |
-| Kiểm soát đầu vào (`admission control`) | Hàng rào định mức số lượng tiến trình được phép xâm nhập vào hệ thống. |
-| Độ trễ hàng đợi (`queueing delay`) | Khoảng thời gian chết mà tác vụ phải chịu đựng trong hàng đợi trước khi được thi hành. |
-| Ngân sách độ trễ (`latency budget`) | Tổng hạn mức thời gian của toàn bộ yêu cầu, không phải mốc thời gian quá hạn lẻ tẻ của từng bước. |
+| Ách tắc (`saturation`) | Mọi người đều bận, không nhận thêm việc được nữa. |
+| Đói tài nguyên (`starvation`) | Tác vụ bị "bỏ đói", không được cấp luồng chạy nên cứ kẹt mãi. |
+| Chờ lồng nhau (`nested blocking`) | Anh công nhân giao việc xong tự đứng im chờ kết quả từ chính việc đó. |
+| Giảm áp (`backpressure`) | Bắt mấy ông đẩy việc chậm lại bớt, hoặc từ chối luôn chứ không ôm rơm nặng bụng. |
+| Chính sách từ chối (`rejection policy`) | Cách xử lý khi Pool/Queue quyết định nói "Không" với tác vụ mới. |
+| Kiểm soát đầu vào (`admission control`) | Hàng rào chặn cửa, giới hạn số lượng request được vào hệ thống. |
+| Độ trễ hàng đợi (`queueing delay`) | Thời gian tác vụ phải "ngồi chơi xơi nước" trong hàng đợi. |
+| Ngân sách độ trễ (`latency budget`) | Tổng thời gian tối đa cho toàn bộ quá trình, không phải tính lẻ tẻ từng bước. |
 
 ## 3. Bối cảnh nghiệp vụ (Business Context)
 
-Hệ thống xử lý lệnh làm giàu dữ liệu hàng loạt (Batch enrichment) vận hành tác vụ cha trên `enrichmentExecutor`. Tác vụ cha lại tiếp tục nhồi các tác vụ con định giá (pricing) hoặc hồ sơ (profile) vào cùng một không gian Pool và gọi lệnh `get`. Với giới hạn Pool Size là 2, chỉ cần hai yêu cầu song song là đủ khả năng đóng băng toàn bộ hệ thống luồng công nhân.
+Hệ thống cần làm giàu dữ liệu hàng loạt. Tác vụ cha chạy trên `enrichmentExecutor` rồi đẩy các tác vụ con như định giá (pricing) vào chung một Pool và gọi `get`. Vì Pool chỉ có 2 luồng, chỉ cần 2 request tới cùng lúc là hệ thống "đứng hình" ngay lập tức.
 
-| Thành phần | Vai trò và Trạng thái |
+| Thành phần | Nó làm gì và đang ở đâu? |
 | --- | --- |
-| Tài nguyên chia sẻ | Vị trí Luồng (Worker slots) và Hàng đợi giới hạn (Bounded queue) |
-| Tác vụ Cha (Parent) | Đang vận hành (RUNNING) nhưng đóng băng tại khối chờ Child Future |
-| Tác vụ Con (Child) | Đang xếp hàng (QUEUED), khao khát luồng công nhân của cùng hệ thống Pool |
-| Vòng lặp bế tắc | Cha giam giữ Luồng chờ Con; Con kẹt dưới Hàng đợi chờ Luồng |
-| Phạm vi | Ranh giới một máy ảo JVM; Nạn đói kết nối JDBC thuộc chuyên đề `SPR-007` |
+| Tài nguyên chia sẻ | Luồng công nhân (Worker slots) và Hàng đợi (Bounded queue). |
+| Tác vụ Cha (Parent) | Đang chạy nhưng bị treo cứng ngắc vì chờ Child Future. |
+| Tác vụ Con (Child) | Đang xếp hàng dài chờ đến lượt mình được chạy. |
+| Vòng lặp bế tắc | Cha ôm luồng chờ Con; Con nằm hàng đợi chờ Luồng. Deadlock! |
+| Phạm vi | Trong phạm vi một máy ảo JVM. (Lỗi tương tự với JDBC thì xem `SPR-007`). |
 
 ## 4. Điều hướng Tài liệu (Navigation)
 
@@ -51,11 +51,11 @@ Hệ thống xử lý lệnh làm giàu dữ liệu hàng loạt (Batch enrichme
 
 ## 5. Tác Động Tới Hệ Thống (Production Impact)
 
-Hàng loạt Yêu cầu bốc hơi vì quá hạn (Timeout), hàng đợi phình to vô độ, tín hiệu từ chối (Rejection) phản hồi quá muộn, dữ kiện luồng/ngữ cảnh (Context) bị giam hãm, kéo theo bão Thử lại (Retry storm). Cảnh báo: Mức tiêu thụ CPU có thể tụt xuống cực thấp, khiến các bảng giám sát (Dashboard) báo hiệu "CPU bình thường" che đậy hoàn toàn một cuộc khủng hoảng sụp đổ hệ thống (Outage) đang diễn ra.
+Hàng tá request sẽ chết vì timeout, hàng đợi thì phình to, báo lỗi quá muộn khiến hệ thống retry liên tục tạo thành "cơn bão". Nguy hiểm nhất là CPU lúc này có thể tụt xuống thấp (vì các luồng đang ngủ chờ), khiến monitoring báo "CPU bình thường" nhưng thực chất hệ thống đã tèo (Outage).
 
 ## 6. Khuyến Nghị Áp Dụng (Best Practices)
 
-- Tiên quyết: Loại bỏ hoàn toàn mô hình đệ trình lồng nhau (Nested submission): Tác vụ cha tự thân thực thi trực tiếp các truy vấn phụ thuộc, hoặc bộ Điều phối ngoài (Orchestrator) đệ trình các tác vụ lá (Leaf task) rồi tự tổng hợp bên ngoài Worker Pool.
-- Chỉ tiến hành phân tách Executor khi và chỉ khi Cấu trúc phụ thuộc (Dependency) / Ngân sách tài nguyên (Resource budget) thực sự biệt lập.
-- Áp đặt kỷ luật sắt: Dùng hàng đợi giới hạn (Bounded queue), minh bạch chính sách Giảm áp/Từ chối, áp dụng Hạn mức thời gian chung (Deadline) và thiết lập Metric giám sát chặt chẽ các chỉ số: Luồng vận hành (Active) / Hàng đợi (Queue) / Chờ đợi (Wait) / Từ chối (Rejection).
-- Khai thác Luồng Ảo (Virtual thread) giúp cắt giảm hao tổn khi luồng bị đóng băng, nhưng KHÔNG tự động tăng cường hạn mức kết nối JDBC, băng thông mạng, hay dung lượng RAM (Heap); Cấu trúc Kiểm soát đầu vào (Admission control) vẫn là bức tường thành bắt buộc.
+- **Cấm kỵ:** Bỏ ngay kiểu ném việc lồng nhau (Nested submission). Tác vụ cha nên tự gọi thẳng hàm xử lý, hoặc dùng một hệ thống điều phối (Orchestrator) riêng lẻ.
+- Tách riêng Pool chỉ khi thật sự cần thiết về mặt logic và tài nguyên.
+- Phải dùng hàng đợi có giới hạn (Bounded queue) và rõ ràng khi nào thì từ chối (Rejection). Cài đặt timeout và giám sát kỹ các thông số: Active / Queue / Wait / Rejection.
+- Virtual thread (Luồng ảo) có thể giúp giảm chi phí đóng băng luồng, nhưng nó KHÔNG tự sinh ra thêm RAM hay Connection DB đâu nhé. Vẫn phải kiểm soát đầu vào đàng hoàng!

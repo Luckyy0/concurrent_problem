@@ -2,6 +2,8 @@
 
 ## Đoạn code dùng AtomicInteger nhưng vẫn phá vỡ invariant
 
+Hãy cùng nhìn vào đoạn code mà một lập trình viên nghĩ là "chuẩn bài" dưới đây:
+
 ```java
 package com.example.connection;
 
@@ -60,14 +62,11 @@ public record BudgetView(int active, int pending, int limit) {
 }
 ```
 
-Mỗi method của `AtomicInteger` là atomic đối với chính counter đó. Toàn bộ
-phép kiểm tra `if (...) pending.incrementAndGet()` không phải một atomic operation, và
-quá trình `pending.decrementAndGet(); active.incrementAndGet();` cũng không phải một
-transition nguyên tử trên cặp counter.
+Ở đây, bạn thấy mỗi hàm của `AtomicInteger` thì nguyên tử (atomic) thật, nhưng **chỉ với chính cái biến đó thôi**. Cái bước `if (...) pending.incrementAndGet()` không hề được gói chung thành một thao tác duy nhất. Tương tự, hành động `pending.decrementAndGet(); active.incrementAndGet();` cũng không phải là một bước chuyển trạng thái (transition) gộp chung cho hai biến đếm này đâu.
 
 ## Phiên bản lỗi (Broken variant) dùng volatile
 
-Một field `volatile` cũng không sửa được lỗi kiểm tra-rồi-increment (check-then-increment):
+Nhiều người nghĩ "thế thì dùng `volatile` có khi ngon hơn". Sai nhé, `volatile` cũng không cứu được lỗi kiểm tra-rồi-mới-tăng (check-then-increment) này:
 
 ```java
 @Component
@@ -90,53 +89,47 @@ public class BrokenVolatileLimiter {
 }
 ```
 
-`used++` là một thao tác đọc-sửa-ghi (read-modify-write). Volatile read và volatile write có visibility,
-nhưng cặp operation không có sự loại trừ lẫn nhau (mutual exclusion); hai thread có thể đọc cùng giá
-trị rồi ghi cùng kết quả.
+Cái `used++` nhìn gọn vậy thôi chứ đằng sau nó là ba bước: đọc (read), sửa (modify), và ghi (write). Volatile chỉ đảm bảo mọi thread thấy dữ liệu mới nhất (visibility), chứ nó không hề khóa cửa để một thread làm xong hết ba bước trên (mutual exclusion). Kết quả là hai ông thread có thể cùng đọc một giá trị, cộng lên, rồi cùng ghi đè lên nhau.
 
-> **Nói ngắn gọn:** `volatile` làm giá trị dễ nhìn thấy hơn; nó không biến dấu
-> `++` hoặc chuỗi “kiểm tra rồi increment” thành một operation không thể chen ngang.
+> **Nói ngắn gọn:** `volatile` giúp nhìn giá trị rõ hơn thôi; nó không hề biến dấu `++` hay chuỗi "kiểm tra rồi tăng" thành một hành động bất khả xâm phạm.
 
 ## Vì sao code trông có vẻ hợp lý
 
-- field không còn là plain `int` mà đã dùng class có chữ `Atomic`;
-- `get`, `incrementAndGet` và `decrementAndGet` đều an toàn luồng (thread-safe) khi đứng riêng lẻ;
-- health endpoint thường hiển thị các con số có vẻ hợp lý;
-- concurrency bug chỉ xuất hiện khi gần đạt limit hoặc đúng lúc diễn ra transition;
-- kiểm thử tuần tự luôn thấy bước kiểm tra và increment nối tiếp nhau.
+- Biến đã thoát kiếp `int` bình thường và khoác áo class `Atomic` nghe rất ngầu.
+- Mấy hàm như `get`, `incrementAndGet`, và `decrementAndGet` đứng một mình thì an toàn luồng (thread-safe) tuyệt đối.
+- Gọi health endpoint ra xem thì số má lúc nào cũng có vẻ tròn trịa.
+- Lỗi đồng thời (concurrency bug) chỉ ngóc đầu lên khi hệ thống chạm nóc (limit) hoặc xui rủi sao đúng ngay lúc dữ liệu đang chuyển trạng thái.
+- Nếu test kiểu tuần tự (chạy từng luồng một) thì mọi thứ mượt mà, kiểm tra xong mới tăng.
 
-Sai lầm nằm ở ranh giới của invariant: capacity phụ thuộc vào tổng của hai field và cả
-quá trình transition, không phụ thuộc vào một method call đơn lẻ.
+Cái bẫy nằm ở chỗ này: sức chứa (capacity) của hệ thống phụ thuộc vào **tổng của cả hai biến đếm** và cả **quá trình dịch chuyển** giữa chúng, chứ không phải nằm ở việc một hàm chạy mượt thế nào.
 
 ## Hai cửa sổ tranh chấp
 
 ### Kiểm tra rồi giữ chỗ (reserve)
 
-Khi `active = 9`, `pending = 0`, `limit = 10`, hai thread cùng đọc tổng bằng 9.
-Cả hai cùng increment `pending`, khiến state thành `active = 9`, `pending = 2`.
+Tưởng tượng `active = 9`, `pending = 0`, `limit = 10`. Hai thread cùng nhào vô, đọc thấy tổng mới bằng 9 (vẫn còn chỗ chán). Cả hai sung sướng gọi increment `pending`, và thế là `active = 9`, `pending = 2` — Bùm! Vượt limit.
 
 ### Chuyển pending thành active
 
-Khi `active = 9`, `pending = 1`, tổng đã đầy 10. Thread T1 decrement pending xuống
-0 trước khi increment active. T2 chen vào, thấy tổng bằng 9 và reserve thêm một
-pending slot. Sau đó T1 increment active lên 10; tổng trở thành 11.
+Lại tưởng tượng `active = 9`, `pending = 1` (đã chạm ngưỡng 10). Thread T1 giảm pending xuống 0, chuẩn bị tăng active lên. Ngay lúc này, Thread T2 nhảy vào chớp nhoáng, thấy tổng mới bằng 9 (do T1 vừa giảm), thế là nhanh nhảu giữ ngay một chỗ pending nữa. T1 hoàn hồn tăng active lên thành 10. Tổng cục giờ thành 11. Toang!
 
 ## Điều kiện để lỗi xuất hiện
 
-1. nhiều thread dùng chung một budget instance;
-2. state ở gần capacity;
-3. bước kiểm tra và update không có chung một linearization point;
-4. transition chạm vào nhiều counter bằng các atomic operation tách rời;
-5. callback xử lý failure/close có thể chạy lặp lại hoặc sai lifecycle.
+1. Nhiều thread cùng xúm vào gọi chung một object (budget instance).
+2. Tình hình đang căng, sát nút sức chứa (capacity).
+3. Bước kiểm tra và bước cập nhật không được chốt chung trong một khoảnh khắc duy nhất.
+4. Việc chuyển đổi đụng chạm tới nhiều biến thông qua các bước nhỏ rải rác.
+5. Callback dọn dẹp lỗi hoặc đóng kết nối bị gọi lặp lại hoặc trật nhịp.
 
 ## Những cách sửa tưởng đúng nhưng chưa đủ
 
 ### Thay get cộng increment bằng updateAndGet trên pending
 
-Lambda của `pending.updateAndGet(...)` chỉ atomic đối với `pending`. Nếu lambda
-đọc `active.get()`, tổng hai counter vẫn không phải là một snapshot/transaction.
+Bạn định dùng lambda `pending.updateAndGet(...)`? Thao tác đó chỉ nguyên tử (atomic) trên chính cái `pending` thôi. Nếu lambda đó thò tay ra đọc `active.get()`, thì tổng hai biến vẫn không phải là một bức ảnh chụp đồng bộ (snapshot) đâu nhé.
 
 ### Dùng incrementAndGet rồi rollback khi vượt limit
+
+Thử kiểu "cứ tăng đi rồi tính, lố thì lùi":
 
 ```java
 int nowPending = pending.incrementAndGet();
@@ -146,29 +139,20 @@ if (active.get() + nowPending > limit) {
 }
 ```
 
-State vượt limit đã được công bố ra ngoài giữa quá trình increment và rollback. Thread khác có thể
-đọc state này hoặc thực hiện transition. Việc rollback còn cạnh tranh với các update
-khác và không tạo ra một quyết định capacity nguyên tử.
+Nghe có vẻ khôn, nhưng trạng thái "lố limit" đã lòi ra ngoài cho bàn dân thiên hạ thấy giữa cái lúc bạn tăng và lùi rồi. Thread khác có thể vô tình đọc trúng cái trạng thái lỗi đó, hoặc xử lý sai nghiệp vụ. Cộng thêm việc rollback này còn phải cạnh tranh với mấy update của thread khác, làm rối tung cả lên.
 
 ### Đánh dấu AtomicInteger field là volatile
 
-Reference `AtomicInteger` không được thay đổi; thêm `volatile` cho reference không
-mở rộng tính atomicity của state bên trong và không nối hai instance lại với nhau.
+Bản thân class `AtomicInteger` không thay đổi địa chỉ của nó. Bạn thêm `volatile` vào biến trỏ tới nó thì cũng chả tăng thêm miếng atomicity nào bên trong, và cũng chả giúp hai biến đếm liên kết với nhau được.
 
 ### Dùng LongAdder cho chốt chặn (gate)
 
-`LongAdder` phù hợp với số liệu (metric) có contention cao. `sum()` không phải là một atomic snapshot
-đối với các concurrent update, nên không phù hợp để quyết định xem có còn capacity hay
-không.
+`LongAdder` chỉ xịn khi bạn cần gom số liệu (metric) ở môi trường tranh chấp siêu cao. Hàm `sum()` của nó không phải là một snapshot atomic. Cho nên đừng dại dùng nó làm người gác cổng quyết định xem còn chỗ hay không.
 
 ### Chỉ thêm Transactional
 
-`@Transactional` điều phối database transaction, không khóa counter trong heap.
-Rollback database không tự động rollback `AtomicInteger`.
+Bạn tính quăng `@Transactional` vào cho rảnh nợ? Annotation này dùng để điều khiển database transaction, không phải để khóa các biến đếm trong bộ nhớ heap của Java đâu. Database có rollback thì cái `AtomicInteger` kia cũng chả tự lùi về số cũ.
 
 ### Chỉ synchronize từng method update
 
-Nếu `tryReserveCreation` được synchronize nhưng `creationSucceeded`,
-`creationFailed`, `connectionClosed` hoặc `view` không dùng chung một monitor, invariant
-vẫn có đường truy cập không được bảo vệ. Phạm vi lock phải bao trọn mọi transition
-liên quan.
+Bạn định xài `synchronized` cho `tryReserveCreation`? Nếu các hàm khác như `creationSucceeded`, `creationFailed`, `connectionClosed` hoặc `view` không dùng chung cái chìa khóa (monitor) đó, thì kẻ hở vẫn còn nguyên. Muốn xài lock thì phải trùm hết mọi đường đi nước bước liên quan.

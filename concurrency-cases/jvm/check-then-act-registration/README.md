@@ -2,15 +2,15 @@
 
 ## 1. Tóm tắt vấn đề (Overview)
 
-Hệ thống duy trì một bộ đăng ký trung tâm (registry) trên bộ nhớ, cấp phát một đối tượng `ManagedResource` tương ứng với mỗi định danh `resourceKey`. Quá trình triển khai lạm dụng `ConcurrentHashMap` và nhầm tưởng rằng kiến trúc đã tự động đạt chuẩn an toàn đa luồng (Thread-safe). Tuy nhiên, lỗ hổng cốt lõi nằm ở việc phân rã quy trình thành hai bước rời rạc:
+Hãy tưởng tượng bạn có một bộ đăng ký (registry) lưu trên RAM để quản lý các đối tượng `ManagedResource` theo `resourceKey`. Nhiều anh em lầm tưởng cứ xài `ConcurrentHashMap` là auto an toàn trong môi trường đa luồng (thread-safe). Nhưng thực tế thì không phải vậy, lỗi nằm ở việc bạn chia quy trình ra làm hai bước rời rạc:
 
 ```text
 Kiểm tra key chưa tồn tại → Khởi tạo và đưa tài nguyên mới vào Map
 ```
 
-Trong thực tế vận hành, hai luồng độc lập hoàn toàn có thể đồng thời vượt qua chốt kiểm tra ban đầu và cùng nhau khởi tạo tài nguyên. Dù cấu trúc Map cuối cùng chỉ lưu trữ duy nhất một đối tượng, đối tượng bị loại trừ vẫn ngầm định được mở (open) và tiếp tục chiếm dụng tài nguyên hệ thống (Thread, Socket, File handle) một cách vô thừa nhận.
+Khi code chạy thật, hai luồng (thread) khác nhau hoàn toàn có thể cùng lúc thấy key chưa tồn tại, thế là cả hai thi nhau tạo mới tài nguyên. Dù cuối cùng cái Map của bạn chỉ lưu một đối tượng, nhưng đối tượng kia bị bỏ rơi, không ai xài đến mà nó vẫn chiếm dụng tài nguyên hệ thống (Thread, Socket, v.v.) một cách lãng phí.
 
-Trọng tâm của bài toán này là việc duy trì các **Quy tắc Bất biến (Business Invariants)** trong không gian của một máy ảo (JVM):
+Để bài toán này chạy chuẩn xác trên JVM, mình cần đảm bảo các **Quy tắc Bất biến (Business Invariants)** sau:
 
 ```text
 - Mỗi resourceKey chỉ được phép liên kết tối đa với một đối tượng ManagedResource đang hoạt động.
@@ -18,42 +18,42 @@ Trọng tâm của bài toán này là việc duy trì các **Quy tắc Bất bi
 - Hàm kiến tạo (Factory) chỉ được cấp phép thực thi duy nhất một lần cho quá trình đăng ký một key.
 ```
 
-> **Nguyên tắc kỹ thuật:** Tính an toàn của các thao tác đơn lẻ trên Map không đồng nghĩa với tính an toàn của một quy trình phức hợp. Một chuỗi lệnh "Kiểm tra rồi mới khởi tạo" (check-then-act) luôn tiềm ẩn khe hở để các luồng khác chen ngang, gây ra hiệu ứng chồng lấp trạng thái.
+> **Nguyên tắc kỹ thuật:** Cấu trúc Map của bạn có thread-safe đi nữa thì không có nghĩa là nguyên cả một đoạn code logic (check rồi mới act) của bạn cũng thread-safe. Cái khe hở giữa lúc "kiểm tra" và "hành động" là đủ để luồng khác nhảy vào phá hỏng trạng thái rồi.
 
 ## 2. Các Thuật ngữ Chuyên ngành (Terminology)
 
-| Thuật ngữ | Ý nghĩa trong ngữ cảnh |
+| Thuật ngữ | Hiểu đơn giản là gì? |
 | --- | --- |
-| Mô hình `check-then-act` | Đánh giá điều kiện trước khi hành động, tạo ra cửa sổ thời gian (window of vulnerability) để luồng khác thay đổi trạng thái nền. |
-| Thao tác phức hợp (`compound action`) | Một quy trình logic lớn được lắp ghép từ nhiều chỉ lệnh nguyên thủy rời rạc. |
-| Thao tác Map nguyên tử (`atomic map operation`) | Quá trình can thiệp cấu trúc Map tại một Điểm hiệu lực duy nhất, miễn nhiễm với sự can thiệp từ luồng ngoại vi. |
-| Phương thức `computeIfAbsent` | Đặc tả API đảm bảo nguyên lý: Khởi tạo giá trị chỉ khi Key vắng mặt, bảo chứng tính Nguyên tử nội tại của Map. |
-| Điểm hiệu lực duy nhất (`linearization point`) | Thời điểm duy nhất mà toàn bộ hệ thống công nhận một thao tác đã chính thức thiết lập trạng thái. |
-| Tài nguyên vô thừa nhận (`orphan resource`) | Đối tượng đã được cấp phát nhưng nằm ngoài vùng kiểm soát của registry, không thể được thu hồi chuẩn xác. |
-| Công bố an toàn (`safe publication`) | Hành vi đưa đối tượng vào môi trường chia sẻ sao cho các luồng khác chỉ nhìn thấy trạng thái đã khởi tạo hoàn thiện. |
+| Mô hình `check-then-act` | Bạn check điều kiện trước, ok rồi mới làm. Nhưng giữa lúc check xong và lúc làm thì có luồng khác xía vào. |
+| Thao tác phức hợp (`compound action`) | Là một cụm nhiều hành động gộp lại. |
+| Thao tác Map nguyên tử (`atomic map operation`) | Là cái thao tác mà bạn can thiệp vào Map dứt khoát 1 lần, luồng khác không có cơ hội chèn ngang. |
+| Phương thức `computeIfAbsent` | Hàm này giúp bạn làm đúng 1 việc: Nếu key chưa có thì tạo mới và bỏ vào Map luôn (bao nguyên tử). |
+| Điểm hiệu lực duy nhất (`linearization point`) | Là cái khoảnh khắc chốt hạ mà cả hệ thống đều công nhận hành động đã hoàn tất. |
+| Tài nguyên vô thừa nhận (`orphan resource`) | Hàng đã tạo ra nhưng bị lãng quên, không ai gom rác (thu hồi). |
+| Công bố an toàn (`safe publication`) | Share cho các luồng khác một cái đối tượng khi nó đã được tạo ra hoàn chỉnh, ngon nghẻ rồi. |
 
 ## 3. Bối cảnh nghiệp vụ (Business Context)
 
-Ứng dụng quản trị một Local Client cho mỗi hệ thống khách hàng (Tenant) hoặc Điểm cuối (Endpoint):
+Ví dụ ứng dụng của bạn cần tạo một Client riêng cho mỗi khách hàng (Tenant):
 
-- Luồng T1 yêu cầu cấp phát tài nguyên cho định danh `tenant-a`;
-- Luồng T2 đồng thời phát sinh yêu cầu tương tự;
-- Phương thức `ManagedResourceFactory.open(...)` kích hoạt các tài nguyên nặng như Worker thread, Socket hoặc File watcher;
-- Registry có trách nhiệm thu hồi và tái sử dụng tài nguyên đã tồn tại thay vì kích hoạt bừa bãi tài nguyên mới.
+- Luồng T1 đòi cấp tài nguyên cho `tenant-a`.
+- Luồng T2 cũng đòi đúng cái đó luôn, cùng lúc.
+- Hàm `ManagedResourceFactory.open(...)` sẽ mở ra các thứ rất nặng nề như Thread, Socket.
+- Registry có nhiệm vụ lấy đồ đã có ra xài lại chứ không được sinh ra rác.
 
-Hệ quy chiếu ở đây giới hạn tại một registry cục bộ của một Application Instance. Nếu bài toán yêu cầu đảm bảo tính duy nhất xuyên suốt Cụm máy chủ (Cluster), cấu trúc Local Map không đủ thẩm quyền; vấn đề đó thuộc chuyên đề `DB-006` và `DIST-001`.
+Lưu ý là bài toán này mình chỉ nói ở phạm vi RAM của 1 server thôi nhé (Local Registry). Còn nếu bạn cần quản lý độc quyền trên nhiều server (Cluster) thì phải xem bài `DB-006` và `DIST-001`.
 
 ## 4. Các Thực thể và Trạng thái chia sẻ (Shared state & Contention)
 
-| Thành phần | Vai trò và Trạng thái |
+| Thành phần | Vai trò |
 | --- | --- |
-| Tài nguyên chia sẻ | Singleton trung tâm `ManagedResourceRegistry` |
-| Bộ nhớ trạng thái | Cấu trúc `ConcurrentMap<String, ManagedResource>` |
-| Chủ thể cạnh tranh | Hai hoặc nhiều luồng yêu cầu (Request/Worker thread) |
+| Tài nguyên chia sẻ | Thằng `ManagedResourceRegistry` (Singleton). |
+| Bộ nhớ trạng thái | Cái map `ConcurrentMap<String, ManagedResource>`. |
+| Chủ thể cạnh tranh | Mấy cái Request/Worker thread đang tranh nhau chạy. |
 | Chuỗi thao tác lỗi | `get(key) → open(key) → put(key, resource)` |
-| Vị trí đứt gãy | Khoảng trống thời gian hậu phương thức `get` và tiền phương thức `put` |
-| Ranh giới Giao dịch | Hoạt động ngoài phạm vi kiểm soát của Database Transaction |
-| Phạm vi Bất biến | Cục bộ trong không gian cấp phát của một Application Instance |
+| Vị trí đứt gãy | Cái chỗ hở giữa lúc `get` xong nhưng chưa kịp `put`. |
+| Ranh giới Giao dịch | Chạy trong RAM, chẳng liên quan gì đến Database Transaction cả. |
+| Phạm vi Bất biến | Chỉ tính trong 1 cục Application Instance (1 server). |
 
 ## 5. Điều hướng Tài liệu (Navigation)
 
@@ -67,29 +67,29 @@ Hệ quy chiếu ở đây giới hạn tại một registry cục bộ của m�
 ## 6. Tác Động Tới Hệ Thống (Production Impact)
 
 ### Hệ Quả Kỹ Thuật
-- Hàm kiến tạo (Factory) bị lạm dụng khởi chạy nhiều lần trên cùng một định danh.
-- Các tài nguyên chậm chân không được bảo chứng quyền quản lý vào registry.
-- Gây rò rỉ nghiêm trọng các tài nguyên gốc như Thread, Socket, File handle, Subscription.
-- Phân tách cấu trúc trả về: Các luồng cùng gọi đăng ký nhưng thu thập về các đối tượng vật lý khác nhau.
-- Quy trình dọn dẹp (Cleanup/Shutdown) mất phương hướng vì chỉ dò tìm được tài nguyên hợp lệ trên Map.
+- Tạo tài nguyên mới liên tục một cách lãng phí cho cùng 1 key.
+- Mấy luồng chậm chân tạo xong không được ghi nhận vào Map.
+- Gây rò rỉ Thread, Socket nặng nề.
+- Các luồng gọi chung 1 key nhưng lại cầm về mấy cái object vật lý khác nhau.
+- Lúc tắt hệ thống dọn dẹp thì bó tay, vì chỉ dọn được cái nào có trong Map.
 
 ### Hệ Quả Nghiệp Vụ
-- Hệ thống vô ý thiết lập đa luồng xử lý hoặc đa kết nối cho cùng một khách hàng.
-- Sinh ra luồng sự kiện (Event) lặp hoặc đẩy hệ thống đối tác vượt ngưỡng giới hạn cấp phép (Rate limit).
-- Máy chủ kiệt quệ định danh kết nối (Connection/File descriptor) khi hứng chịu tải trọng cao.
-- Sự cố hiển thị ngẫu nhiên theo xác suất phân luồng (Timing), gây trở ngại cực lớn cho quy trình tái hiện và gỡ lỗi.
+- Hệ thống vô tình mở nhiều kết nối cho cùng một ông khách hàng.
+- Bắn event trùng lặp, hoặc làm nghẽn mẹ nó giới hạn (rate limit) của đối tác.
+- Tải cao là chết ngắc vì cạn kiệt Connection hay File Descriptor.
+- Lỗi lúc bị lúc không (do tuỳ thời điểm luồng nó chạy thế nào), nên fix bug cực kỳ đau đầu.
 
 ## 7. Khuyến Nghị Áp Dụng (Best Practices)
 
-- Ưu tiên phương thức `computeIfAbsent` khi thao tác kiến tạo nhẹ, không gọi lại chính khối Map nội tại và không đòi hỏi xử lý Remote I/O kéo dài.
-- Áp dụng kỹ thuật Điền Trống (Placeholder) qua `FutureTask` nếu quá trình cấp phát tốn kém hoặc mang tính chất biến đổi ngoại vi (Side effect); chỉ duy nhất luồng "thắng" được quyền thi hành Factory, các luồng thụ động chuyển sang trạng thái chờ đồng bộ kết quả.
-- Trong trường hợp chấp thuận việc hàm kiến tạo lặp, áp dụng `putIfAbsent` nhưng bắt buộc phải triển khai quy trình Thu hồi khẩn cấp (Clean up) đối với các tài nguyên dư thừa.
-- Tránh ảo tưởng dùng cơ chế Registry Cục Bộ để phân xử tính độc quyền (Uniqueness) trên quy mô Kiến trúc Đa máy chủ (Multi-instance).
+- Hãy xài `computeIfAbsent` nếu quá trình tạo mới nó nhẹ, không thao tác lại vào chính cái Map và không đụng tới I/O mạng mẽo quá lâu.
+- Nếu tạo tài nguyên rất nặng hoặc có side-effect, hãy dùng chiêu Điền Trống (Placeholder) kiểu `FutureTask`. Nghĩa là thằng nào nhanh chân thì đi tạo thật, các thằng khác đứng chờ đồng bộ lấy kết quả thôi.
+- Cùng lắm nếu muốn dùng `putIfAbsent` (chấp nhận tạo thừa), thì NHẤT ĐỊNH phải dọn dẹp (clean up) mấy cái đối tượng thừa thãi bị vứt đi.
+- Đừng bao giờ lôi cái Local Registry này ra để giải quyết bài toán độc quyền cho kiến trúc nhiều server (Multi-instance).
 
 ## 8. Phân Tích Phương Án Chọn Lựa (Architectural Alternatives)
 
-- **Sử dụng `computeIfAbsent`**: Tương thích Cache/Registry cục bộ, tiến trình khởi tạo tức thời và hiếm khi phát sinh lỗi.
-- **Mô hình Placeholder (`FutureTask`)**: Đáp ứng khởi tạo khối lượng lớn, hệ thống Caller yêu cầu chia sẻ đồng bộ đối tượng, cần cấu trúc thu dọn khi hàm kiến tạo thất bại để hỗ trợ chu trình Thử lại (Retry).
-- **Hợp nhất `putIfAbsent` & Cleanup**: Xảy ra dư thừa tài nguyên là có thể chấp nhận, miễn là có năng lực tự định vị để đóng tài nguyên rác.
-- **Từ khóa `synchronized`**: Quy mô bộ đăng ký siêu nhỏ, tỷ lệ cạnh tranh thấp và chấp thuận đặc tả mọi luồng xếp hàng chung chờ cấp khóa (Global lock).
-- **Ràng buộc Database hoặc Điều phối Phân tán**: Các Quy tắc Bất biến chia sẻ hệ sinh thái nhiều Nút mạng hoặc phải bảo lưu sau tiến trình Tái khởi động (Restart).
+- **Sử dụng `computeIfAbsent`**: Ngon, hợp cho local cache, dễ dùng, ít lỗi.
+- **Mô hình Placeholder (`FutureTask`)**: Cực xịn nếu cần khởi tạo nặng, buộc phải share đồng bộ. Thêm nữa còn dễ clean up hoặc làm cơ chế Retry.
+- **Hợp nhất `putIfAbsent` & Cleanup**: OK nếu bạn lười, chấp nhận tạo rác tạm thời nhưng nhớ phải dọn dẹp được nó.
+- **Từ khóa `synchronized`**: Xài tạm nếu registry cực nhỏ, ít xài, chấp nhận việc tất cả các luồng phải xếp hàng chờ đợi nhau.
+- **Ràng buộc Database hoặc Điều phối Phân tán**: Dùng khi bạn chơi hệ đa máy chủ, hoặc cần lưu trữ giữ liệu kể cả khi sập server khởi động lại.
