@@ -2,15 +2,13 @@
 
 ## Mục tiêu thiết kế
 
-Mọi transaction có thể làm thay đổi roster invariant phải gặp cùng authoritative
-conflict point hoặc được database kiểm tra như một serializable execution.
+Mọi transaction có thể làm thay đổi quy tắc bất biến của danh sách trực phải gặp cùng một điểm xung đột xác thực (authoritative conflict point) hoặc được database kiểm tra như một luồng thực thi tuần tự hóa (serializable execution).
 
-Loser behavior phải rõ: block rồi reject, timeout, affected-row `0`, hoặc abort
-`40001` và bounded retry.
+Hành vi của phía thất bại (loser) phải rõ ràng: block rồi bị từ chối, timeout, số row bị ảnh hưởng bằng `0`, hoặc bị hủy bằng mã lỗi `40001` và thử lại có giới hạn.
 
-## Solution 1 — Lock roster guard row
+## Giải pháp 1 — Lock roster guard row
 
-`on_call_roster` đã là stable parent; dùng nó làm guard:
+`on_call_roster` đã là thực thể cha ổn định; có thể dùng nó làm guard:
 
 ```java
 public interface OnCallRosterRepository
@@ -35,7 +33,7 @@ where roster_id = :rosterId
 for update;
 ```
 
-Service:
+Dịch vụ (Service):
 
 ```java
 @Service
@@ -75,24 +73,21 @@ public class GuardedOnCallService {
 }
 ```
 
-Behavior:
+Hành vi (Behavior):
 
-1. A locks roster row.
-2. B attempts same `FOR UPDATE` and blocks.
-3. A counts `2`, updates Alice, commits; guard lock releases.
-4. B acquires guard, loads current state/count `1`.
-5. B returns `LAST_OPERATOR_REQUIRED` without updating Bob.
+1. A khóa dòng danh sách trực (locks roster row).
+2. B nỗ lực thực hiện `FOR UPDATE` tương tự và bị chặn (blocks).
+3. A đếm số lượng `2`, cập nhật Alice, commits; guard lock được giải phóng.
+4. B lấy được guard, tải trạng thái và kết quả đếm hiện tại là `1`.
+5. B trả về `LAST_OPERATOR_REQUIRED` mà không cập nhật Bob.
 
-> **Nói ngắn gọn:** guard row làm cho roster-level invariant có một physical row
-> mà mọi competing transaction buộc phải đi qua.
+> **Nói ngắn gọn:** guard row làm cho quy tắc bất biến mức danh sách trực có một row vật lý mà mọi transaction cạnh tranh đều buộc phải đi qua.
 
-Mọi add/remove/leave/reactivate path phải lock guard trước. Với nhiều rosters, lock
-theo sorted roster ID. Giữ transaction ngắn, dùng bounded `lock_timeout`, không
-gọi remote service khi đang giữ lock.
+Mọi luồng thao tác thêm/xóa/rời ca/kích hoạt lại phải thực hiện lock guard trước. Với nhiều danh sách trực, hãy thực hiện lock theo thứ tự roster ID đã sắp xếp. Giữ transaction ngắn, dùng giới hạn `lock_timeout`, không gọi dịch vụ từ xa khi đang giữ lock.
 
-## Solution 2 — Authoritative on-call counter
+## Giải pháp 2 — Bộ đếm on-call xác thực (Authoritative on-call counter)
 
-Thêm counter vào roster:
+Thêm bộ đếm vào danh sách trực:
 
 ```sql
 alter table on_call_roster
@@ -101,8 +96,7 @@ alter table on_call_roster
         check (on_call_count >= 1);
 ```
 
-Một robust leave attempt update own row rồi conditional-decrement guard trong cùng
-transaction:
+Một luồng nỗ lực rời ca (leave attempt) vững chắc thực hiện cập nhật row của chính mình rồi giảm giá trị guard có điều kiện (conditional-decrement guard) trong cùng một transaction:
 
 ```java
 public interface OnCallAssignmentCommands {
@@ -152,13 +146,9 @@ public LeaveResult leaveWithCounter(UUID rosterId, UUID operatorId) {
 }
 ```
 
-`LastOperatorRequiredException` là runtime exception được map thành domain response
-ngoài transaction; rollback khôi phục assignment update. Concurrent A/B update
-different assignments rồi contend on roster counter: first `2 -> 1`, second sees
-predicate false và rollback own update.
+`LastOperatorRequiredException` là runtime exception được ánh xạ thành kết quả trả về của hệ thống (domain response) bên ngoài transaction; bước rollback khôi phục lại cập nhật của lệnh phân công. Hai tiến trình đồng thời A và B cập nhật các phân công khác nhau rồi tranh chấp trên bộ đếm danh sách trực: bên thứ nhất giảm từ `2 -> 1`, bên thứ hai thấy điều kiện sai và tự động rollback cập nhật của chính mình.
 
-Tất cả mutation paths phải dùng consistent lock order và giữ counter đồng bộ. Có
-reconciliation:
+Tất cả luồng biến đổi dữ liệu (mutation paths) phải dùng thứ tự lock thống nhất (consistent lock order) và giữ bộ đếm đồng bộ. Có đối soát:
 
 ```sql
 select r.roster_id, r.on_call_count,
@@ -169,10 +159,9 @@ group by r.roster_id, r.on_call_count
 having r.on_call_count <> count(a.*) filter (where a.on_call);
 ```
 
-## Solution 3 — Lock toàn relevant assignment set
+## Giải pháp 3 — Lock toàn bộ tập hợp phân công liên quan
 
-Không có parent row thì lock all existing roster assignments theo deterministic
-order:
+Nếu không có row cha thì lock tất cả các rows phân công hiện tại theo một thứ tự tất định:
 
 ```java
 @Lock(LockModeType.PESSIMISTIC_WRITE)
@@ -185,16 +174,13 @@ order:
 List<OnCallAssignment> findAllForUpdate(UUID rosterId);
 ```
 
-A locks Alice/Bob rows; B waits. Sau A commit, B statement ở `READ COMMITTED`
-acquire current versions and must evaluate current on-call set before leaving.
+A khóa các rows của Alice/Bob; B phải chờ. Sau khi A commit, lệnh của B ở mức `READ COMMITTED` sẽ lấy được phiên bản hiện tại và buộc phải đánh giá lại tập on-call hiện tại trước khi thực hiện rời ca.
 
-Caveat: protocol phải xử lý concurrent INSERT assignment. Lock existing rows
-không khóa một future row; stable parent guard thường rõ hơn. Lock order khác nhau
-tạo deadlock; set lớn tăng lock/memory/latency.
+Nhược điểm: giao thức phải xử lý được thao tác INSERT phân công đồng thời. Việc lock các rows có sẵn không khóa được một row tạo mới trong tương lai; một guard cha ổn định thường rõ ràng hơn. Thứ tự lock khác nhau sẽ tạo ra deadlock; kích thước tập hợp lớn làm tăng tiêu thụ lock, memory và độ trễ.
 
-## Solution 4 — PostgreSQL `SERIALIZABLE`
+## Giải pháp 4 — PostgreSQL `SERIALIZABLE`
 
-Attempt:
+Tiến hành nỗ lực (Attempt):
 
 ```java
 @Service
@@ -225,7 +211,7 @@ public class SerializableLeaveAttempt {
 }
 ```
 
-Outer bounded retry:
+Vòng lặp thử lại có giới hạn bên ngoài:
 
 ```java
 public LeaveResult leave(UUID rosterId, UUID operatorId) {
@@ -243,17 +229,13 @@ public LeaveResult leave(UUID rosterId, UUID operatorId) {
 }
 ```
 
-Retry orchestrator và transactional attempt là hai Spring beans để proxy tạo new
-physical transaction. Loser rollback; retry reloads winner state và returns
-`LAST_OPERATOR_REQUIRED`.
+Trình điều phối thử lại (retry orchestrator) và thao tác cố gắng thực thi transaction là hai Spring beans để proxy có thể tạo ra một transaction mới về mặt vật lý. Phía thất bại sẽ thực hiện rollback; lệnh thử lại sẽ tải trạng thái của bên đã chiến thắng và trả về `LAST_OPERATOR_REQUIRED`.
 
-SSI tránh explicit blocking guard nhưng có abort/retry cost. Hot rosters có thể
-gây retry amplification; metric attempts/exhaustion là bắt buộc.
+SSI tránh việc chặn rõ ràng (explicit blocking guard) nhưng có chi phí abort và thử lại. Danh sách trực thao tác liên tục (hot rosters) có thể gây khuếch đại thử lại; đo đạc số lần thử lại và cạn kiệt số lần thử là điều bắt buộc.
 
-## Solution 5 — Constraint trigger với explicit guard
+## Giải pháp 5 — Constraint trigger với guard rõ ràng
 
-Row-level `CHECK`/unique không diễn đạt at-least-one sibling row. Một constraint
-trigger chỉ safe nếu nó lock roster guard trước khi aggregate validation:
+`CHECK` ở mức row hoặc unique constraint không diễn đạt được quy tắc phải có ít nhất một row anh em. Một constraint trigger chỉ an toàn nếu nó lock roster guard trước khi tiến hành bước xác thực tổng hợp:
 
 ```sql
 select 1
@@ -267,13 +249,11 @@ where roster_id = :rosterId
   and on_call;
 ```
 
-Trigger không có lock protocol vẫn race. Logic trong database tăng enforcement
-coverage cho direct SQL nhưng tăng migration/debug complexity; stored procedure
-có thể là boundary rõ hơn.
+Trigger không có giao thức lock vẫn sẽ xảy ra race condition. Logic trong database tăng độ bao phủ thực thi cho truy vấn SQL trực tiếp nhưng lại tăng độ phức tạp khi migration và gỡ lỗi; stored procedure có thể là một ranh giới (boundary) rõ ràng hơn.
 
-## Tại sao `@Version` và uniqueness không đủ
+## Tại sao `@Version` và tính duy nhất không đủ
 
-Generated SQL:
+SQL được tạo ra:
 
 ```sql
 update on_call_assignment
@@ -281,46 +261,41 @@ set on_call=false, version=version+1
 where assignment_id=:id and version=:oldVersion;
 ```
 
-Affected-row `0` phát hiện stale write cùng assignment; write skew có affected-row
-`1` trên Alice và Bob. Unique constraint cũng không biểu diễn lower-bound count.
+Khi số row bị ảnh hưởng là `0` thì phát hiện thao tác ghi lỗi thời (stale write) cùng lúc trên một phân công; write skew có số row ảnh hưởng là `1` trên cả Alice và Bob. Ràng buộc unique cũng không biểu diễn quy tắc đếm có giới hạn dưới.
 
-## Trade-off comparison
+## So sánh ưu nhược điểm (Trade-off comparison)
 
-| Cách | Conflict point | Loser | Contention | Complexity |
+| Cách tiếp cận | Điểm xung đột | Xử lý bên thất bại | Cạnh tranh | Độ phức tạp |
 | --- | --- | --- | --- | --- |
-| Guard `FOR UPDATE` | Roster row | block rồi reject/timeout | Theo hot roster | Thấp |
-| Conditional counter | Roster counter | affected-row `0` + rollback | Theo hot roster | Counter/reconcile |
-| Lock all rows | Assignment set | block/timeout | Theo set size | Lock ordering |
-| `SERIALIZABLE` | SSI dependencies | `40001`, retry | Retry under conflict | Operational retry |
-| JVM lock | Process memory | local wait | Local only | Không multi-instance |
+| Guard `FOR UPDATE` | Roster row | block rồi từ chối/timeout | Theo hot roster | Thấp |
+| Bộ đếm có điều kiện | Roster counter | affected-row `0` + rollback | Theo hot roster | Cần bộ đếm và đối soát |
+| Lock toàn bộ rows | Assignment set | block/timeout | Theo kích thước set | Cần thứ tự lock |
+| `SERIALIZABLE` | Các phụ thuộc SSI | gặp `40001`, thử lại | Thử lại khi có xung đột | Vận hành vòng lặp thử lại |
+| JVM lock | Process memory | chờ ở bộ nhớ cục bộ | Chỉ áp dụng cục bộ | Không hỗ trợ đa tiến trình |
 
-## Failure và recovery
+## Lỗi và phục hồi (Failure and recovery)
 
-- Guard holder rollback/crash: assignment rollback, row lock release.
-- Counter decrement failure: runtime exception rollback prior assignment update.
-- Serialization loser: transaction unusable; retry new transaction.
-- Timeout/deadlock: rollback whole attempt; bounded safe retry if command
-  idempotent.
-- Crash after commit/before response: conditional state/idempotency key replays
-  result without another decrement.
-- External notification: durable outbox only in successful transaction.
+- Tiến trình giữ guard bị rollback/crash: việc phân công sẽ rollback, giải phóng row lock.
+- Không thể giảm bộ đếm: runtime exception rollback các cập nhật phân công trước đó.
+- Giao dịch thua SSI: transaction không sử dụng được nữa; thử lại bằng transaction mới.
+- Timeout hoặc deadlock: rollback toàn bộ nỗ lực; việc thử lại an toàn có giới hạn nếu lệnh có tính lũy đẳng (idempotent).
+- Crash sau khi commit hoặc trước khi phản hồi: trạng thái có điều kiện hoặc khóa lũy đẳng (idempotency key) phát lại kết quả mà không làm giảm dữ liệu thêm một lần nữa.
+- Lệnh gửi thông báo ra bên ngoài (external notification): thực hiện outbox bền bỉ chỉ khi transaction thành công.
 
-## Recommendation
+## Khuyến nghị (Recommendation)
 
-Với stable roster parent, guard-row lock là default dễ audit. Counter phù hợp khi
-roster reads cần cheap count và team có reconciliation discipline.
-`SERIALIZABLE` phù hợp khi invariant phức tạp hoặc nhiều mutation paths khó quy về
-một guard, miễn full-transaction retry được vận hành tốt.
+Với các thực thể danh sách trực cha ổn định, việc đặt khóa guard-row là thao tác cơ bản dễ tiến hành kiểm toán. Dùng bộ đếm phù hợp khi các thao tác đọc danh sách trực cần đếm nhanh và đội ngũ có quy trình đối soát dữ liệu (reconciliation).
+`SERIALIZABLE` phù hợp khi quy tắc bất biến phức tạp hoặc nhiều luồng thay đổi khó quy về một điểm guard thống nhất, miễn là tính năng thử lại toàn bộ transaction được vận hành tốt.
 
-## Production checklist
+## Danh sách kiểm tra môi trường production (Production checklist)
 
-- [ ] Invariant scope là roster, không nhầm với assignment row.
-- [ ] Mọi mutation path dùng cùng guard/counter/SSI contract.
-- [ ] Effective isolation được xác minh.
-- [ ] `40001`, `40P01`, `55P03` có bounded handling.
-- [ ] Retry tạo transaction mới và reload toàn roster.
-- [ ] Multi-roster/operator locks có deterministic order.
-- [ ] Không remote I/O khi giữ database locks.
-- [ ] Counter-versus-rows reconciliation và unsafe-roster alert tồn tại.
-- [ ] Duplicate command không apply leave/decrement lần hai.
-- [ ] PostgreSQL Testcontainers regression assert final on-call count.
+- [ ] Phạm vi của quy tắc bất biến phải áp dụng trên toàn danh sách trực, không nhầm lẫn với từng row phân công riêng lẻ.
+- [ ] Mọi luồng thay đổi trạng thái phải dùng cùng một hợp đồng cấu trúc guard, bộ đếm hoặc SSI.
+- [ ] Chế độ cô lập đã được xác minh tính hiệu quả.
+- [ ] Có cách xử lý có giới hạn cho các lỗi `40001`, `40P01`, `55P03`.
+- [ ] Luồng thử lại tạo một transaction mới và tải lại toàn bộ danh sách trực.
+- [ ] Việc lock nhiều danh sách trực và nhân viên luôn theo một thứ tự tất định.
+- [ ] Không có truy vấn I/O từ xa khi đang giữ database locks.
+- [ ] Các cảnh báo về đối soát lệch giữa row và bộ đếm, cũng như về trạng thái không an toàn phải tồn tại.
+- [ ] Lệnh trùng lặp không thực hiện rời ca hay giảm số đếm lần thứ hai.
+- [ ] Có PostgreSQL Testcontainers để chạy hồi quy quy tắc bất biến cuối cùng của số lượng danh sách trực.

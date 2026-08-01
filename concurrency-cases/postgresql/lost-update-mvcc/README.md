@@ -1,131 +1,131 @@
-# DB-001 — Vấn Đề Ghi Đè Mất Dữ Liệu (Lost update) Dưới Trướng PostgreSQL MVCC
+# DB-001 — Vấn Đề Ghi Đè Mất Dữ Liệu (Lost update) Dưới Cơ Chế PostgreSQL MVCC
 
-## 1. Tóm tắt câu chuyện đau lòng
+## 1. Tóm tắt vấn đề
 
-Giả sử Job `IMPORT-42` đã cày xong `10` đơn vị (units).
-Bỗng nhiên:
-- Ông Công Nhân A (Worker A) chạy tới báo: "Sếp ơi, em làm thêm được `3` cái!".
-- Ông Công Nhân B (Worker B) cũng chen ngang: "Em làm được `4` cái!".
+Giả sử tiến trình (Job) `IMPORT-42` đã hoàn thành được `10` đơn vị công việc (units).
+Tại cùng một thời điểm:
+- Luồng xử lý A (Worker A) báo cáo hoàn thành thêm `3` đơn vị.
+- Luồng xử lý B (Worker B) báo cáo hoàn thành thêm `4` đơn vị.
 
-Vì dùng Spring Transaction và JPA, cả hai ông đều lấy tờ giấy ghi chú (entity) hiện tại ra xem: "À, ban đầu là `10`".
-- Ông A tự nhẩm trong đầu (trong JVM): `10 + 3 = 13`.
-- Ông B cũng tự nhẩm: `10 + 4 = 14`.
+Vì sử dụng Spring Transaction và JPA mặc định, cả hai luồng đều tải thực thể (entity) hiện tại từ cơ sở dữ liệu lên bộ nhớ: "Số lượng ban đầu là `10`".
+- Luồng A thực hiện tính toán trong bộ nhớ (JVM): `10 + 3 = 13`.
+- Luồng B cũng thực hiện tính toán tương tự: `10 + 4 = 14`.
 
-Đến đoạn lưu xuống DB (Hibernate dirty checking flush), cả hai ông đều đẩy lệnh UPDATE theo kiểu ép buộc con số tuyệt đối (absolute values) với điều kiện ngô nghê `WHERE job_id = ?`.
+Khi lưu dữ liệu xuống DB (thông qua cơ chế Hibernate dirty checking flush), cả hai luồng đều phát sinh câu lệnh UPDATE ghi đè giá trị tuyệt đối (absolute values) với điều kiện đơn giản `WHERE job_id = ?`.
 
-Kết cục:
-- Ông A chốt sổ trước, ghi số `13`.
-- Ông B chốt sổ sau, đè bẹp lên số `13` của A, sửa thành `14`.
-- Công sức `+3` của ông A bốc hơi không dấu vết (Lost update), mặc dù cả A và B đều nhận được thông báo "Lưu thành công, cười tươi nhé!".
+Kết quả thực thi:
+- Luồng A hoàn tất giao dịch (commit) trước, ghi nhận giá trị `13`.
+- Luồng B hoàn tất giao dịch sau, ghi đè lên kết quả của A, sửa thành giá trị `14`.
+- Công sức `+3` của luồng A bị mất hoàn toàn (Lost update), mặc dù cả A và B đều không ghi nhận bất kỳ ngoại lệ (exception) nào và đều báo cáo thao tác thành công.
 
-Nguyên tắc bất di bất dịch (Invariant) bị phá vỡ:
+Điều kiện bất biến (Invariant) bị phá vỡ:
 ```text
-Tổng số Đã Xong (final completedUnits)
-  = Số ban đầu (initial) + Tổng công sức (delta) của mọi lệnh được chấp nhận
+Tổng số công việc Đã Xong (final completedUnits)
+  = Số ban đầu (initial) + Tổng khối lượng (delta) của mọi lệnh được chấp nhận
 
-Với số ban đầu = 10, công sức A = 3, công sức B = 4:
-Thì kết quả CẦN PHẢI LÀ = 17. (Chứ không phải 14!)
+Với số ban đầu = 10, khối lượng A = 3, khối lượng B = 4:
+Thì kết quả CẦN PHẢI LÀ = 17. (Thực tế hệ thống lại ghi nhận 14!)
 ```
 
-> **Nói ngắn gọn:** Cơ chế MVCC của PostgreSQL vô tình dung túng cho cả A và B cùng nhìn thấy phiên bản cũ rích (đã chốt). Nếu Code của bạn tự tính toán con số tuyệt đối rồi ốp thẳng xuống DB, thì DB cũng bó tay không biết đường nào mà gộp (merge) số liệu lại giùm bạn đâu.
+> **Nói ngắn gọn:** Cơ chế MVCC của PostgreSQL cho phép cả A và B cùng nhìn thấy phiên bản dữ liệu cũ (đã commit). Nếu mã nguồn của bạn tự tính toán con số tuyệt đối trên bộ nhớ ứng dụng rồi đẩy thẳng lệnh UPDATE xuống CSDL, CSDL sẽ không thể tự động gộp (merge) sự thay đổi này.
 
-## 2. Dàn diễn viên và Sân khấu (Actors và shared state)
+## 2. Các thành phần tham gia (Actors và shared state)
 
 | Thành phần | Vai trò |
 | --- | --- |
-| Ông Công Nhân A | Ôm cái Transaction cộng thêm `3` đơn vị. |
-| Ông Công Nhân B | Ôm cái Transaction cộng thêm `4` đơn vị. |
-| Bảng `job_progress` | Nơi lưu giữ sổ sách chân lý (Authoritative counters). |
-| Bộ nhớ đệm Hibernate (Persistence context) | Nơi lưu lén bản nháp (snapshot) và tự động bắt lỗi thay đổi (dirty-check) theo số tuyệt đối. |
-| PostgreSQL | Kẻ phán xử: Cung cấp ảnh chụp (snapshots), khóa dòng (row locks) và quyết định tầm nhìn khi chốt sổ (commit visibility). |
+| Worker A | Thực thi Giao dịch (Transaction) cộng thêm `3` đơn vị. |
+| Worker B | Thực thi Giao dịch cộng thêm `4` đơn vị. |
+| Bảng `job_progress` | Nơi lưu giữ trạng thái chính thức (Authoritative counters). |
+| Bộ nhớ đệm Hibernate (Persistence context) | Nơi lưu giữ bản nháp (snapshot) và tự động nhận diện thay đổi (dirty-check) để cập nhật số tuyệt đối. |
+| PostgreSQL | Hệ quản trị CSDL quản lý ảnh chụp dữ liệu (snapshots), khóa dòng (row locks) và quyết định tầm nhìn dữ liệu khi commit (commit visibility). |
 
-Lúc đầu (Initial row):
+Trạng thái ban đầu (Initial row):
 ```text
 job_id          = IMPORT-42
 completed_units = 10
 total_units     = 100
 ```
 
-Kết cục bi đát (Broken final):
+Trạng thái lỗi cuối cùng (Broken final):
 ```text
 completed_units = 14
-Cả hai báo công thành công!
+Cả hai giao dịch báo cáo thành công!
 ```
 
-## 3. Nơi xảy ra án mạng (Transaction boundary và contention point)
+## 3. Ranh giới giao dịch và điểm tranh chấp (Transaction boundary và contention point)
 
-Mỗi lần bạn gọi hàm `addCompletedUnits()`, nó chạy qua Proxy của Spring và đẻ ra một Transaction độc lập hoàn toàn trên PostgreSQL với mức độ `READ COMMITTED` (Chỉ Đọc Hàng Đã Chốt).
+Mỗi lần phương thức `addCompletedUnits()` được gọi, Spring Proxy sẽ khởi tạo một Giao dịch độc lập trên PostgreSQL với mức độ cô lập `READ COMMITTED` (Chỉ Đọc Dữ Liệu Đã Commit).
 
-Quy trình bóp dái nhau không hề nguyên tử (Non-atomic sequence):
+Chuỗi thao tác không nguyên tử (Non-atomic sequence) gây ra lỗi:
 ```text
-Lấy số hiện tại từ DB (SELECT)
-  -> Chạy thuật toán siêu cấp trong JVM (Cộng trừ)
-  -> Lưu số mới xuống DB CHỈ bằng Khóa Chính (UPDATE by primary key)
+Lấy dữ liệu hiện tại từ DB (SELECT)
+  -> Chạy logic tính toán cục bộ trong JVM
+  -> Lưu số mới xuống DB CHỈ dựa trên Khóa Chính (UPDATE by primary key)
 ```
 
-Điểm thắt cổ chai (Contention point) chính là cái Dòng `job_progress(job_id='IMPORT-42')`. Các lệnh UPDATE có giành nhau cái Khóa Dòng (row lock), nên lúc ghi tụi nó bắt buộc phải xếp hàng (serialize về thời gian). NHƯNG việc xếp hàng ghi đè những con số đã bị sai lệch (stale absolute writes) thì cũng chẳng bảo vệ được tính cộng dồn (additive invariant) đâu!
+Điểm tranh chấp (Contention point) chính là dòng dữ liệu `job_progress(job_id='IMPORT-42')`. Các lệnh UPDATE từ hai luồng sẽ tranh giành Khóa cấp dòng (row lock), do đó tại thời điểm ghi dữ liệu, chúng buộc phải thi hành tuần tự (serialize về thời gian). Tuy nhiên, việc tuần tự hóa các lệnh ghi đè mang giá trị sai lệch (stale absolute writes) hoàn toàn không bảo vệ được tính cộng dồn (additive invariant) của hệ thống.
 
-## 4. Mong Mỏi vs. Thực Tế Phũ Phàng (Expected và actual)
+## 4. Kỳ vọng theo thiết kế lỗi và Thực tế (Expected và actual)
 
-| Bước | Ông A | Ông B | Chốt sổ (Final) |
+| Bước thực thi | Luồng A | Luồng B | Kết quả chung (Final) |
 | --- | --- | --- | --- |
-| Lấy sổ ra xem (Read) | 10 | 10 | |
-| Tự tính nhẩm (Calculate) | 13 | 14 | |
-| Ai nhanh tay hơn (Commit) | Xong Trước | Xong Sau | |
-| Số Đáng Lý Phải Có (Expected) | +3 | +4 | 17 |
-| Sự Thật Cay Đắng (Broken write) | Lưu 13 | Đè thành 14 | 14 |
+| Đọc dữ liệu (Read) | 10 | 10 | |
+| Tính toán (Calculate) | 13 | 14 | |
+| Giao dịch hoàn tất (Commit) | Hoàn tất trước | Hoàn tất sau | |
+| Khối lượng kỳ vọng (Expected) | +3 | +4 | 17 |
+| Kết quả thực tế (Broken write) | Lưu 13 | Đè thành 14 | 14 |
 
-Chả có miếng lỗi Exception, Timeout, hay Báo cáo sai số lượng dòng (affected-row conflict) nào nổ ra cả! Vì lệnh UPDATE chỉ tìm trúng cái ID đó là đè bẹp, không hề có điều kiện kiểm tra phiên bản hay giá trị cũ (version/old-value predicate).
+Toàn bộ quá trình không hề phát sinh Exception, Timeout, hay cảnh báo về số lượng dòng cập nhật (affected-row conflict). Điều này xảy ra do lệnh UPDATE chỉ dựa vào Khóa chính để tìm dòng cần ghi đè, không kèm theo điều kiện xác nhận phiên bản hoặc giá trị cũ (version/old-value predicate).
 
-## 5. Từ vựng chém gió (Thuật ngữ cần biết)
+## 5. Thuật ngữ kỹ thuật cần nắm
 
 | Thuật ngữ | Giải thích |
 | --- | --- |
-| lost update (Mất cục dữ liệu) | Công sức lưu của một thằng bị thằng đến sau ghi đè âm thầm. Đau! |
-| MVCC | Trò ảo thuật phân thân dữ liệu (Multi-Version Concurrency Control) của Database. |
-| statement snapshot | Bức ảnh chụp tại thời điểm chạy từng Câu lệnh ở mức `READ COMMITTED`. |
-| read-modify-write | Chuỗi hành động: Đọc lên -> Tính trong Code -> Ghi xuống. |
-| dirty checking | Trò tự soi xét của Hibernate: Thấy Object bị đổi là đẻ lệnh UPDATE giùm. |
-| absolute write | Ép số tuyệt đối: Ví dụ `SET completed_units = 14`. |
-| atomic delta | Giao trọng trách cho DB tự tính: `SET completed_units = completed_units + 4`. (Chuẩn bài!) |
-| version predicate | Đính kèm điều kiện chống ế: `WHERE version = expected` để bắt quả tang bọn ghi đè. |
+| Lost update (Mất dữ liệu cập nhật) | Kết quả của một giao dịch bị giao dịch đến sau ghi đè âm thầm, làm mất dữ liệu hợp lệ. |
+| MVCC | Cơ chế kiểm soát đồng thời đa phiên bản (Multi-Version Concurrency Control) của RDBMS. |
+| Statement snapshot | Bức ảnh chụp dữ liệu tại thời điểm chạy từng Câu lệnh, áp dụng cho mức độ `READ COMMITTED`. |
+| Read-modify-write | Chuỗi thao tác: Đọc dữ liệu lên bộ nhớ -> Tính toán -> Ghi đè kết quả xuống DB. |
+| Dirty checking | Cơ chế của Hibernate tự động theo dõi thay đổi trên Entity và sinh lệnh UPDATE tương ứng. |
+| Absolute write | Lệnh ghi áp đặt con số cố định: Ví dụ `SET completed_units = 14`. |
+| Atomic delta | Giao việc tính toán cho CSDL bằng thao tác nguyên tử: `SET completed_units = completed_units + 4`. |
+| Version predicate | Điều kiện kiểm tra phiên bản dữ liệu: `WHERE version = expected` để phòng ngừa ghi đè mù quáng. |
 
-## 6. Bản đồ kho báu (Điều hướng)
+## 6. Điều hướng tài liệu
 
-- [Đoạn Code thảm họa read-modify-write bằng JPA](broken-code.md)
-- [Mổ xẻ Tầm nhìn MVCC và lý do Mất Dữ Liệu](analysis.md)
-- [Bí kíp giải cứu: Cập nhật Nguyên tử, Khóa Lạc Quan và Khóa Bi Quan](solutions.md)
-- [Phòng Thí Nghiệm Đập Tan Ảo Tưởng ở PostgreSQL](experiments.md)
-- [Giao dịch Nguyên tử Database (Atomic database operations)](../../concepts/atomic-database-operations.md)
+- [Đoạn mã lỗi read-modify-write bằng JPA](broken-code.md)
+- [Phân tích chi tiết tầm nhìn MVCC và lỗi Mất Dữ Liệu](analysis.md)
+- [Các giải pháp xử lý: Cập nhật Nguyên tử, Khóa Lạc Quan và Khóa Bi Quan](solutions.md)
+- [Bộ kiểm thử tái hiện lỗi ở PostgreSQL](experiments.md)
+- [Giao dịch Nguyên tử trong CSDL (Atomic database operations)](../../concepts/atomic-database-operations.md)
 - [PostgreSQL MVCC](../../concepts/postgresql-mvcc.md)
-- [Mức độ Cô lập (Isolation levels)](../../concepts/isolation-levels.md)
+- [Các mức độ Cô lập (Isolation levels)](../../concepts/isolation-levels.md)
 - [Khóa Lạc Quan (Optimistic locking)](../../concepts/optimistic-locking.md)
 - [Khóa Bi Quan (PostgreSQL locks)](../../concepts/postgresql-locks.md)
-- [Nghệ thuật Viết Test Đa Luồng (Concurrency testing)](../../concepts/concurrency-testing.md)
+- [Kiểm thử Tương tranh (Concurrency testing)](../../concepts/concurrency-testing.md)
 
-## 7. Hậu quả khi lên Production
+## 7. Hậu quả trên môi trường Production
 
-- Bảng đếm số tiến độ hiển thị số nhỏ hơn số việc thực tế đã làm (Báo cáo láo).
-- Trình kích hoạt hoàn thành công việc (Job completion trigger) có nguy cơ ngủ gục hoặc chạy trễ.
-- Mở Audit Log / Check response của Worker thì thấy "Báo cáo thành công", nhưng Database lại cãi "Tao không thấy số". Mâu thuẫn!
-- Tổ Kiểm toán (Reconciliation) phải hì hục đi rà lại từng dòng Log (event records) để cộng tay lại con số.
-- Nhét cái Khóa Cục Bộ (JVM-local lock - synchronized) vào Code chỉ là trò trẻ con vô dụng khi chạy nhiều Server (multiple application instances).
-- Lượng truy cập (load) càng cao, tỉ lệ bị đè số (overwrite) càng lớn mà cấm có báo lỗi (error signal) một tiếng nào.
+- Biểu đồ và báo cáo tiến độ hiển thị số liệu thấp hơn so với thực tế công việc đã hoàn thành.
+- Các bộ kích hoạt chuyển trạng thái (Job completion trigger) có thể không hoạt động hoặc hoạt động trễ do tiến độ không đạt mức 100% như mong đợi.
+- Dữ liệu truy vết (Audit Log) từ phía ứng dụng báo cáo thành công, nhưng CSDL lại thiếu hụt số liệu, gây khó khăn cho việc đối soát.
+- Quá trình xử lý chênh lệch số liệu (Reconciliation) đòi hỏi nhiều công sức phân tích lại các sự kiện (event logs) để tính toán thủ công con số chính xác.
+- Việc sử dụng khóa bộ nhớ (JVM-local lock - synchronized) sẽ vô tác dụng khi hệ thống được triển khai đa máy chủ (multiple application instances).
+- Lượng truy cập (load) càng cao, tỷ lệ mất dữ liệu càng lớn mà hệ thống không hề sinh ra bất kỳ tín hiệu cảnh báo lỗi nào.
 
-## 8. Hướng sửa cho Người Mới (Khuyến nghị)
+## 8. Hướng khắc phục khuyến nghị
 
-Nếu chỉ là cộng dồn số đếm (commutative counter delta), hãy đẩy phần tính toán xuống Database bằng cú SQL Nguyên tử (atomic conditional SQL):
+Nếu logic nghiệp vụ chỉ đơn thuần là cộng dồn số đếm (commutative counter delta), hãy tối ưu bằng cách đẩy phần tính toán xuống cơ sở dữ liệu qua cú pháp SQL Nguyên tử (atomic conditional SQL):
 
 ```sql
 update job_progress
 set completed_units = completed_units + :delta
 where job_id = :jobId
-  and completed_units + :delta <= total_units; -- Thêm điều kiện tránh lố
+  and completed_units + :delta <= total_units; -- Kiểm tra điều kiện giới hạn
 ```
 
-Nhớ check cái `affected-row count` (số dòng thành công) để biết mà báo lỗi / báo vui.
-Nhưng nếu nghiệp vụ của bạn không chỉ là cộng trừ mà rắc rối hơn nhiều (aggregate mutation phức tạp), hãy ôm thẻ bùa `@Version` (Khóa Lạc Quan) kết hợp tự động thử lại (bounded retry) trong Giao dịch mới. Hoặc xài `FOR UPDATE` (Khóa Bi Quan) nếu bạn chấp nhận việc tụi nó đứng xếp hàng (blocking trade-off).
+Nhớ kiểm tra số lượng dòng thay đổi (`affected-row count`) để xác nhận thao tác thành công.
+Tuy nhiên, nếu nghiệp vụ phức tạp và liên quan đến việc thay đổi nhiều trường dữ liệu (aggregate mutation), hãy áp dụng cơ chế Khóa Lạc Quan (`@Version`) kết hợp cùng cơ chế Tự động thử lại (bounded retry) trong giao dịch mới. Hoặc sử dụng Khóa Bi Quan (`FOR UPDATE`) nếu hệ thống chấp nhận sự đánh đổi về thời gian chờ (blocking trade-off).
 
 ## 9. Phạm vi bài toán
 
-Căn bệnh Mất Dữ Liệu này diễn ra ở khắp mọi nơi (generic anomaly). Nhưng nếu bạn đang xây app Ngân hàng đếm Tiền (Financial balance) hay Bán hàng giữ Kho (ecommerce stock), hãy đọc riêng bài `BANK-002` và `ECOM-001`; vì bài này chỉ mượn ví dụ đếm số để né tránh bớt các mớ bòng bong nghiệp vụ chuyên sâu đó.
+Lỗi Mất Dữ Liệu Cập Nhật (Lost update) là một rủi ro phổ biến trong lập trình tương tranh (generic anomaly). Tài liệu này sử dụng ví dụ về bộ đếm tiến độ để làm rõ nguyên lý. Nếu hệ thống của bạn xử lý các nghiệp vụ nhạy cảm như Giao dịch tài chính (Financial balance) hay Quản lý Tồn kho (ecommerce stock), vui lòng tham khảo các bài `BANK-002` và `ECOM-001` để xem các thiết kế và giải pháp nghiệp vụ chuyên sâu phù hợp hơn.

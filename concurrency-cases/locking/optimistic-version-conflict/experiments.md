@@ -1,21 +1,21 @@
-# Vào Phòng Thí Nghiệm: Ép Đụng Độ Khóa Lạc Quan Bằng Testcontainers
+# Môi trường thực nghiệm: Tái hiện xung đột khóa lạc quan bằng Testcontainers
 
-## 1. Mục tiêu Thí nghiệm
+## 1. Mục tiêu thực nghiệm
 
-Trong bài này, chúng ta sẽ bắt tay viết code Test để chứng minh:
+Mục đích của bộ kiểm thử này nhằm chứng minh các luận điểm kỹ thuật sau:
 
-1. Không xài `@Version` thì DB bị ghi đè thê thảm thế nào.
-2. Ép hai luồng cùng bốc lên một version, rồi bắt luồng A phải chốt sổ trước luồng B.
-3. Kẻ thua cuộc (luồng B) sẽ bị văng lỗi Optimistic, sửa được `0` dòng và Giao dịch bị vứt xó.
-4. Kiểm tra Dữ liệu cuối cùng dưới DB có đúng của luồng A không, chứ không phải chỉ test xem có văng lỗi là xong.
-5. Soi thử xem Hibernate đẻ ra câu SQL có đuôi `version = ?` thật không.
-6. Chặn đứng Client gửi cái Version ôi thiu từ ngoài cửa.
+1. Hệ quả trực tiếp của việc thiếu cơ chế `@Version` (gây ra hiện tượng ghi đè dữ liệu).
+2. Kiểm soát đồng bộ hai luồng truy xuất cùng một phiên bản dữ liệu, và chỉ định luồng hoàn tất transaction trước.
+3. Xác nhận luồng chậm hơn (luồng thua cuộc) sẽ kích hoạt ngoại lệ khóa lạc quan, thay đổi `0` dòng và transaction bị hủy bỏ (rollback).
+4. Kiểm chứng tính toàn vẹn của dữ liệu cuối cùng trong database thuộc về luồng chiến thắng, thay vì chỉ kiểm tra sự hiện diện của ngoại lệ.
+5. Kiểm tra cấu trúc câu lệnh SQL do Hibernate sinh ra để xác nhận sự xuất hiện của mệnh đề `version = ?`.
+6. Xác thực cơ chế phòng vệ tại tầng API khi phía gọi truyền lên thông số version không hợp lệ (dữ liệu lỗi thời).
 
-> **Nói ngắn gọn:** Đã test Khóa Lạc Quan thì phải tạo ra được cái Bẫy Chặn (gate) chính xác đến từng mi-li-giây, chứ không phải cứ ném bừa (load test) hàng trăm luồng rồi cầu trời cho nó đụng nhau đâu.
+> **Ghi chú kỹ thuật:** Việc kiểm thử cơ chế khóa lạc quan yêu cầu sử dụng rào chắn luồng có độ chính xác cao nhằm thiết lập kịch bản đụng độ định danh, thay vì phụ thuộc vào các bài kiểm thử tải (load test) mang tính ngẫu nhiên.
 
-## 2. Dựng sân khấu thật với PostgreSQL Testcontainers
+## 2. Thiết lập môi trường bằng PostgreSQL Testcontainers
 
-Đừng xài DB ảo (H2), hãy dùng đồ thật:
+Môi trường kiểm thử yêu cầu hệ quản trị database vật lý thay thế cho các database in-memory (như H2) nhằm bảo đảm tính chính xác của cơ chế transaction và MVCC:
 
 ```java
 @Testcontainers
@@ -33,14 +33,14 @@ class OptimisticOfferIT {
     @Autowired
     private JdbcTemplate jdbc;
 
-    // Dùng 2 thread để đóng vai nhân viên A và B
+    // Cấp phát ExecutorService với 2 luồng đại diện cho 2 phía gọi
     private final ExecutorService executor = Executors.newFixedThreadPool(2);
 
     @BeforeEach
     void seed() {
-        // Dọn dẹp sân bãi
+        // Thiết lập trạng thái dữ liệu nguyên bản
         jdbc.update("delete from product_offer");
-        // Nhét dữ liệu gốc vào: Giá 100, version 7
+        // Khởi tạo bản ghi: Giá 100, Phiên bản 7
         jdbc.update("""
                 insert into product_offer(offer_id, price, title, version)
                 values (42, 100.00, 'Launch offer', 7)
@@ -55,11 +55,11 @@ class OptimisticOfferIT {
 }
 ```
 
-Lưu ý: Không đặt `@Transactional` ở hàm Test nhé; bắt 2 luồng phải nhào xuống DB commit/rollback thật sự.
+Lưu ý: Phương thức test tuyệt đối không khai báo `@Transactional` để cho phép hệ thống tự động xử lý ranh giới transaction.
 
-## 3. Tạo Bẫy Chặn (Gate) điều phối kịch bản
+## 3. Kiến trúc điều phối rào chắn
 
-Chúng ta dùng `CountDownLatch` để bắt các luồng phải "xếp hàng" đúng ý đồ của đạo diễn:
+Sử dụng `CountDownLatch` để kiểm soát thứ tự thực thi của các luồng:
 
 ```java
 @TestConfiguration
@@ -81,12 +81,12 @@ final class TwoEditorGate implements OfferEditGate {
     @Override
     public void afterLoad(String actor, long version) {
         bothLoaded.countDown();
-        await(bothLoaded, "Bắt cả hai phải tải xong v" + version);
+        await(bothLoaded, "Bắt buộc hai luồng hoàn tất nạp v" + version);
         
         if ("A".equals(actor)) {
-            await(allowA, "Chờ lệnh mới cho A chạy tiếp");
+            await(allowA, "Đợi tín hiệu tiếp tục cho tiến trình A");
         } else {
-            await(aCommitted, "B phải há mồm chờ A chốt sổ xong mới được chạy");
+            await(aCommitted, "Tiến trình B bị đình chỉ cho đến khi A hoàn tất commit");
         }
     }
 
@@ -102,18 +102,18 @@ final class TwoEditorGate implements OfferEditGate {
 static void await(CountDownLatch latch, String description) {
     try {
         if (!latch.await(5, TimeUnit.SECONDS)) {
-            throw new AssertionError("Đợi quá lâu rồi (Timeout): " + description);
+            throw new AssertionError("Vượt quá thời gian chờ (timeout): " + description);
         }
     } catch (InterruptedException interrupted) {
         Thread.currentThread().interrupt();
-        throw new AssertionError("Bị cắt ngang: " + description, interrupted);
+        throw new AssertionError("Tiến trình bị gián đoạn: " + description, interrupted);
     }
 }
 ```
 
-Trên Production cái Gate này chẳng làm gì cả (no-op). Ở đây, Test chỉ gọi hàm `aCommitted()` khi và chỉ khi Lệnh A đã chốt sổ thành công xuống Database.
+Trong cấu hình môi trường thực tế, interface `OfferEditGate` sẽ triển khai không hoạt động (no-op). Ở môi trường kiểm thử, `aCommitted()` chỉ được gọi khi transaction A đã kết thúc pha commit.
 
-## 4. Dịch vụ Sửa giá thông qua Spring Proxy
+## 4. Dịch vụ cập nhật qua Spring proxy
 
 ```java
 @Service
@@ -130,12 +130,12 @@ public class OfferAttemptService {
         this.gate = gate;
     }
 
-    // Mở Giao Dịch mới tinh cho mỗi Luồng
+    // Yêu cầu phân định transaction độc lập cho từng luồng
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public long edit(String actor, BigDecimal price) {
         ProductOffer offer = offers.findById(42L).orElseThrow();
         
-        // Bước chân vào cái bẫy chặn của đạo diễn
+        // Luồng thực thi tiến nhập vào rào chắn kiểm thử
         gate.afterLoad(actor, offer.version());
         
         offer.changePrice(price);
@@ -145,9 +145,9 @@ public class OfferAttemptService {
 }
 ```
 
-## 5. Thí nghiệm 1: Ghi đè rành rành (Không có `@Version`)
+## 5. Thử nghiệm 1: Kịch bản ghi đè khi thiếu `@Version`
 
-Nếu xóa cột `version` đi, chuyện gì xảy ra?
+Trường hợp mô phỏng loại bỏ thuộc tính `version`:
 
 ```java
 Future<Void> a = executor.submit(() -> {
@@ -164,15 +164,15 @@ a.get(5, TimeUnit.SECONDS);
 gate.aCommitted();
 b.get(5, TimeUnit.SECONDS);
 
-// B thản nhiên đạp bay công sức của A!
+// Kết quả của B đã ghi đè hoàn toàn thay đổi của A
 assertThat(price()).isEqualByComparingTo("80.00");
-// Mà cả 2 lệnh lại đều báo thành công mới cay chứ!
+// Cả 2 luồng đều nhận phản hồi thành công từ hệ thống
 assertThat(successfulCalls()).isEqualTo(2);
 ```
 
-Đấy, nếu chỉ check lỗi mà không moi database lên soi tận mắt giá trị cuối cùng, thì bạn đã bỏ lọt Lỗi mất dữ liệu (Lost Update) rồi!
+Bài kiểm thử này minh họa rủi ro mất bản cập nhật nếu hệ thống chỉ tập trung kiểm tra luồng trả về mà không đối chiếu trực tiếp dữ liệu sau cùng tại database.
 
-## 6. Thí nghiệm 2: Gắn `@Version` vào là Xung đột ngay
+## 6. Thử nghiệm 2: Kích hoạt xung đột bằng khóa lạc quan
 
 ```java
 @Test
@@ -185,118 +185,117 @@ void secondEditorCannotOverwriteCommittedVersion() throws Exception {
             attempts.edit("B", new BigDecimal("80.00"));
             return null;
         } catch (Throwable failure) {
-            return failure; // Bắt gọn cái Lỗi ném ra
+            return failure; // Lưu trữ ngoại lệ phát sinh
         }
     });
 
     gate.allowA();
-    assertThat(a.get(5, TimeUnit.SECONDS)).isEqualTo(8); // A sửa xong tăng lên v8
+    assertThat(a.get(5, TimeUnit.SECONDS)).isEqualTo(8); // A hoàn tất, version = 8
     gate.aCommitted();
 
-    Throwable loser = b.get(5, TimeUnit.SECONDS); // Luồng B xong
-    // Luồng B ăn ngay quả Lỗi mồm thúi
+    Throwable loser = b.get(5, TimeUnit.SECONDS); // Luồng B hoàn tất pha thực thi
+    // Xác minh ngoại lệ khóa lạc quan được ném ra
     assertThat(loser)
             .isInstanceOf(ObjectOptimisticLockingFailureException.class);
             
-    // Và quan trọng nhất: Dữ liệu cuối cùng được bảo toàn là của A
+    // Xác minh tính toàn vẹn của dữ liệu thuộc về transaction A
     assertThat(price()).isEqualByComparingTo("90.00");
     assertThat(version()).isEqualTo(8);
 }
 ```
 
-## 7. Thí nghiệm 3: Đã Sập là Sập Luôn (Failed transaction)
+## 7. Thử nghiệm 3: Vòng đời của transaction hỏng
 
-Khi B vướng lỗi đụng độ, cái Giao Dịch của B coi như "chết lâm sàng" (rollback-only). Bạn không thể "hô hấp nhân tạo" cho nó bằng cách `catch` lỗi rồi gọi lệnh khác đè vào.
-Muốn cứu? Mở Giao dịch MỚI, bốc dữ liệu mới từ DB lên lại.
+Một khi luồng B vướng lỗi xung đột, trạng thái của transaction bị chuyển thành `rollback-only`. Không có khả năng bắt lỗi và thử lại (catch and retry) trong cùng một transaction. Kế hoạch xử lý đòi hỏi khởi tạo transaction mới và tải lại thực thể.
 
 ```java
-// Bốc lại dữ liệu từ một Giao dịch MỚI TINH
+// Truy xuất lại thực thể từ một transaction hoàn toàn mới
 OfferView reloaded = readService.get(42);
 assertThat(reloaded.price()).isEqualByComparingTo("90.00");
 assertThat(reloaded.version()).isEqualTo(8);
-// Id của các Giao dịch không được trùng nhau!
+// Định danh của các transaction không được phép trùng lặp
 assertThat(attemptProbe.transactionIds()).doesNotHaveDuplicates();
 ```
 
-Test này chỉ để khẳng định: Muốn chơi lại thì phải làm ván mới, cấm ăn gian.
+Khẳng định nguyên lý: Thao tác tiếp nối bắt buộc phải hoạt động trên nền tảng dữ liệu mới.
 
-## 8. Thí nghiệm 4: Sút ngay từ cổng nếu Client rinh Version thiu
+## 8. Thử nghiệm 4: Kiểm soát tính nhất quán tại biên ứng dụng (xác thực version phía gọi)
 
 ```java
 ChangeOfferPrice stale = new ChangeOfferPrice(
         42,
-        7, // Version của Client nè, giờ DB nó là 8 cơ!
+        7, // Phiên bản giả định từ phía gọi (database đã là 8)
         new BigDecimal("80.00"),
         UUID.randomUUID()
 );
 
-// Sút thẳng cẳng không thương tiếc
+// Hệ thống từ chối lập tức trước khi truy xuất database cập nhật
 assertThatThrownBy(() -> editor.changePrice(stale))
         .isInstanceOf(StaleOfferEditException.class);
         
-// Data của A vẫn bình yên vô sự
+// Dữ liệu hợp lệ được bảo toàn
 assertThat(price()).isEqualByComparingTo("90.00");
 assertThat(version()).isEqualTo(8);
 ```
 
-Khi làm Controller HTTP, nhớ ánh xạ lỗi này thành `412 Precondition Failed` (Mày không đủ tư cách vì data ôi thiu) thay vì báo lỗi server nhé.
+Trên kiến trúc REST API, lỗi `StaleOfferEditException` cần được ánh xạ thành `412 Precondition Failed` nhằm phản hồi trạng thái dữ liệu lỗi thời tới phía gọi.
 
-## 9. Thí nghiệm 5: Mổ xẻ câu SQL (SQL inspection)
+## 9. Thử nghiệm 5: Phân tích cấu trúc lệnh SQL
 
-Dùng đồ nghề `StatementInspector` của Hibernate để tóm lấy câu SQL trước khi nó chui xuống DB:
+Sử dụng cơ chế `StatementInspector` của Hibernate nhằm phân tích luồng truy vấn trước khi thực thi:
 
 ```java
 assertThat(sqlCapture.updatesFor("product_offer"))
         .anySatisfy(sql -> {
             assertThat(sql).contains("version=?");
             assertThat(sql).contains("where offer_id=?");
-            assertThat(sql).contains("and version=?"); // Quan trọng nhất là khúc này!
+            assertThat(sql).contains("and version=?"); // Mệnh đề chốt chặn bảo mật
         });
 ```
 
-Chỉ tìm từ khóa thôi, đừng dại mà assert nguyên xi nguyên chuỗi SQL (nhỡ Hibernate nó đổi cách thụt lề hay thứ tự cột là test lăn ra đỏ quạch).
+Tiêu chuẩn đối sánh chỉ tìm kiếm từ khóa thay vì đối chiếu chuỗi SQL hoàn chỉnh, giúp mã kiểm thử tránh tình trạng kiểm thử thiếu ổn định do sự thay đổi trong định dạng / thứ tự cột.
 
-## 10. Thí nghiệm 6: Viết SQL chay cũng phải có tình người
+## 10. Thử nghiệm 6: Yêu cầu bắt buộc đối với truy vấn SQL thuần
 
-Nếu ông nào thích xài SQL thuần:
+Nếu dự án áp dụng SQL truy vấn thuần:
 
 ```sql
 update product_offer
 set price = 95.00,
-    version = version + 1   -- Bắt buộc phải có dòng này nha mấy cha!
+    version = version + 1   -- Bắt buộc tích hợp gia tăng biến số
 where offer_id = 42
   and version = 7;
 ```
 
-Viết test để assert xem dòng đó trả về `1` (thành công) và mớm cái v7 thêm lần nữa để ép nó trả về `0`. Cái Test này sinh ra để trị mấy ông Tối Ưu Hóa làm hỏng hợp đồng (contract) của hệ thống.
+Viết kiểm thử nhằm mô phỏng kết quả `affected rows = 0` (khi gán version không khớp) là nguyên tắc bắt buộc để rà soát các lỗ hổng của cơ chế tối ưu hóa không qua ORM.
 
-## 11. Thí nghiệm 7: 2 Luồng = 2 Server (Multi-instance)
+## 11. Thử nghiệm 7: Xác thực khả năng mở rộng đa tiến trình
 
-Code bạn chạy 2 Threads trên 1 máy, hay chạy 2 Container trên 2 máy tính khác nhau thì Kết Quả Đụng Độ Vẫn Y Chang. Lý do? Kẻ phân xử cuối cùng là cái Database bự chảng nằm dưới, nó nắm cái đuôi `version = ?`. Đó là lý do bạn ĐỪNG BAO GIỜ dùng `synchronized` để giải quyết bài toán này.
+Sự hiện diện của mệnh đề `version = ?` trong database đóng vai trò cốt lõi. Bất luận kiến trúc được xử lý qua đa luồng cục bộ hay triển khai nhiều instance trên các node độc lập, trạng thái xung đột vẫn được nhận diện y hệt. Yếu tố này phủ định hoàn toàn khả năng sử dụng khóa nội bộ JVM (như `synchronized`) cho mô hình bảo vệ database phân tán.
 
-## 12. Thí nghiệm 8: Thằng thì Sửa, Thằng thì Xóa
+## 12. Thử nghiệm 8: Xung đột giữa cập nhật và xóa dữ liệu
 
-A tải v7. Thằng B bay xuống DB gọi lệnh Xóa Mất Tích.
-A tải xong loay hoay sửa rồi xả SQL xuống... Bùm! Trả về `0` dòng (affected rows `0`).
-Lúc này bạn văng lỗi Khóa Lạc Quan hay văng lỗi "Data Not Found" (Không tìm thấy) đều được, tùy luật của Công ty bạn. Nhưng tuyệt đối không tự phục hồi (cứu sống) dòng bị xóa.
+- A truy xuất v7. B thực thi lệnh XÓA (Delete).
+- A hoàn tất quá trình cập nhật bộ nhớ, thực thi `flush`... và nhận về `affected rows = 0`.
+- Hệ thống có thể chuyển hóa lỗi này thành xung đột lạc quan hoặc ngoại lệ không tìm thấy (tùy thuộc nghiệp vụ). Khuyến nghị không được áp dụng các biện pháp phục hồi giả lập để khởi tạo lại bản ghi.
 
-## 13. Bảng Tổng Kết Số Phận (Ma trận bao phủ)
+## 13. Ma trận bao phủ trạng thái
 
-| Kịch bản | Kẻ thắng (A) | Kẻ thua (B) | Giá trị DB sau cùng |
+| Kịch bản | Trạng thái Luồng A (chiến thắng) | Trạng thái Luồng B (thua cuộc) | Giá trị database sau cùng |
 | --- | --- | --- | --- |
-| Không cột Version | Cả 2 đều báo Thành Công | Chả báo lỗi gì sất | `80`, A khóc hận vì mất tích |
-| **Có `@Version`** | Đổi được 1 dòng | Sửa được `0` dòng / Văng Exception | `90 / v8` |
-| Bơm Client thiu | DB lưu `v8` | Đuổi về từ vòng giữ xe | `90 / v8` |
-| SQL Chay thuần | Đổi được 1 dòng | Sửa được `0` dòng | Version tự nhích lên 1 |
-| Sửa đụng Xóa | Lệnh Xóa bay cái roẹt | Cắn lưỡi vì lỗi | Bốc hơi khỏi DB |
+| Không cấu hình Version | Thông báo thành công | Không báo lỗi (ghi đè ngầm) | `80` (Dữ liệu luồng A bị hủy bỏ) |
+| **Áp dụng `@Version`** | Cập nhật 1 bản ghi | Trả về `0` bản ghi / Ném ngoại lệ | `90 / v8` |
+| Phía gọi gửi version cũ | Tích hợp thành `v8` | Từ chối ngay khi xác thực | `90 / v8` |
+| Sử dụng SQL thuần | Cập nhật 1 bản ghi | Trả về `0` bản ghi | Tự động gia tăng lên 1 phiên bản |
+| Sửa đổi gặp xóa bỏ | Thực thi xóa dữ liệu thành công | Xảy ra lỗi do `affected rows = 0` | Không tồn tại bản ghi |
 
-## 14. Bí kíp dập tắt Flaky Test (Test lúc xanh lúc đỏ)
+## 14. Tiêu chuẩn chống kiểm thử thiếu ổn định
 
-- Dùng `CountDownLatch` ép các luồng xếp hàng, đừng bao giờ dùng `Thread.sleep(1000)` ngu ngốc.
-- Phải có Timeout cho mọi hành động đợi chờ, hết giờ là giựt sập.
-- Phải nhổ cỏ dọn rác DB (`delete from product_offer`) gọn gàng sạch sẽ.
-- Chơi đồ thật (PostgreSQL Testcontainers) chứ đừng tin thằng lươn lẹo H2 DB.
+- Vận dụng `CountDownLatch` để kiểm soát nhịp đồng bộ của luồng, nghiêm cấm sử dụng `Thread.sleep` phụ thuộc vào tốc độ phần cứng.
+- Áp dụng các cấu hình giới hạn thời gian (timeout) chặt chẽ cho toàn bộ các rào chắn (latch, future).
+- Thiết lập kịch bản làm sạch trạng thái database vật lý (`delete from product_offer`) trong các pha khởi tạo.
+- Khẳng định tính pháp lý thông qua PostgreSQL Testcontainers thay vì H2 in-memory DB.
 
-## 15. Áp dụng lên Đời Thật (Production)
+## 15. Tiêu chuẩn cho môi trường thực tế
 
-Đưa lên môi trường thật là phải soi log. Log ra số đụng độ, trả 412/409 bao nhiêu lần. Trò đụng độ này mà bỗng nhiên tăng vọt ngay sau đợt Đẩy Code (Deploy), thì khoan chửi Client, coi chừng mấy "pháp sư" viết SQL Chay lười cộng dồn Version rồi đó!
+Khi triển khai lên hệ thống thực, hệ thống giám sát cần thu thập chỉ số tần suất xung đột, cùng số lượng trả về mã HTTP `412/409`. Một sự gia tăng đột biến về tỷ lệ lỗi khóa lạc quan sau quá trình triển khai là dấu hiệu cảnh báo nghiêm trọng về các tệp lệnh SQL thuần / migration đã vi phạm cấu trúc quản trị version.

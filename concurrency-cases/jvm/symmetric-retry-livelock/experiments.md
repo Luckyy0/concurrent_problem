@@ -1,16 +1,12 @@
-# Deterministic livelock experiments và production verification
+# Các thử nghiệm tất định (Deterministic experiments) và kiểm chứng trên production
 
 ## Chiến lược kiểm thử
 
-Không chạy broken `while(true)` rồi hy vọng timeout. Harness giới hạn số attempt
-và dùng hai `CyclicBarrier`: barrier đầu buộc mỗi actor giữ first lock trước khi
-xin second; barrier thứ hai giữ first lock cho tới khi cả hai đã thử second lock,
-rồi hai actor mới release để bắt đầu vòng kế tiếp.
+Không chạy một vòng lặp `while(true)` bị lỗi rồi hy vọng nó sẽ timeout. Cấu trúc kiểm thử (harness) sẽ giới hạn số attempt và dùng hai `CyclicBarrier`: barrier đầu tiên buộc mỗi actor phải giữ lock thứ nhất trước khi yêu cầu lock thứ hai; barrier thứ hai duy trì việc giữ lock thứ nhất cho tới khi cả hai actor đều đã thử lấy lock thứ hai, sau đó cả hai actor mới release để bắt đầu vòng lặp kế tiếp.
 
-Mọi barrier/future có timeout; không dùng `Thread.sleep`. Xem
-[Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
+Mọi đối tượng barrier và future đều phải có timeout; không sử dụng `Thread.sleep`. Xem [Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
 
-## Experiment 1: tái hiện N vòng không progress
+## Thử nghiệm 1: tái hiện N vòng lặp nhưng không có progress
 
 ```java
 package com.example.channel;
@@ -100,12 +96,11 @@ class SymmetricRetryLivelockTest {
 }
 ```
 
-Assertion `false` cho cả hai actor cùng `attempts=40` chứng minh thread vẫn hoạt
-động nhưng không operation nào hoàn tất. Attempt budget giữ test hữu hạn.
+Kết quả kiểm tra (assertion) trả về `false` cho cả hai actor với cùng số lần `attempts=40` chứng tỏ các thread vẫn đang hoạt động nhưng không có operation nào được hoàn tất. Ngân sách số lần thử (attempt budget) giúp giới hạn thời gian chạy của test.
 
-> **Nói ngắn gọn:** test đo progress, không chỉ đo thread còn sống hay không.
+> **Nói ngắn gọn:** bài test đo lường progress, chứ không chỉ kiểm tra xem thread còn sống hay không.
 
-## Experiment 2: ordering cho phép hai operation hoàn tất
+## Thử nghiệm 2: việc phân định thứ tự (ordering) cho phép hai operation hoàn tất
 
 ```java
 @Test
@@ -146,54 +141,45 @@ private static void awaitLatch(CountDownLatch latch) {
 }
 ```
 
-Hai swap tuần tự đưa ownership về state ban đầu. Future timeout là watchdog nếu
-ordering bị regression. Snippet cần imports `CountDownLatch` và static assertions
-đã dùng ở Experiment 1.
+Hai lệnh swap tuần tự đưa ownership trở về state ban đầu. Future timeout đóng vai trò như một cơ chế giám sát (watchdog) trong trường hợp tính năng ordering bị lỗi (regression). Đoạn mã này cần import `CountDownLatch` và các static assertion đã dùng ở Thử nghiệm 1.
 
-## Experiment 3: retry budget luôn tạo terminal outcome
+## Thử nghiệm 3: retry budget luôn tạo ra kết quả cuối cùng (terminal outcome)
 
-Inject `RandomGenerator` deterministic vào solution 2 và một harness luôn trả
-conflict. Assert:
+Truyền vào (inject) một đối tượng `RandomGenerator` mang tính tất định (deterministic) cho giải pháp 2 và một harness luôn trả về trạng thái conflict. Các bước assert gồm:
 
-- method trả `CONTENDED`, không chạy vô hạn;
-- attempt count đúng `maxAttempts`;
-- tổng backoff không vượt operation deadline;
-- không lock nào còn held sau return;
-- input invalid (`maxAttempts <= 0`, timeout không dương) bị reject;
-- interrupt trước/trong backoff trả `INTERRUPTED` và giữ interrupt flag.
+- phương thức trả về kết quả `CONTENDED`, không chạy vô hạn;
+- số lần attempt đếm được đúng bằng `maxAttempts`;
+- tổng thời gian backoff không vượt quá operation deadline;
+- không có lock nào còn bị giữ (held) sau khi hàm trả về;
+- dữ liệu đầu vào không hợp lệ (`maxAttempts <= 0` hoặc timeout không phải số dương) sẽ bị từ chối (reject);
+- nếu có interrupt trước hoặc trong quá trình backoff, hệ thống sẽ trả về `INTERRUPTED` và giữ nguyên cờ interrupt (flag).
 
-Không assert jitter “phải” bảo đảm success; randomized backoff chỉ thay đổi xác
-suất. Termination đến từ deadline/attempt cap.
+Không assert rằng jitter "phải" bảo đảm trạng thái success; randomized backoff chỉ có tác dụng thay đổi xác suất thành công. Việc dừng vòng lặp (termination) phải đến từ deadline hoặc giới hạn attempt (attempt cap).
 
-## Experiment 4: stress với hot key
+## Thử nghiệm 4: stress test với hot key
 
-Sau deterministic tests, chạy nhiều actor trên cùng channel pair và ghi seed.
-Assert completed + contended + interrupted bằng submitted; không operation vượt
-deadline; ownership luôn thuộc tập owner hợp lệ; attempt/completion ratio có giới
-hạn theo policy.
+Sau các bài kiểm thử tất định (deterministic test), tiến hành chạy nhiều actor trên cùng một cặp channel và ghi lại seed. Cần assert rằng tổng số completed, contended và interrupted bằng số lượng submitted; không có operation nào vượt quá deadline; quyền sở hữu (ownership) luôn thuộc một tập owner hợp lệ; tỷ lệ attempt trên completion nằm trong giới hạn theo policy.
 
-Stress test dùng injected random seed, không log từng retry, không thay thế
-Experiment 1.
+Stress test phải sử dụng random seed được inject, không log từng lần retry và không thể thay thế cho Thử nghiệm 1.
 
-## Production verification
+## Kiểm chứng trên môi trường production
 
 - `swap_attempt_total`, `swap_completed_total`, `retry_exhausted_total`;
-- attempts per operation và backoff duration;
-- operation deadline/interrupt;
-- lock conflict theo channel pair hash;
-- CPU/runnable thread count và state-version progress;
-- completed throughput so với retry rate.
+- số lần attempt cho mỗi operation và khoảng thời gian backoff;
+- operation deadline hoặc tín hiệu interrupt;
+- lock conflict dựa theo mã băm (hash) của cặp channel;
+- mức sử dụng CPU, số lượng runnable thread và tiến trình chuyển đổi state version;
+- throughput hoàn tất (completed throughput) so với tỷ lệ retry (retry rate).
 
-Alert khi retry tăng nhưng completed/state version không đổi. Một thread dump đơn
-lẻ có thể không bắt được livelock; dùng metric/time-series và nhiều snapshot.
+Thiết lập cảnh báo (alert) khi retry tăng nhưng số completed hoặc state version không đổi. Một thread dump đơn lẻ có thể không bắt được tình trạng livelock; hãy dùng các metric chuỗi thời gian (time-series) và thu thập nhiều snapshot.
 
 ## Checklist chất lượng
 
-- [ ] Symmetry được tạo bằng barrier, không bằng sleep.
-- [ ] Broken harness hữu hạn nhờ attempt budget.
-- [ ] Cả hai actor retry nhưng không progress được assert.
-- [ ] Fixed ordering test chạy hai direction cùng lúc.
-- [ ] Mọi barrier/latch/future có timeout.
-- [ ] Interrupt flag và lock cleanup được test.
-- [ ] RandomGenerator được inject để test reproducible.
-- [ ] Production signal đo completion cùng retry, không chỉ CPU.
+- [ ] Tính đối xứng (symmetry) được tạo ra bằng barrier, không dùng hàm sleep.
+- [ ] Harness bị lỗi sẽ vẫn có tính hữu hạn nhờ sử dụng attempt budget.
+- [ ] Đảm bảo assert được việc cả hai actor đều retry nhưng không tạo ra progress.
+- [ ] Test tính năng fixed ordering bằng cách chạy hai hướng (direction) cùng một lúc.
+- [ ] Mọi đối tượng barrier, latch, hay future đều được cấu hình timeout.
+- [ ] Cờ interrupt và quá trình dọn dẹp lock (lock cleanup) phải được test.
+- [ ] Đối tượng `RandomGenerator` được inject để bảo đảm test có thể tái hiện được (reproducible).
+- [ ] Các tín hiệu (signal) trên production phải đo lường được tỷ lệ completion cùng với retry, chứ không chỉ đo mức sử dụng CPU.

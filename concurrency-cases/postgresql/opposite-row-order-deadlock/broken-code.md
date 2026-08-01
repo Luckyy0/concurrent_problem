@@ -1,6 +1,6 @@
-# Đống Code Khai Tử: Cầm Đèn Chạy Trước Ô Tô, Khóa Nguồn Trước Đích (Code lỗi — khóa tài khoản nguồn rồi tài khoản đích)
+# Phân Tích Mã Nguồn Lỗi: Khóa tài nguyên theo thứ tự động (Broken code — dynamic lock ordering)
 
-## 1. Cấu Trúc Khung Xương (Entity tối thiểu)
+## 1. Cấu trúc thực thể (Entity definition)
 
 ```java
 package example.transfer;
@@ -48,9 +48,9 @@ public class Account {
 }
 ```
 
-Ví dụ này Sếp cố tình bóp cái Đồ án (domain) lại cho bé xíu để em nhìn thấu cái Deadlock. Code Ngân Hàng chốt sổ thật (Production financial model) người ta còn múa cả Sổ cái (ledger), Dấu vết (audit), Khóa trùng (idempotency) và Đối soát cuối ngày (reconciliation); Ba cái đó Sếp đéo nhét vô đây làm gì cho rối rắm.
+Ví dụ này sử dụng một mô hình nghiệp vụ (domain model) tối giản để tập trung vào cơ chế gây ra Deadlock. Trong các hệ thống tài chính thực tế, mô hình này sẽ phức tạp hơn với sổ cái (ledger), lưu trữ lịch sử kiểm toán (audit trail), xử lý trùng lặp (idempotency) và nghiệp vụ đối soát.
 
-## 2. Thằng Kho Giữ Cửa (Repository lấy khóa bi quan - `pessimistic lock`)
+## 2. Truy xuất dữ liệu với khóa bi quan (Pessimistic lock repository)
 
 ```java
 package example.transfer;
@@ -70,7 +70,7 @@ public interface AccountRepository extends JpaRepository<Account, Long> {
 }
 ```
 
-Lệnh này xúi thằng đệ Hibernate nhổ bọt ra câu SQL y chang thế này:
+Sử dụng annotation `@Lock(LockModeType.PESSIMISTIC_WRITE)` sẽ tạo ra câu lệnh SQL như sau thông qua Hibernate:
 
 ```sql
 select id, balance
@@ -79,9 +79,9 @@ where id = ?
 for update;
 ```
 
-Mỗi lần thốt ra câu lệnh trên, Nó giật Lấy Cái Ổ Khóa Dòng (row-level lock) và Ôm Chặt Lấy Cho Tới Khi Hàm Giao Dịch Chốt Sổ Xong Xuôi (transaction end).
+Lệnh `FOR UPDATE` thực hiện cấp khóa độc quyền cấp dòng (row-level lock) trên các bản ghi thỏa mãn điều kiện. Khóa này sẽ được nắm giữ cho đến khi giao dịch chứa nó kết thúc (commit hoặc rollback).
 
-## 3. Dịch Vụ Mù Quáng: Trông Thì Hợp Lý Nhưng Đi Lùi (Service trông hợp lý nhưng tạo thứ tự ngược)
+## 3. Dịch vụ gây lỗi: Khóa theo tham số truyền vào (Broken service implementation)
 
 ```java
 package example.transfer;
@@ -106,13 +106,13 @@ public class BrokenTransferService {
             throw new IllegalArgumentException("source equals destination");
         }
 
-        // TỘI ÁC BẮT ĐẦU TỪ ĐÂY: Trình tự lấy khóa ăn theo hướng chuyển tiền
+        // LỖI NGHIÊM TRỌNG: Trình tự khóa phụ thuộc vào tham số đầu vào
         Account source = lock(fromId);
         Account destination = lock(toId);
 
         source.debit(amount);
         destination.credit(amount);
-        // Thằng Kiểm Tra Rác (Dirty checking) sẽ xả 2 câu UPDATE trước khi gõ Búa Chốt Sổ (commit).
+        // Quá trình Dirty checking của Hibernate sẽ sinh các lệnh UPDATE trước khi commit
     }
 
     private Account lock(long accountId) {
@@ -122,40 +122,40 @@ public class BrokenTransferService {
 }
 ```
 
-Lệnh Chuyển A→B sẽ vồ khóa A trước. Lệnh Chuyển B→A lại tham lam vồ khóa B trước. Rõ ràng Mọi Đứa Giao Dịch Đều Đang Khư Khư Bảo Vệ Khúc Rút Tiền Của Nó, NHƯNG LẠI ĐÉO HỀ CÓ MỘT THỨ TỰ TÔN TI CHUNG (total order chung).
+Với cấu trúc trên, lệnh chuyển từ A sang B sẽ khóa tài khoản A trước, trong khi lệnh chuyển từ B sang A sẽ khóa tài khoản B trước. Các giao dịch cố gắng bảo vệ dữ liệu nhưng lại bỏ qua yêu cầu thiết lập một trật tự chuẩn chung (canonical order). Điều này khiến hệ thống dễ bị rơi vào trạng thái bế tắc (deadlock) khi các luồng hoạt động đồng thời đan chéo nhau.
 
-> **Nói ngắn gọn:** Tội của Mày không nằm ở chuyện xài thiếu Bùa `FOR UPDATE`; Cái Ngu Nằm Ở Chỗ Mày ĐI XIN MỘT MỚ Ổ KHÓA NHƯNG LẠI PHỤ THUỘC VÀO CHIỀU ĐI CỦA ĐÍCH HAY NGUỒN.
+## 4. Xung đột luồng thao tác (Interleaved SQL execution)
 
-## 4. Bãi Chiến Trường Chéo Cánh (Thứ tự SQL xen kẽ gây lỗi)
+Khi hai tiến trình tương tác ngược chiều diễn ra song song:
 
 ```sql
--- Thằng T1 Lên Tiếng
+-- Giao dịch T1 (từ A -> B)
 begin;
-select * from account where id = 101 for update; -- T1 túm được A
+select * from account where id = 101 for update; -- T1 khóa A (ID: 101)
 
--- Thằng T2 Lên Tiếng
+-- Giao dịch T2 (từ B -> A)
 begin;
-select * from account where id = 202 for update; -- T2 túm được B
+select * from account where id = 202 for update; -- T2 khóa B (ID: 202)
 
--- Thằng T1 Lại Kêu Lên
-select * from account where id = 202 for update; -- T1 đứng Há Mỏ chờ T2 thả B
+-- T1 tiếp tục:
+select * from account where id = 202 for update; -- T1 phải chờ T2 giải phóng B
 
--- Thằng T2 Kêu Lên Trả Đũa
-select * from account where id = 101 for update; -- VÒNG LUẨN QUẨN BÙNG NỔ! Bắt Buộc Có Đứa Chết!
+-- T2 tiếp tục:
+select * from account where id = 101 for update; -- T2 phải chờ T1 giải phóng A -> DEADLOCK!
 ```
 
-Đồng hồ đếm ngược hết giờ, 1 trong 2 đứa nếm mùi Thất Bại Ngọt Ngào:
+Kết quả là một trong hai giao dịch sẽ nhận được ngoại lệ từ PostgreSQL:
 
 ```text
 ERROR: deadlock detected
 SQLSTATE: 40P01
 ```
 
-Thằng DB PostgreSQL nó khoái bắn đứa nào nó bắn, có thể T1, có thể T2 (chọn victim). Mày Lập Trình Tuyệt Đối CẤM DỰA DẪM Vào Việc Thằng Connection Nào Yếu Đuối Hay Bị Bắn Lặp Đi Lặp Lại.
+Cơ sở dữ liệu tự động chọn một nạn nhân để hủy bỏ (abort). Ứng dụng không thể dự đoán hoặc thao túng quá trình lựa chọn này.
 
-## 5. Cấp Cứu Tào Lao Ngay Tại Hiện Trường Đống Rác (Retry sai bên trong transaction cũ)
+## 5. Áp dụng Retry không hợp lệ (Invalid retry within the same transaction)
 
-Bị DB bắn cho tơi tả ở Production (nhận mã `40P01`), Mấy Đứa Mới Học Nghề hay nhét đoạn này vào nè:
+Lập trình viên đôi khi cố gắng bắt ngoại lệ và thử lại ngay trong khối giao dịch (transaction block) hiện tại:
 
 ```java
 package example.transfer;
@@ -188,7 +188,7 @@ public class BrokenRetryingTransferService {
                 return;
             } catch (CannotAcquireLockException deadlockOrTimeout) {
                 entityManager.clear();
-                // NGU XUẨN: Xịt rửa cái Persistence Context ĐÉO ĐẺ RA ĐƯỢC 1 cái Giao Dịch DB (database transaction) Mới Đâu!
+                // LỖI KỸ THUẬT: Xóa persistence context không tạo ra giao dịch CSDL mới.
             }
         }
         throw new TransferTemporarilyUnavailableException();
@@ -196,12 +196,13 @@ public class BrokenRetryingTransferService {
 }
 ```
 
-Bởi vì một khi thằng PostgreSQL nhả rác `40P01` ra, CÁI GIAO DỊCH HIỆN TẠI COI NHƯ ĐÃ THÀNH XÁC ƯỚP (aborted state).
-Bất kể mày đánh lệnh gì tiếp, nó cũng sẽ Vỗ Mặt Chửi `25P02` (`in_failed_sql_transaction`) cho tới khi Mày Tự Tay Gọi Xe Rác Dọn Đi (rollback). Cái chai thuốc tẩy `EntityManager.clear()` Của Thằng JPA chỉ bứt Entity Ra Thôi; NÓ KHÔNG BIẾT VÀ KHÔNG THỂ LÀM DB DỌN DẸP GIAO DỊCH (Rollback JDBC) CŨNG KHÔNG HỀ NHẢ MỚ Ổ KHÓA CŨ RA!
+Khi PostgreSQL trả về ngoại lệ `40P01`, giao dịch cơ sở dữ liệu đã chuyển sang trạng thái `aborted`. Bất kỳ lệnh SQL nào tiếp theo trong giao dịch này sẽ bị từ chối với lỗi `25P02` (`in_failed_sql_transaction`) cho đến khi lệnh `ROLLBACK` được thực hiện. 
 
-Chưa hết, Chữ `CannotAcquireLockException` Bọc Ở Ngoài Dày Cộp Bao Quanh Hàng Đống Thứ Không Lấy Được Khóa Khác Nữa. Muốn Viết Luật Retry Thật Sự Phải Lột Vỏ Ra (inspect SQLSTATE/cause), Chứ Cấm Bốc Hốt Rằng: Thấy Cái Tên Ngoại Lệ Đó Nghĩa Là Đang Bị Kẹt Xe!
+Sử dụng `EntityManager.clear()` chỉ xóa trạng thái của bộ nhớ đệm (Persistence Context), nhưng không tác động đến giao dịch JDBC (JDBC transaction) đang tồn tại và không nhả khóa (lock) cơ sở dữ liệu. Thêm vào đó, `CannotAcquireLockException` có thể bao gồm nhiều trường hợp lỗi lấy khóa khác (như lock timeout), yêu cầu hệ thống phải phân tích cụ thể mã `SQLSTATE` thay vì chỉ phụ thuộc vào tên class Exception.
 
-## 6. Món Võ Mèo Cào Ở Một Mình (Khóa cục bộ không bảo vệ nhiều instance)
+## 6. Giải pháp khóa cục bộ (Local synchronization issue)
+
+Sử dụng cơ chế khóa cục bộ của Java:
 
 ```java
 private final Object transferMutex = new Object();
@@ -213,31 +214,25 @@ public void transfer(...) {
 }
 ```
 
-Cái Bùa Này chỉ hù được mấy cái Luồng (threads) Đang Lanh Chanh Trong Đúng Cái 1 Cái Xó Máy Chủ Tụi Nó Đang Đứng Thôi (1 JVM). Thằng App-1 Và Mấy Thằng App-2 Giữ Cái Ổ Khóa Nội Bộ Chả Liên Quan Gì Đến Nhau Nhưng Vẫn Lao Vào Cấu Xé Chung 1 Ổ Khóa Dòng Của Thằng PostgreSQL, Kết Quả Banh Xác Như Thường! Nó Lại Còn Làm Ứ Đọng Tốc Độ Chạy (throughput) Trên Từng Máy Mà Chẳng Giải Quyết Được Chút Quyền Lợi Nào Về Sự Thống Nhất Chung (correctness boundary).
+Cơ chế này chỉ đồng bộ hóa các luồng trên cùng một máy ảo (JVM). Khi ứng dụng triển khai trên môi trường nhiều máy chủ (multi-instance), các JVM độc lập không chia sẻ `transferMutex` sẽ tiếp tục tranh chấp các bản ghi (rows) trong cơ sở dữ liệu và vẫn dẫn đến Deadlock. Đồng thời, cấu trúc khóa độc quyền (exclusive lock) này sẽ làm giảm đáng kể khả năng đáp ứng (throughput) của hệ thống.
 
-## 7. Setup Bẫy Để Xem Chúng Nó Cắn Nhau (Điều kiện để tái hiện)
+## 7. Các điều kiện tái hiện (Reproduction criteria)
 
-1. Sổ cái Đã Ghi Chép Vào Sẵn 2 dòng Account mang 2 Số ID Khác Nhau.
-2. Vác 2 Ống Nước Riêng Biệt (physical PostgreSQL connections) Bơm 2 Cục Giao Dịch Chạy Cùng Lúc.
-3. Kẻ T1 Giành Xong A Trước Mới Đi Ngó B.
-4. Kẻ T2 Tranh Xong B Trước Khi Liếc Ngó A.
-5. Cả 2 Đứa Mở Giao Dịch Miệng Thổi Sáo Há Mỏ Đợi Cục Khóa Tiếp Theo.
-6. Đồng Hồ Giám Thị Chỉnh Nhanh (`deadlock_timeout` ngắn) Cho Vừa Mắt Test Nhưng Khóa Bạc Đầu (`lock_timeout`) Đừng Có Nổ Giữa Chừng.
-7. Vác DB Thật Chơi Thật Trân Bằng PostgreSQL; Thằng H2 Sinh Ra Chả Phải Để Làm Bằng Chứng Cho Cái Màn Bắt Lỗi Xịn Xò Này.
+1. Có sẵn các bản ghi tài khoản để thực hiện giao dịch, mỗi bản ghi mang một ID định danh.
+2. Hai giao dịch thực thi trên hai luồng và hai kết nối vật lý (physical connections) độc lập.
+3. Giao dịch T1 hoàn thành việc khóa tài nguyên A.
+4. Giao dịch T2 hoàn thành việc khóa tài nguyên B trước khi T1 bắt đầu yêu cầu khóa B.
+5. Cấu hình tham số kiểm tra deadlock (`deadlock_timeout`) nhỏ hơn tham số chờ khóa (`lock_timeout`).
+6. Thử nghiệm trên cơ sở dữ liệu PostgreSQL thực tế thay vì dùng cơ sở dữ liệu in-memory (như H2) để đảm bảo độ chính xác của cơ chế MVCC.
 
-Kê Lệnh Rào Chắn `CountDownLatch` Dằn Mặt Sau Cục Khóa Thứ 1 Để Bắt Tụi Nó Chen Ngang (interleaving). Chứ Cứ Lùa 2 Lệnh Gửi Cùng Nhau Đi Rất Dễ Bị Xịt, Và Màn Kịch Lỗi Không Bao Giờ Thấy Trên Máy Chấm Tự Động (CI run).
+## 8. Các phương pháp khắc phục chưa toàn diện (Incomplete mitigations)
 
-## 8. Đừng Ráng Chữa Cháy Kiểu Phèn (Các cách sửa chưa đủ)
+- **Tăng `lock_timeout`:** Tăng thời gian chờ có thể giải quyết các lỗi chậm do quá tải, nhưng không khắc phục được tình trạng chờ chéo của deadlock.
+- **Retry không giới hạn:** Dẫn đến "retry storm", tiêu hao băng thông kết nối và tài nguyên tính toán của cơ sở dữ liệu.
+- **Thực hiện một chiều (One-way process):** Loại bỏ việc tranh chấp từ một quy trình, nhưng deadlock vẫn có thể xảy ra do các công việc khác (như batch jobs hoặc đối soát).
+- **Điều chỉnh cấu hình giám sát PostgreSQL:** Điều chỉnh `deadlock_timeout` để giảm tần suất kiểm tra có thể giúp giảm sử dụng CPU của PostgreSQL nhưng không ngăn chặn được deadlock.
 
-- Nới Lỏng Giờ Chờ Khóa Cửa (`lock_timeout`): Chờ Mòn Gối Cho Xong Nhưng Cục Tức Cắn Đuôi Nhau Vẫn Không Hết Nhé.
-- Xài Bùa Thử Lại Bất Tử Cứ Thấy Lỗi Là Chạy Tới Bến: Nó Đẻ Ra Trận Mưa Súng Đạn Liên Hoàn Gây Sụp (retry storm) Qua Cả Hạn Chót Của Hệ Thống.
-- Sợ Lỗi Nhai Nuốt Xong Báo Success Lá Cải: Kẻ Chết Thay Của Ta Đã Đem Vứt Chôn Rác Mất Xác (rollback) Mà Khách Hàng Ở Kia Lại Chén Kết Quả Báo Láo À?
-- Sắp Xếp Luồng Của 1 Cửa Này Thôi Nè: Còn Cái Lũ Batch Chạy Đêm / Đối Soát Bên Cạnh Nó Cầm Ngược Khóa Tới Sáng Sớm Cho Tụi Em Nhận Rác Nữa Kìa.
-- Trình Lười Đọc Số Nhảm `SELECT` Của Gái Đẹp Xong Mới Xin Kẹo `FOR UPDATE`: Không Ép Nhường Hàng Từ Sớm (reserve row) Xong Chạy Đi Cầm Trật Khóa Lại.
-- Vặn Nút Giờ Giám Thị Khám Nhỏ Tới Dấu Chấm Đỏ Dưới Production: Đè Chết Cổ Bắt Giám Thị Bào CPU Nhưng Đéo Cắn Đuôi Nhau Mất Đâu.
-- Bắt Giao Dịch Làm Đồ Tể / Alo Remote Ra Đời Gọi Notification Ngay Giữa Đoạn Xin Nhau Khóa Cửa Kìa: Hút Trọn Đời Đợi (lock lifetime) Lên Đỉnh Mây Mở Rộng Địa Hình Nổ Bom (blast radius).
-
-## 9. Đổ Nền Gạch Dựng Sân (DDL và dữ liệu khởi tạo cho thí nghiệm)
+## 9. Khởi tạo cấu trúc bảng thí nghiệm (DDL setup)
 
 ```sql
 create table account (
@@ -249,4 +244,4 @@ insert into account(id, balance)
 values (101, 1000.00), (202, 1000.00);
 ```
 
-Rào Lưới Nhện `balance >= 0` Chỉ Để Chống Chế Phòng Hờ Lớp Vỏ Hù Dọa Ở Case Này Thôi Nhé. Mơ Đi Nó Bằng Thế Nào Được Vài Con Logic Ràng Buộc Kế Toán Nhúng Kĩ Ở Lớp Application Hay Chục Bức Tường Sổ Cái Nhà Bank Thật Xây Nên Đâu!
+Ràng buộc (constraint) `balance >= 0` đảm bảo tính toàn vẹn cơ bản. Tuy nhiên, logic kiểm tra và trừ tiền thường phải được thực hiện ở tầng ứng dụng (application code) sau khi các bản ghi đã được khóa thành công để xử lý các yêu cầu nghiệp vụ phức tạp.

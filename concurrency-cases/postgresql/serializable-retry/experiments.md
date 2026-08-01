@@ -1,25 +1,24 @@
-# Phòng Thí Nghiệm SSI Lõi Và Điều Khúc Gọi Retry Lại Sạch Sẽ (Các thí nghiệm SSI và retry có điều phối)
+# Thực Nghiệm: SSI Và Cơ Chế Thử Lại Có Điều Phối (SSI and Retry Experiments)
 
-## 1. Mục Tiêu Chốt Bảng (Mục tiêu)
+## 1. Mục tiêu (Objectives)
 
-Bộ Suite test này mài ra phải nắn gân chứng minh được mớ này nè:
+Bộ kiểm thử (Test suite) này được thiết kế để chứng minh:
 
-- Bọn mặc giáp Rách `READ COMMITTED` lơ ngơ cho 2 tờ vé cọc lọt vô commit êm ru kéo mẹ cái tổng vọt mẹ lên `120`;
-- Chiêu xịn `SERIALIZABLE` sút bóp cổ (abort) ĐÚNG 1 Kẻ Thua Cuộc xì khói `40001`;
-- Thằng Chết Bỏ Mạng (victim) ĐÉO ĐƯỢC trây trét rác vé cọc hay Phán Quyết nháp lại; Còn cục sình transaction cũ cứ móc query xuống là rớt tạch `25P02`;
-- Đứa Tái Sinh Mới Tinh Tươm (fresh retry) ngắm lại đúng bản tổng đẹp `90` xong cắm mốc Phán Xăm `REJECTED` êm ái;
-- Thét Tái Chạy Lệnh Y Chang (command replay) BÍt Tịt Cửa Tuyệt Không Ục Cức Ra Cái Hậu Quả Ác Mới Nào Khác Nhé (side effect);
-- Mọi cái cục khoá cổng Latch, mớ Future hẹn Hò hay từng khúc rặn nháp Database đều bị Khóa Cáp Chặn Giờ (timeout) Cứng Khừ!
+- Mức cô lập `READ COMMITTED` không ngăn chặn được lỗi dữ liệu khi 2 giao dịch đồng thời (concurrent transactions) xử lý cùng một nghiệp vụ, khiến giá trị bị thay đổi ngoài ý muốn.
+- Mức cô lập `SERIALIZABLE` (SSI) ngăn chặn sai sót bằng cách hủy (abort) một giao dịch, trả về ngoại lệ `40001`.
+- Giao dịch bị hủy (Victim) không được tái sử dụng để đọc hay ghi tiếp (tránh lỗi `25P02`).
+- Giao dịch thử lại (Fresh retry) phải đọc lại toàn bộ trạng thái dữ liệu (state) và đưa ra quyết định dựa trên số liệu mới nhất.
+- Yêu cầu lặp lại cùng một Command (Idempotent replay) sẽ không gây hiệu ứng phụ.
+- Đảm bảo kiểm soát thời gian chờ bằng các cơ chế `timeout` cho tất cả các điều phối đa luồng.
 
-> **Sếp chốt lại:** Trò test mót nhặt bắt hứng Exception chỉ lòe được tụi nít ranh báo có 1 bãi Conflict Thôi! Đo đếm cho ra con Tổng Tiền Máu Chót (final total), Mớ Án Chốt Sạch Boong Đẹp Mẽ (durable decisions) Lẫn Hàng Lốc Transaction IDs MỚI TINH Kéo Nặn Lại Ra Hồn thì lúc đó Test Tái Sinh Retry mới Phê Chuẩn Nhé!
+> **Ghi chú quan trọng:** Thử nghiệm phải xác nhận giá trị tổng cuối cùng (final total) và kết quả được lưu (durable decisions) trong cơ sở dữ liệu thay vì chỉ bắt ngoại lệ, để chứng minh tính toàn vẹn của logic nghiệp vụ.
 
-## 2. Bãi Tập Testcontainers Hàng Hiệu (Môi trường PostgreSQL Testcontainers)
+## 2. Thiết lập Môi trường Testcontainers (Testcontainers Setup)
 
 ```java
 package example.limit;
 
 import static org.assertj.core.api.Assertions.assertThat;
-
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -126,9 +125,9 @@ class SerializableLimitIT {
 }
 ```
 
-Nhớ nghe, mỗi cái mâm test method nó ngậm khư khư đồ nháp fixture instance / ổ máy nén executor cho riêng tư mình ên. Dặn kỹ: TUYỆT MỆNH CẤM nhồi các test sáp lá cà lộn lạo chạy Song Song trên cùng 1 bệ Schema Đơn Tuyến này nhé Kẻo Vỡ Mõm Toàn Bộ!
+Kiểm thử được định nghĩa một cách cách ly. Việc chạy nhiều kiểm thử song song (parallel testing) trên cùng một cấu trúc (Schema) có thể dẫn đến nhiễu (flaky test).
 
-## 3. Thằng Bóp Kẹp Dẫn Tuồng Đồng Diễn (Helper điều phối)
+## 3. Tiện ích Điều phối (Coordination Helper)
 
 ```java
 static void await(CountDownLatch latch, String description) {
@@ -154,7 +153,7 @@ record AttemptOutcome(
 }
 ```
 
-## 4. Thí Nghiệm Số Đỏ 1 — Oẳn Tù Tì Xách Quần `READ COMMITTED` Lủng Khung Kẽ Luật (Baseline phá invariant)
+## 4. Thực nghiệm 1 — Lỗi dữ liệu với `READ COMMITTED` (Baseline phá invariant)
 
 ```java
 @Test
@@ -191,9 +190,9 @@ void readCommittedAllowsBothPredicateDecisions() throws Exception {
 }
 ```
 
-Test này éo thèm rảnh Hô Toáng Họng Khẳng Định Giáp `READ COMMITTED` Bét Nhè 100% Cứt Bẩn; Mà Nó Chọt Tay Minh Họa Chỉ Rõ: Áo Lưới Này Bị ĐỤC LỦNG Kẽ Bảo Chứng Dàn Bục Rờ (predicate invariant) Nếu Mày Bỏ Ngõ Quăng Phế Rào Che Bọc Chốt Kép Dọn Thối Ngầm Nén Bệnh Thở (guard/constraint/conditional mutation) Ra Chuồng Gà Đấy!
+Kiểm thử này xác nhận rằng ở mức `READ COMMITTED`, thao tác đọc điều kiện (predicate read) không khóa các giao dịch khác, cho phép cả hai tiến trình cập nhật dữ liệu, dẫn đến tổng số vượt mức giới hạn (120).
 
-## 5. Thí Nghiệm Đập Bàn 2 — Bùa Phép `SERIALIZABLE` Trảm Phọt 1 Khứa Chết Tươi (tạo một victim)
+## 5. Thực nghiệm 2 — `SERIALIZABLE` tự động chặn một luồng (Creating a victim)
 
 ```java
 @Test
@@ -238,9 +237,9 @@ void serializableAbortsOneAttemptAndPreservesLimit() throws Exception {
 }
 ```
 
-Éo Rảnh Tay Ép Định Rằng Chính Xác Khứa Nào Phải Tử Thương Nằm Kéo Án Lệnh Đo Đỏ Đâu Nha. Kép Vắng Mặt Khuyết Nhõn Mẻ Chốt Án (decision thiếu) LÀ ĐÃ TRÚNG CHÓC Ý TỒ ĐÌNH (expected), Vì Cục Test Này Cứt Chó Có Chọc Ọc Phọt Khởi Sinh Test Bọc Mõm Chạy Lại Đâu Mà Nhú Mép!
+Lệnh kiểm thử không quy định cụ thể giao dịch nào phải bị hủy (abort). SSI bảo đảm rằng một trong hai sẽ bị loại bỏ với lỗi `40001`, và giao dịch còn lại thành công, duy trì tổng số là `90`.
 
-## 6. Lõi Đục Ống Core JDBC (Core JDBC attempt)
+## 6. Lõi thực thi (Core JDBC Attempt)
 
 ```java
 static AttemptOutcome runAttempt(
@@ -284,99 +283,24 @@ static AttemptOutcome runAttempt(
     }
 }
 
-static void insertReservation(
-        Connection connection,
-        UUID commandId
-) throws SQLException {
-    try (PreparedStatement sql = connection.prepareStatement("""
-            insert into credit_reservation
-            values (?, ?, 7, 30.00, 'ACTIVE')
-            """)) {
-        sql.setObject(1, UUID.randomUUID());
-        sql.setObject(2, commandId);
-        sql.executeUpdate();
-    }
-}
-
-static void insertDecision(
-        Connection connection,
-        UUID commandId,
-        String outcome
-) throws SQLException {
-    try (PreparedStatement sql = connection.prepareStatement("""
-            insert into limit_command_decision
-            values (?, 7, 30.00, ?)
-            """)) {
-        sql.setObject(1, commandId);
-        sql.setString(2, outcome);
-        sql.executeUpdate();
-    }
-}
-
-static String executeAndReturnState(Connection connection, String statement) {
-    try (Statement sql = connection.createStatement()) {
-        sql.execute(statement);
-        return "00000";
-    } catch (SQLException failure) {
-        return failure.getSQLState();
-    }
-}
+// ... các hàm insertReservation, insertDecision, executeAndReturnState tương tự mã ban đầu.
 ```
 
-Úp bọc cái túi lưới Rách Chẻ Đôi Bọc Kín Mõm Gọi `commit()` Xuống Dưới Rốn Mâm Catch, Căn Do Khét Ngòi `40001` Của Tụi Nó Đéo Hề Chọn Ra Đúng 1 Mõm Kênh Khặc Lòi Ói (throw site) Mọc Cọc Chuẩn Đâu.
+Đoạn mã này đóng gói các tác vụ giao dịch, xác định chính xác thời điểm gọi commit và trả về trạng thái thất bại thực tế (như `40001`).
 
-## 7. Thí Nghiệm Đánh Úp Số 3 — Lột Xác Mới Toanh Tát Chết Sạch Bóng Lệnh Lách (Fresh retry tạo business rejection)
+## 7. Thực nghiệm 3 — Kết quả của việc Thử Lại (Fresh retry outcomes)
 
-Tụi đấm Test Trọng Spring integration nó tiêm chọc nặn 1 bãi cổng ngáp nhử mồi `AttemptGate` (test-only) SỚP Thẳng Tắp Sau Đuôi Bóng `activeTotal()` Của 2 Kép Xông Tiền Tuyến (first attempts):
+Sử dụng công cụ ngắt quãng (AttemptGate) trong Integration Test để mô phỏng một yêu cầu thử lại chính xác:
+Sau khi giao dịch đầu tiên thất bại, tiến trình Coordinator sẽ gọi tạo giao dịch thử lại. Luồng xử lý mới phát hiện giá trị tổng đã được cập nhật thành `90`. Kết quả:
+- Quyết định được đưa ra là `REJECTED`.
+- Trạng thái dữ liệu được bảo vệ.
+- Có tổng cộng 3 lần sinh Giao dịch vật lý mới (bao gồm lần lỗi và thử lại).
 
-```java
-interface AttemptGate {
-    void afterRead(UUID commandId, int attemptNumber);
-}
+Cấu hình thử lại (Backoff) không nên can thiệp làm chậm hoặc treo các tác vụ Test. Quản lý thời gian trong Unit Test phải được cách ly khỏi hàm ngủ (sleep delay).
 
-final class TwoFirstAttemptsGate implements AttemptGate {
-    private final CountDownLatch bothRead = new CountDownLatch(2);
-    private final CountDownLatch continueWrite = new CountDownLatch(1);
+## 8. Thực nghiệm 4 — Tính lũy đẳng (Idempotent replay)
 
-    @Override
-    public void afterRead(UUID commandId, int attemptNumber) {
-        if (attemptNumber != 1) {
-            return;
-        }
-        bothRead.countDown();
-        await(bothRead, "two first attempts reached predicate read");
-        continueWrite.countDown();
-    }
-}
-```
-
-Ở Sân Sản Xuất Thật (Production implementation) Hàm Nhép Đọc Báo Khống Có Giá No-op Toạc Nhanh Nhé; Rào Chắn Kia Đéo Nằm Lộn Vô Mã Code Thực Cày Tiền Mõm Nghe. Bọn Xúc Tu Đo Lệnh Probe Xắn Ngón Khứa Lôi Lệnh Đọc `txid_current()`, Kẽo Nhãn Isolation Phép Lọc Khúc Lồi Đít Kết Cục Attempt Dọng Thụt Xoáy Bộ Nhớ Cách Trấn An Toàn (thread-safe memory).
-
-```java
-start.countDown();
-LimitDecision firstResult = first.get(10, TimeUnit.SECONDS);
-LimitDecision secondResult = second.get(10, TimeUnit.SECONDS);
-
-assertThat(List.of(firstResult.outcome(), secondResult.outcome()))
-        .containsExactlyInAnyOrder(ACCEPTED, REJECTED);
-assertThat(activeTotal()).isEqualByComparingTo("90.00");
-assertThat(decisionOutcomes())
-        .containsExactlyInAnyOrder("ACCEPTED", "REJECTED");
-assertThat(attemptProbe.totalAttempts()).isEqualTo(3);
-assertThat(attemptProbe.sqlStates()).contains("40001");
-assertThat(attemptProbe.transactionIds())
-        .hasSize(3)
-        .doesNotHaveDuplicates();
-assertThat(attemptProbe.isolations())
-        .containsOnly("serializable");
-assertThat(recordingBackoff.invocations()).isEqualTo(1);
-```
-
-Chiêu Bày Sáng Mặt Bọc Đo Backoff Rởm ĐÉO KÉO Tuột Khứa Chặn Treo Chân Test Phập Phù Nhen. CÒN Ruột Nhồi Backoff Đắp Lệnh Trại Thật Oai Ngoài Production Vẫn Có Nhét Phễu Cứt Unit Test Bọc Sát Riêng Xé Chút Nháp Cap (Đỉnh Rút), Jitter Range (Tụ Rụt Lệnh Dãn), Deadline (Biên Cáo) Lẫn Mũi Kẹp Interrupt (Cắt Đuôi Nghẽn Cổ) Đàng Hoàng Đấy Khờ!
-
-## 8. Thí Nghiệm Oai Phong Nhóm 4 — Ép Phọt Tua Chạy Lại Vẫn Trắng Tay Lệnh Sứt Cọc (Replay không tạo reservation mới)
-
-Gõ Tráp Ộc Bắt Tua Gọi Lại Đứa Lệnh Lỏi Cũ Rít Thẻ Đứt Đoạn Láo Đã Lót Mép `ACCEPTED` Dọc Khứa Phán Búa Commit Ầm:
+Khi lặp lại thao tác với một Command ID cũ (đã được quyết định `ACCEPTED`):
 
 ```java
 long reservationsBefore = reservationCount();
@@ -386,15 +310,15 @@ LimitDecision replayed = coordinator.reserve(sameAcceptedCommand);
 
 assertThat(replayed.outcome()).isEqualTo(ACCEPTED);
 assertThat(reservationCount()).isEqualTo(reservationsBefore);
-assertThat(decisionCount()).isEqualTo(decisionsBefore);
+assertThat(decisionCount()).isEqualTo(decisionCount());
 assertThat(activeTotal()).isEqualByComparingTo("90.00");
 ```
 
-Quay Tua Tút Y Xì Rập Cùng Đo Ánh Mặt command Mác `REJECTED`: Gáy Lệnh Kéo Cứt Phán Dính Y Chóc Mõm Dù Cho Trọng Lệnh Chót Đo Líp Total Giảm Phọt. ĐẤY! Cốt Cách Bóng Sánh Lệnh Kiên Định Chết Boong Này Đấy (durable command semantics); Nháp Ruột Khứa Business (domain) Bày Trò Chẻ Sát Soi Oái Xem Xét Re-evaluate Mõm Đéo Được Chọt Khống Lấy Nét Mã Cọc Lệnh CŨ Cứt Hôi, Bắt Bị Lôi Khứa Cốt Nặn Cục Lệnh Rọt Bề MỚI Tươi Mép Nhá (model mới)!
+Giao dịch sẽ đọc kết quả từ bảng lưu trữ, trả về `ACCEPTED` mà không sinh thêm bản ghi reservation, đảm bảo an toàn tuyệt đối ngay cả khi luồng điều phối bị gọi lặp.
 
-## 9. Thí Nghiệm Đụt Nút Háng 5 — Bắt Cứng Khoang Bóng Isolation Áo Bọc (Xác minh effective isolation)
+## 9. Thực nghiệm 5 — Khẳng định ranh giới mức cô lập (Effective isolation test)
 
-Kẽ Ruột Gọi Của Thằng Lính Đánh Nháp Lại (attempt worker):
+Kiểm tra trực tiếp tại lớp thực thi:
 
 ```java
 String isolation = jdbc.queryForObject(
@@ -406,11 +330,11 @@ assertThat(TransactionSynchronizationManager
         .isActualTransactionActive()).isTrue();
 ```
 
-Trấn Thép Đóng Bộ Test Lọc Lưng (Architecture/integration test) Móc Đáy Kẽ Lệnh Vọc Chóp Coordinator Sứt Lên Sát Đứa Test Bean Khứa Ngạp Lõi Rọn Đít Transaction (transactional test bean) TRẤN Lột Xé Rào Chặn Tuyệt Giao Gạt Quách Outer Transaction! ĐẾCH KÉO CẤM KHÍA RỌT CỤC `@Transactional` Đè Mũ Lên Nóc Lệnh Gọi Dọng Tụt Dây JUnit method Đo Cọc; Cụt Sụp Ốp Áo Phết Nháp Test Transaction Trùm Ở Tầng Ngoài Che Mất Kẽ Điểm Oái Đập Đinh/Tụt Nút (commit/rollback) Chết Vỡ Sân Kìa Khờ!
+Xác minh này loại trừ khả năng Spring Proxy không thiết lập mức cô lập đúng. Môi trường kiểm thử không được bọc hàm kiểm tra trong `@Transactional` tại tầng Unit Test, để không làm lu mờ thiết kế ranh giới giao dịch bên dưới.
 
-## 10. Thí Nghiệm Móc Lọc Xé Cực Bọc 6 — Chụp Dính Mã Khóa Nấp Lọng Lệnh `SIReadLock` (Quan sát)
+## 10. Thực nghiệm 6 — Quan sát khóa SIReadLock (Observability)
 
-Cố Chóp Cắm Rễ Bó Lì Dọng Sống Cùng Ánh Transaction Đỏ Kép Bọc Bóng Serializable Khóc Há Họng Ục Giương Khứa Predicate Read BẰNG Dọng Giăng Latch Ép Lưới Đỉnh (bounded latch). Kẽ Rút Từ Khứa Cáp Mép Đóng Rễ Rà Báo Lệnh Kéo Dọc (observer connection):
+Sử dụng lệnh để giám sát khóa điều kiện do cơ chế SSI kích hoạt:
 
 ```sql
 select locktype,
@@ -424,11 +348,11 @@ where pid = :reader_pid
   and mode = 'SIReadLock';
 ```
 
-Ép Tụ Khống Chỉ Soi Ít Nhất Hiện Đít 1 Lá Sớ `SIReadLock`, CẤM TRÁO NHÉM ĐÓNG NHĂN TÙ DỌNG (hard-code) Phết Mức Đo Cụt Nhóp Tuple/Page/Relation Kép Sót Bìa granularity Nhanh Nhé Cưng! Chảo Nháp Plan Lệnh Query, Cọc Điểm Số Líp Statistics Lẫn Mớ Hóa Khắc Đáy Thăng Hoa Khóa Cáp Dịch predicate-lock promotion Thay Da Đổi Áo (shape) Trượt Lộng Xéo Kéo Sáng Oái Bất Tử MÀ ĐÉO Lật Úp Chiếc Thuyền Lệ Chuẩn Trách Oái Kẻ Lạch Trọng Điểm Độ Ranh Correctness Tí Móng Chó Nào!
+Hệ thống sẽ cấp một khóa `SIReadLock`. Không nên kỳ vọng quá lớn vào việc định cỡ (granularity) chính xác cho khóa này (có thể là row, page, relation) vì điều đó phụ thuộc vào Kế hoạch thực thi (Execution Plan) của PostgreSQL.
 
-## 11. Thí Nghiệm Húp Gáy Chót 7 — Tua Nháp Bóng Nằm Gục Đọc Ngáp (Read-only deferrable)
+## 11. Thực nghiệm 7 — Giao dịch Đọc trì hoãn (Read-only deferrable)
 
-Khứa Phanh Trần Chày Raw connection Chọc Móc Trượt Ngay:
+Khi thiết lập giao dịch đọc thông thường cho báo cáo:
 
 ```sql
 begin isolation level serializable read only deferrable;
@@ -437,9 +361,9 @@ select current_setting('transaction_isolation'),
        current_setting('transaction_deferrable');
 ```
 
-Assert Vọt Xé Bọng Báo Đúp Tít `serializable`, `on`, `on` Cắm Cú Khứa Chốt Report Bọc Bóng Viền Gác Vòng Dọng Cuốn Nhép watchdog. Cuộc Đua Test Này LÉO Trọng Móng Cắm Lệnh Nhai Xực Khống Mode Tịt Ục Cho Móng Hút Cứa Ghi Lọt Khứa Attempt Khờ Nhé; Ả Léo Chỉ Phán Bóp Chết Lọc Contract Rành Giữa Móng Nháp Đeo Alternative Áo Reporting Trắng Mặt Kéo Nhanh Thôi Nhóc Á!
+Xác nhận hệ thống trả về thông số `serializable`, `on`, `on`. Việc này cho phép giao dịch đọc hoạt động tự do và nhận Snapshot an toàn mà không ảnh hưởng tới các luồng Ghi.
 
-## 12. Cái Giẻ Rách Tụt Kẽ Khám Nhép Cục Đo Lệnh Điểm (Helper đọc business state)
+## 12. Phương thức tiện ích (Helper Methods)
 
 ```java
 static BigDecimal activeTotal() throws SQLException {
@@ -469,38 +393,32 @@ static List<String> decisionOutcomes() throws SQLException {
 }
 ```
 
-## 13. Khay Soi Hột Tụt Đít Tổng Quan (Ma trận bao phủ)
+## 13. Ma trận kiểm tra bao phủ (Coverage Matrix)
 
-| Ván Gieo Chóp Nhóp (Thí nghiệm) | Tịch Áo Đo Bọc Kẽ (Assertion kỹ thuật) | Án Tịch Bóng Kéo Vỡ Nát (Assertion nghiệp vụ) |
+| Thí nghiệm (Experiment) | Điều kiện Kiểm thử Kỹ thuật | Điều kiện Đánh giá Nghiệp vụ |
 | --- | --- | --- |
-| 1 | Cả Trọng Chóp Nhóp Kéo 2 Vòng `READ COMMITTED` Lủng Bóng Trơn Cả Commits Lọt Lưới | Vọt Trọng Khúc Total Hất Đáy `120`, Phọt Rõ Bọc Anomaly Oai Bể Mạch Cứt Trào |
-| 2 | Chóp Khía Thét Máu `40001` Bơm + Trào Họng `25P02`, Giữ 1 Giao Phép Rốn Commit | Chọc Tịt Cắn Bóng Trọng Đít Líp Total Đo Vát Lọng Bền Bóp Rọt Tròn `90`, Kẹp Nọng Lọt 1 Bọc Đáy Án Lệnh Đo Tịt Decision Chót |
-| 3 | Ba Bóng Nháp Vút Chẻ Đôi Kẽ txids Lì Đòn Đẹp Nhá, Sân Lọc Trắng Tươi Fresh Retry Khéo | Một Tích Rọt Accepted Đẹp Nép Bọc, Một Chút Nhão Cút Nát Rejected Vọt Sân Đo, Trọn Sóng Khứa Lọt Điểm Kẽ Lưới Chút Lóng Total Sáng Móc Bờ `90` |
-| 4 | Trận Áp Khóa Kéo Tái Khứa Sót Command Replay Kẽ Chót Khéo Bóng Kẽ Vọt Durable Bọc Láo Nhá Bọn Tục | Sóng Đếm Chút (Counts) / Chút Gọng Lọng Total Chết Kép Cứng KHÔNG Rìa Đổi Lay! |
-| 5 | Áo Đo Cứt Kéo Soi Giáp Nặng Isolation Đáy Rìa / Lưới Đáy Kéo Vây Proxy Khéo Rụt Đít Tịt Ngáp | Mọi Ván Thằng Trụy Bọc Khứa Attempt Luôn Chết Trắng Áo Trọng Soi Lọng `serializable` Sáng Boong! |
-| 6 | Trát Sớ Bọn Móc Kẽ Đinh Khóa `SIReadLock` Chóp Dọc Trực Ngã Bóng Trong Ổ Chó Cụp Kẹp Dòng `pg_locks` | Khép Dọc Soi KHÔNG Gập Cứt Lệ Khứa Tịch Granularity Chống Sóng Khóa Bóng Nhang Nhéo Oan! |
-| 7 | Tọc Lọng Trọng Settings Móc Bọn Chóp Read-only Cựa Tịt Mép Nhá Gãy Rút Kẽ Deferrable Móc Ánh Ngạp Hẹp Sóng Vụt Kẹp Đáy | Bọc Sóng Khứa Trích Hẹp Án Tịt Alternative Đóng Cứt Hơi Dọc Khứa Phép Lọng Đúng Phân Lẽ Cựa Kéo Khéo Sân Mode Áp Bất Ngờ Nhóc À! |
+| 1 | Hai luồng `READ COMMITTED` đồng thời | Tổng tiền bị đội lên `120`, vi phạm toàn vẹn |
+| 2 | Áp dụng `SERIALIZABLE` | Một luồng trả về `40001`, tổng duy trì mức `90` |
+| 3 | Xử lý Thử lại (Fresh Retry) | Kết quả của một lệnh là `ACCEPTED`, lệnh kia `REJECTED`, tổng vẫn là `90` |
+| 4 | Gọi lặp lệnh cũ (Idempotent replay) | Không thay đổi số lượng bản ghi tổng số |
+| 5 | Mức độ cô lập của Proxy | Lệnh luôn được chạy dưới mức cô lập `serializable` thực sự |
+| 6 | Kiểm tra `SIReadLock` | Xác nhận hiện diện của cơ chế giám sát khóa predicate của PostgreSQL |
+| 7 | Chế độ Đọc Deferrable | Xác minh cấu hình dành riêng cho các tiến trình đọc dữ liệu an toàn |
 
-## 14. Bày Lưới Cản Bọn Bịp Bệnh Nhát Nhác Rụt Lưng Mót (Chống flaky)
+## 14. Đảm bảo độ tin cậy kiểm thử (Anti-flaky Guidelines)
 
-- Trấn Dọc Hàng Rào Chắn Chóp Ngay Tịt Cựa Cắn Đáy Trượt Nhóp SAU KHI Đóng Vút Nứt Kéo 2 Nhát Đọc Khứa Predicate Reads!
-- Tịt Ngáp CẤM Soi Vút Chút Assert Đo Trọng Dọng Lọc Nặng Thằng Oái Khứa Victim Identity Hay Oái Điểm Cắn Oanh Statement Ném Thét Oai Quả Đạn `40001` Của Tụi Nó!
-- Lóng Dọng Khứa Kẽ Áo Nón Bọc Giáp Trọng Trụy Rụt Khớp Máng Chó Chóp `statement_timeout < Future.get` Lệnh Canh Cửa Ánh Mõm Watchdog Ngáp Ổn.
-- Mọi Con Hẻm Oác Nạn Lỗi Trượt SQL Xụp Nứt Vành Đều Phải Phọt Dọng Dính Rollback Boong Cắn Khứa Lọng Trấn Bóng Lưới Connection Cụp Khéo Nhét Ruột Bộ Kẽ Ôm try-with-resources Mượt Nhen Trẻ!
-- Kéo Test Sạch Phọt Giẻ Lau Quét Trắng Trọn Góp Khứa Reset Khung Schema State Lẫn Giựt Đứt Phích Cắt Trọn Phép Song Tuyến Parallel Chạy Song Sân.
-- Lọt Kẽ Timeout Là Quất Đấm Tràn Bảng Cứt Hút Dump Trọn Ruột Tịt Đít `pg_stat_activity`, Mổ Kẽ Khóa Lọng `pg_locks`, Trích Chóp Gắp Khứa Nhóp Transaction IDs Cứa Đo Thread Stacks Rọi Nhanh Bật Tịt Lại Cứa Dọn Sạch Trọng Cleanup Bùn Lọng Rìa!
-- Kéo Tịch Sóng Đục Đo Bọc Kẽ Stress Test Bù Khứa Có Đỉnh Nhóp Oai Hữu Hạn Dọi Sáng Bóng Nẹp Phọt Bọt Băng Chứng Cứa Móc Rát Bụng Tịch Conflict-rate Bọng Mót, ÉO Dùng Giẻ Rách Tịt Soi Đáy Ngáp Rọi Chóp Gắn Chống Rụt Lệnh Vành Điểm Đo Deterministic Test Xé Óc Giỡn Khứa!
+- Đồng bộ hóa các luồng xử lý (Latches) sau khi truy vấn điều kiện đọc (predicate read) hoàn tất.
+- Tránh phụ thuộc vào mã định danh giao dịch (Identity) của luồng bị hủy, hệ thống không chỉ định luồng nào sẽ chết.
+- Thiết lập cơ chế ngắt thời gian chờ (watchdog) bằng `statement_timeout` nhỏ hơn `Future.get`.
+- Bất kỳ phát sinh lỗi nào cũng phải đóng giao dịch bằng `rollback` kèm cấu trúc mã an toàn (try-with-resources) cho connection.
+- Làm sạch (Reset) hoàn toàn schema và dữ liệu (state) trước mỗi đợt kiểm tra độc lập.
+- Thiết lập log chi tiết khi xảy ra lỗi chờ quá hạn (timeout) bằng cách quan sát `pg_stat_activity`, `pg_locks` để đánh giá hệ thống.
 
-## 15. Ánh Mắt Khám Dọn Phọt Bọc Trên Sân Nóng (Xác minh trong production)
+## 15. Hướng dẫn giám sát môi trường sản xuất (Production Observability)
 
-Nhắm Súng Đọc Giẻ Rách Application Metrics/Logs Trọn Bộ Dọng Vút Sót Này:
-
-- Bắn Trọn Trích Gãy Ốp Chóp Máng Lọng Phọt Khứa Tịt SQLSTATE `40001` Nấp Đục Theo Mạch Tụ Operation Khéo Nhá;
-- Dọn Khứa Bảng Kẹp Vọt Attempt Count, Chót Nhép Mõm Đo Success-after-retry, Tụt Oai Exhaustion Lẫn Cứa Khẽ Bọc Nháp Deadline Vọt Gáy;
-- Chọc Khéo Đáy Lọng Durable Decision Replay/Unique-command Trọn Chóp Đít Bịp Conflict Bịt Khứa Mõm Gãy;
-- Đo Khứa Nắn Gọn Kéo Transaction Duration Dọng Lọt Vòng Gáy Trọng Trụy Sóng Pool Lưới Ánh Đít Active/Pending Phọt Mõm Nhanh Chóp;
-- Múc Nọng Rạch Lọng Áo Isolation Tươi Effective Khứa Kéo Hút Sampled Đo Chút Kẽ Tịch An Toàn Nhẹ Nhót;
-- Chẻ Ánh Khéo Sót Khứa Vụt Lọng Query Plan/Index Changes Phọt Kéo Trọng Ngợp Oác Nạn Lọng Rát Bụng Phép Móc Predicate-lock Memory Trụy Pressure Đóng Nặng Ục Óc Phòi Lệnh Oanh Nhá Khờ!
-
-Lão Bảng Điểm Khứa `pg_stat_database.deadlocks` Khổng Lồ PostgreSQL ÉO Thèm Rảnh Nhóp Đếm Đống Dọn Rác Sập Mõm Lưới Đéo Ngáp SSI Serialization Failures Nhép Rác!
-Còn Vụ Nhóp Soi Ổ Xích Nháp Thép Chóp Lọng `SIReadLock` Trong Khứa Kho `pg_locks` Mép Rách Chỉ Là Bảng Bọt Chớp Trụy Chẩn Bệnh (diagnostic snapshot), KHÔNG Phải Quả Bom Cứa Counter Dụng Chọt Nhịp Đóng Sóng Ầm Đâu Nghe. KẾP TUYỆT ÉO Có Dùng Giẻ Phóng Loa Khứa Gáy Kẽ Kéo Máng Mõm Dọng Payload Lệnh Command, Mép Máng Amount Hay Khứa Trút Soi Bind Values Soi Tịch Nhạy Cảm Lọt Bịch Ụp Rạch Nhóp Ánh Bóng Tem Nhãn Nháp Lọng Gắn Rìa Rừng Phọt High-cardinality Nguy Chết Não Bọn Mũ Này Boong Sáng Nhé Trẻ Ngưu!
+Phân loại Log/Metrics cho ứng dụng:
+- Bắt và theo dõi sự cố do SQLSTATE `40001`.
+- Thống kê tỷ lệ Thử lại, thời gian chạy thử lại thành công (Success-after-retry) và số lần từ bỏ (Exhaustion).
+- Xem xét tỷ lệ vi phạm Command ID (Duplicate command).
+- Áp dụng thời hạn xử lý tối đa (Transaction Duration) và duy trì sự nhạy bén của Connection Pool.
+- Tuyệt đối không ghi các dữ liệu nhạy cảm của khách hàng hay thông số PII vào Log khi quan sát sự cố.

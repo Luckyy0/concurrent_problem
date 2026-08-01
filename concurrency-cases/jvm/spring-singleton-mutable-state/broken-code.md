@@ -2,8 +2,8 @@
 
 ## Đoạn code gây điều kiện tranh chấp
 
-Đoạn code dưới đây mô phỏng một cách triển khai dễ gặp: developer giữ sequence
-và customer gần nhất trong field để dùng lại giữa các lời gọi.
+Đoạn code dưới đây mô phỏng một cách triển khai dễ gặp: lập trình viên giữ sequence
+và dữ liệu khách hàng gần nhất trong field để dùng lại giữa các lời gọi.
 
 ```java
 package com.example.checkout;
@@ -44,7 +44,7 @@ public record ReceiptDraft(long sequence, String customerId) {
 }
 ```
 
-Controller dùng constructor injection nhưng mọi request vẫn đi vào cùng service
+Controller dùng constructor injection nhưng mọi request vẫn đi vào cùng một service
 instance:
 
 ```java
@@ -84,19 +84,19 @@ public record CreateReceiptDraftRequest(String customerId) {
 
 ## Vì sao đoạn code trông có vẻ hợp lý
 
-- Unit test gọi tuần tự luôn thấy sequence tăng.
+- Kiểm thử đơn vị gọi tuần tự luôn thấy sequence tăng.
 - Mỗi câu lệnh Java đều ngắn nên khó nhận ra chúng tạo thành một chuỗi nhiều bước.
 - Spring khởi tạo singleton an toàn, nhưng điều này dễ bị hiểu nhầm thành mọi lần
   truy cập sau đó cũng an toàn cho nhiều luồng.
-- State không nằm trong database nên developer có thể bỏ qua việc phân tích vùng
+- Trạng thái không nằm trong database nên lập trình viên có thể bỏ qua việc phân tích vùng
   tranh chấp và cơ chế khóa.
 
 ## Điều kiện để lỗi xuất hiện
 
 1. Bean dùng singleton scope mặc định.
-2. Server có ít nhất hai request worker.
+2. Server có ít nhất hai luồng xử lý request.
 3. Hai lời gọi `createDraft` bị xen kẽ.
-4. Không có cùng một monitor/lock bao quanh toàn bộ invariant.
+4. Không có cùng một monitor/lock bao quanh toàn bộ logic nghiệp vụ (invariant).
 
 `nextSequence` và `lastCustomerId` đều là trạng thái dùng chung có thể thay đổi.
 Không có cơ chế đồng bộ nào tạo quan hệ xảy ra-trước giữa hai luồng xử lý
@@ -120,7 +120,7 @@ private volatile long nextSequence;
 read → add → write
 ```
 
-Hai thread vẫn có thể cùng read `41` rồi cùng write `42`.
+Hai luồng vẫn có thể cùng đọc `41` rồi cùng ghi `42`.
 
 ### Chỉ đổi counter sang AtomicLong
 
@@ -128,7 +128,7 @@ Hai thread vẫn có thể cùng read `41` rồi cùng write `42`.
 private final AtomicLong nextSequence = new AtomicLong(41);
 ```
 
-`incrementAndGet()` sửa lỗi của counter, nhưng `lastCustomerId` vẫn có thể bị
+`incrementAndGet()` sửa lỗi của bộ đếm, nhưng `lastCustomerId` vẫn có thể bị
 request khác ghi đè. Một field an toàn cho nhiều luồng không tự bảo vệ quy tắc
 bao gồm nhiều field.
 
@@ -142,4 +142,4 @@ public ReceiptDraft createDraft(String customerId) {
 ```
 
 Spring transaction gắn với một luồng và database connection. Nó không buộc các
-lời gọi method phải chạy lần lượt và không khóa field nằm trong Java heap.
+lời gọi phương thức phải chạy lần lượt và không khóa field nằm trong Java heap.

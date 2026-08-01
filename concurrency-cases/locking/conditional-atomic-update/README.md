@@ -1,11 +1,11 @@
-# Bài toán LOCK-004 — Cập nhật an toàn với điều kiện (Conditional atomic `UPDATE`)
+# Bài toán LOCK-004 — Cập nhật An toàn với Điều kiện (Conditional atomic `UPDATE`)
 
-## Tóm tắt câu chuyện
+## 1. Tóm tắt vấn đề (Overview)
 
-Tưởng tượng kho hàng của bạn có mặt hàng số `77` đang còn đúng `5` chiếc. Có hai khách hàng cùng lúc bấm nút thanh toán, mỗi người đều muốn mua `4` chiếc.
-Nếu ứng dụng của bạn làm theo kiểu ngây thơ: Đọc kho lên thấy còn `5`, kiểm tra thấy `5 > 4` là thỏa mãn, rồi ghi đè con số `1` (5 trừ 4) xuống Database... thì cả hai luồng sẽ cùng thấy hợp lệ! Kết cục là Database bị ghi đè chỉ còn `1`, nhưng bạn đã nhận đặt cọc của cả 2 khách (tổng cộng `8` chiếc) trong khi kho chỉ có `5`. Chào mừng bạn đến với thảm họa thất thoát hàng!
+Hãy xem xét kịch bản: Kho hàng có mặt hàng số `77` với số lượng tồn (available) là `5`. Có hai transaction đồng thời yêu cầu mua `4` đơn vị sản phẩm.
+Nếu ứng dụng xử lý theo luồng Đọc-Kiểm tra-Ghi (Read-Check-Write) cơ bản: Đọc số lượng hiện tại là `5`, kiểm tra `5 > 4` (thỏa mãn), sau đó cập nhật số lượng còn `1`. Do không có cơ chế lock, cả hai transaction đều đọc được giá trị `5` ban đầu và cùng thực hiện cập nhật. Hậu quả là database ghi nhận số lượng tồn kho còn `1`, nhưng hệ thống đã chấp nhận cả 2 yêu cầu (tổng cộng `8` đơn vị). Đây là lỗi mất cập nhật (Lost update) dẫn đến việc bán hàng vượt quá số lượng tồn (Overselling).
 
-Khi quy tắc nghiệp vụ có thể gói gọn lại trong một điều kiện, hãy gửi thẳng "ý định" của bạn xuống Database để nó tự xử lý:
+Để khắc phục, quy tắc nghiệp vụ nên được tích hợp trực tiếp vào câu lệnh cập nhật thông qua cơ chế cập nhật nguyên tử có điều kiện (Conditional atomic update):
 
 ```sql
 UPDATE inventory_item
@@ -16,130 +16,131 @@ WHERE product_id = :productId
   AND available_quantity >= :quantity;
 ```
 
-Nếu số dòng bị ảnh hưởng (affected-row count) trả về là `1`, nghĩa là bạn đã đặt hàng thành công. Nếu trả về `0`, nghĩa là câu lệnh không thỏa mãn điều kiện và chẳng có gì thay đổi; lúc này ứng dụng KHÔNG ĐƯỢC PHÉP báo thành công hay lưu dữ liệu đặt hàng.
+Nếu số dòng bị ảnh hưởng (affected-row count) trả về là `1`, transaction đã đặt hàng thành công. Nếu trả về `0`, lệnh không thỏa mãn điều kiện và không có dữ liệu nào bị thay đổi; ứng dụng phải ghi nhận trạng thái từ chối (ví dụ: hết hàng).
 
-> **Nói ngắn gọn:** Đừng bao giờ hỏi Database "Còn hàng không?" rồi đem về RAM tính toán xong mới ghi lại. Hãy ra lệnh trực tiếp: "Chỉ trừ hàng giùm tôi nếu ngay tại giây phút ghi, số lượng vẫn còn đủ".
+> **Ghi chú quan trọng:** Không nên thực hiện tính toán số lượng tồn kho trên vùng nhớ ứng dụng (RAM) rồi ghi đè số tuyệt đối xuống database. Hãy thực thi việc trừ số lượng bằng một câu lệnh database nguyên tử (atomic operation) để đảm bảo tính nhất quán dữ liệu tại thời điểm ghi.
 
-## Các diễn viên và Trạng thái tranh chấp
+## 2. Các thực thể và Trạng thái chia sẻ (Actors and shared state)
 
-| Thành phần | Trạng thái ban đầu |
+| Thực thể | Trạng thái ban đầu |
 | --- | --- |
-| Bảng tồn kho (`inventory_item`) | Sản phẩm `77`, đang có sẵn (available) `5`, đã giữ chỗ (reserved) `0` |
-| Lệnh A | Đơn `A`, số lượng mua `4`, chạy trên Máy chủ 1 |
-| Lệnh B | Đơn `B`, số lượng mua `4`, chạy trên Máy chủ 2 |
-| Bảng giữ chỗ (`inventory_reservation`) | Bảng lưu lịch sử kết quả dựa trên mã lệnh (command ID) |
-| Hộp thư gửi đi (`outbox_event`) | Chỉ được tạo ra khi đơn hàng đã chốt (commit) thành công |
+| Bảng tồn kho (`inventory_item`) | Sản phẩm `77`, có sẵn (`available`) `5`, đã giữ (`reserved`) `0` |
+| Lệnh A | Yêu cầu `4` sản phẩm, thực thi trên Máy chủ 1 |
+| Lệnh B | Yêu cầu `4` sản phẩm, thực thi trên Máy chủ 2 |
+| Bảng giữ chỗ (`inventory_reservation`) | Lưu lịch sử kết quả dựa trên mã lệnh (command ID) |
+| Hộp thư gửi đi (`outbox_event`) | Chỉ được tạo ra khi đơn hàng đã commit thành công |
 
-Điểm tranh giành đẫm máu nhất chính là dòng dữ liệu của sản phẩm số 77. Hai luồng đến từ hai nơi khác nhau mang mã khác nhau, nên cơ chế chống trùng lặp (idempotency) không giúp ích gì ở đây; chính mẹo "cập nhật kèm điều kiện" (conditional mutation) mới là tấm khiên bảo vệ kho hàng.
+Điểm tranh chấp tập trung tại bản ghi của sản phẩm số `77`. Hai luồng xử lý xuất phát từ hai yêu cầu khác nhau nên cơ chế chống trùng lặp (Idempotency) không giải quyết được vấn đề này; phương pháp cập nhật kèm điều kiện (conditional mutation) là giải pháp cốt lõi để bảo vệ tính nhất quán của dữ liệu tồn kho.
 
-## Những quy tắc bất di bất dịch (Invariant)
+## 3. Các quy tắc bất biến (Invariants)
 
-Khi không có lệnh nhập/xuất kho nào xen ngang, ta phải đảm bảo:
+Trong điều kiện không có transaction nhập/xuất kho nào khác tác động, hệ thống phải đảm bảo:
 
 ```text
 Số lượng hàng có sẵn (available_quantity) >= 0
 
-Số lượng hàng đã giữ chỗ (reserved_quantity) 
-  = Tổng số lượng của các đơn có trạng thái RESERVED (đã giữ)
+Số lượng hàng đã giữ chỗ (reserved_quantity) = Tổng số lượng của các lệnh có trạng thái RESERVED
 
 Hàng có sẵn + Hàng đã giữ chỗ = Tổng hàng ban đầu trong kho
 
-Mỗi mã lệnh (command ID) chỉ được phép tạo ra ĐÚNG MỘT kết quả.
+Mỗi mã lệnh (Command ID) chỉ được tạo ra MỘT kết quả duy nhất.
 
-Hệ thống gọi (Caller) chỉ nhận được thông báo RESERVED sau khi giao dịch đã thực sự chốt (commit).
+Phía gọi chỉ nhận được thông báo hoàn tất sau khi transaction đã thực sự commit.
 ```
 
-Lưu ý: Bạn có thể cài thêm cờ kiểm tra dưới Database `CHECK (available_quantity >= 0)` để phòng hờ (defense in depth), nhưng chừng đó là chưa đủ để phát hiện lỗi ghi đè mất dữ liệu (lost update).
+Lưu ý: Mặc dù có thể thiết lập ràng buộc (Constraint) trong database như `CHECK (available_quantity >= 0)` như một lớp phòng thủ sâu (Defense in depth), điều này vẫn chưa đủ để ngăn chặn lỗi ghi đè mất dữ liệu (Lost update) nếu luồng logic ở tầng ứng dụng bị thiết kế sai.
 
-## Ranh giới Giao dịch (Transaction)
+## 4. Ranh giới transaction (Transaction boundaries)
 
-Một lần thử chạy hàm `InventoryReservationTx.reserve()` sẽ trải qua các bước:
+Một quy trình xử lý `InventoryReservationTx.reserve()` cần tuân thủ các bước sau:
 
-1. Đăng ký cái mã lệnh (command ID) hoặc đọc lại kết quả nếu lệnh này từng chạy rồi.
-2. Bắn câu SQL `UPDATE ... RETURNING` có kèm điều kiện.
-3. Nếu trả về `0` dòng: Lưu trạng thái `OUT_OF_STOCK` (hết hàng) và KHÔNG tạo thư gửi đi (outbox).
-4. Nếu trả về `1` dòng: Lưu trạng thái `RESERVED` cùng số lượng còn lại và tạo thư gửi đi.
-5. Chốt (commit) hoặc Hủy (rollback) TẤT CẢ các bước trên cùng lúc.
+1. Đăng ký mã lệnh (Command ID) để đảm bảo tính duy nhất, hoặc đọc lại kết quả nếu mã lệnh đã được xử lý.
+2. Thực thi câu lệnh SQL `UPDATE ... RETURNING` có kèm điều kiện.
+3. Nếu trả về `0` dòng: Ghi nhận trạng thái `OUT_OF_STOCK` (hết hàng) và KHÔNG tạo bản ghi sự kiện (outbox event).
+4. Nếu trả về `1` dòng: Ghi nhận trạng thái `RESERVED` kèm số lượng tồn kho còn lại, đồng thời tạo bản ghi sự kiện (outbox event).
+5. Xác nhận (Commit) hoặc Hủy (Rollback) TOÀN BỘ các thao tác trên trong cùng một transaction.
 
-Tuyệt đối KHÔNG nhét các việc như: gọi API thanh toán, gửi tin nhắn RabbitMQ/Kafka, hoặc vòng lặp chờ đợi (retry wait) vào trong Giao dịch này. Nếu quá trình UPDATE sau đó bị lỗi, lệnh Rollback phải hoàn trả lại toàn bộ số đếm kho như cũ.
+Tuyệt đối KHÔNG thực hiện các tác vụ ngoại vi (remote I/O) như gọi API thanh toán, gửi thông điệp Kafka/RabbitMQ, hoặc logic tạm dừng (Thread.sleep) bên trong transaction này. Nếu quá trình xử lý thất bại, lệnh Rollback phải hoàn trả toàn bộ số lượng tồn kho như trước khi thực thi.
 
-## Tại sao nhiều luồng cùng `UPDATE` mà vẫn không sai?
+## 5. Cơ chế hoạt động của cập nhật đồng thời (Concurrent UPDATE behavior)
 
-Giả sử PostgreSQL đang ở mức cách ly `READ COMMITTED` (mặc định):
+Giả định PostgreSQL đang hoạt động ở mức cô lập `READ COMMITTED` (mặc định):
 
 ```text
-Giao dịch A (Tx-A) UPDATE: Kiểm tra 5 >= 4 → Đúng → Dòng này bị khóa, số lượng còn 1
-Giao dịch B (Tx-B) UPDATE: Đòi đánh vào đúng dòng đó → Bị chặn lại, phải đứng chờ
-Tx-A COMMIT (Chốt sổ): Chìa khóa được nhả ra
-Tx-B: Tự động đánh giá lại điều kiện WHERE trên dữ liệu thực tế mới nhất → 1 >= 4 là Sai → Báo cập nhật 0 dòng
+Transaction A (Tx-A) thực hiện UPDATE: Đánh giá 5 >= 4 → Hợp lệ → lock bản ghi (Row lock), cập nhật số lượng tồn còn 1.
+Transaction B (Tx-B) thực hiện UPDATE: Yêu cầu lock trên cùng bản ghi → Bị chặn, chuyển sang trạng thái chờ (Wait).
+Tx-A COMMIT: Giải phóng lock.
+Tx-B: Database tự động đánh giá lại điều kiện (Predicate recheck) trên phiên bản dữ liệu mới nhất → 1 >= 4 (Không hợp lệ) → Trả về 0 dòng cập nhật.
 ```
 
-Nếu Tx-A xui xẻo bị Rollback, Tx-B sẽ đánh giá lại trên con số `5` gốc và nó sẽ giành chiến thắng (cập nhật 1 dòng).
-Sức mạnh ở đây là phép cộng/trừ được Database tự làm trên **phiên bản dữ liệu mới nhất dưới ổ cứng**, chứ ứng dụng không hề gửi một con số cụ thể tính từ đồ "thiu" trên RAM.
+Nếu Tx-A bị hủy (Rollback), Tx-B sẽ đánh giá lại trên giá trị gốc là `5`, điều kiện hợp lệ và cập nhật thành công (ảnh hưởng 1 dòng).
+Sức mạnh của phương pháp này nằm ở việc tính toán số lượng được database thực thi trên **phiên bản dữ liệu mới nhất (current row version)** đã commit, thay vì dựa trên dữ liệu mà tầng ứng dụng đọc được ban đầu.
 
-## Bảng quy ước kết quả (Outcome contract)
+## 6. Hợp đồng kết quả (Outcome contract)
 
-| Database trả về | Kết quả nghiệp vụ |
+| Kết quả từ database | Trạng thái nghiệp vụ |
 | --- | --- |
-| Sửa được 1 dòng (affected rows `1`) | Báo `RESERVED` (Giữ chỗ thành công) |
-| Sửa 0 dòng (và chắc chắn dòng đó có tồn tại) | Báo `OUT_OF_STOCK` (Hết hàng) |
-| Báo lỗi `55P03` do hết giờ chờ khóa | Báo `BUSY` (Hệ thống bận), sau đó Rollback |
-| Báo lỗi `40P01` hoặc `40001` | Lỗi kỹ thuật; Có thể tự động thử lại (retry) nếu an toàn |
-| Bị văng lỗi Constraint / Insert / Outbox sau khi UPDATE | Phải Rollback lại toàn bộ quá trình |
-| Trùng mã lệnh y chang (Duplicate fingerprint) | Trả về kết quả cũ, KHÔNG bị trừ hàng 2 lần |
-| Trùng mã lệnh nhưng dữ liệu sai lệch (Different fingerprint)| Báo `IDEMPOTENCY_MISMATCH` (Lỗi xung đột dữ liệu) |
+| Số dòng bị ảnh hưởng (Affected rows) là `1` | `RESERVED` (Thành công) |
+| Số dòng bị ảnh hưởng là `0` (sản phẩm tồn tại) | `OUT_OF_STOCK` (Hết hàng) |
+| Lỗi `55P03` (Lock timeout) | `BUSY` (Hệ thống quá tải), thực hiện Rollback |
+| Lỗi `40P01` (deadlock) hoặc `40001` (Serialization failure) | Lỗi kỹ thuật; Hệ thống có thể thử lại (Retry) một cách an toàn |
+| Lỗi ràng buộc (Constraint / Insert / Outbox) sau UPDATE | Thực hiện Rollback toàn bộ transaction |
+| Mã lệnh trùng lặp khớp hoàn toàn (Duplicate fingerprint) | Trả về kết quả cũ, KHÔNG trừ hàng nhiều lần |
+| Mã lệnh trùng lặp sai dữ liệu (Different fingerprint) | Lỗi `IDEMPOTENCY_MISMATCH` (Xung đột dữ liệu) |
 
-Lưu ý: Kết quả "Sửa 0 dòng" đôi khi bị hiểu nhầm là do "sản phẩm không tồn tại". Code của bạn phải đủ thông minh để phân biệt 2 trường hợp này, đừng có ngồi đoán mò từ con số `0`.
+Lưu ý: Kết quả "Số dòng bị ảnh hưởng = 0" có thể do nhiều nguyên nhân (như hết hàng hoặc sai ID). Tầng ứng dụng cần phân biệt rõ các trường hợp này để trả về mã lỗi nghiệp vụ phù hợp.
 
-## Các thuật ngữ kỹ thuật cần thuộc lòng
+## 7. Các thuật ngữ kỹ thuật (Terminology)
 
-| Thuật ngữ | Ý nghĩa trong bài toán này |
+| Thuật ngữ | Ý nghĩa |
 | --- | --- |
-| Cập nhật kèm điều kiện (`conditional mutation`) | Chỉ sửa dữ liệu nếu như điều kiện nghiệp vụ vẫn còn đúng. |
-| Câu lệnh `UPDATE` nguyên tử (`atomic UPDATE`) | Gom việc kiểm tra (WHERE) và việc sửa dữ liệu (SET) vào chung 1 câu lệnh duy nhất. |
-| Số dòng bị ảnh hưởng (`affected-row count`) | Con số trả về báo hiệu có bao nhiêu dòng thực sự đã được sửa. |
-| Đánh giá lại điều kiện (`predicate recheck`) | Sự thông minh của PostgreSQL: Nó tự động xét lại cụm `WHERE` ngay khi đối thủ vừa nhả khóa ra. |
-| Phiên bản dòng mới nhất (`current row version`) | Dữ liệu tươi mới nhất đang có dưới ổ cứng mà câu lệnh được phép đụng vào. |
-| Mệnh đề `RETURNING` | Một chiêu của PostgreSQL giúp trả về kết quả ngay sau khi Update thành công. |
-| Không làm gì cả (`no-op`) | Lệnh chạy thành công nhưng chả có dòng nào thỏa mãn để thay đổi. |
-| Cập nhật hàng loạt (`bulk DML`) | Cập nhật trực tiếp bằng SQL, lách qua mặt bộ đệm của JPA/Hibernate. |
-| Phòng thủ nhiều lớp (`defense in depth`) | Dùng rào chắn (Constraint) của DB để bảo hiểm thêm, nhưng nó không thay thế được logic code. |
+| Cập nhật kèm điều kiện (`Conditional mutation`) | Chỉ thực hiện thay đổi dữ liệu nếu điều kiện nghiệp vụ vẫn đúng tại thời điểm ghi. |
+| Câu lệnh nguyên tử (`Atomic statement`) | Tích hợp kiểm tra logic (WHERE) và thay đổi dữ liệu (SET) vào một câu lệnh duy nhất. |
+| Số dòng bị ảnh hưởng (`Affected-row count`) | Giá trị hệ thống trả về, biểu thị số bản ghi thực sự bị thay đổi. |
+| Đánh giá lại điều kiện (`Predicate recheck`) | Cơ chế của PostgreSQL tự động kiểm tra lại mệnh đề `WHERE` sau khi lấy được lock. |
+| Phiên bản dòng mới nhất (`Current row version`) | Dữ liệu mới nhất đã được commit mà câu lệnh tương tác trực tiếp. |
+| Mệnh đề `RETURNING` | Lệnh trong PostgreSQL cho phép trả về trực tiếp giá trị dữ liệu ngay sau khi cập nhật. |
+| Hành động rỗng (`No-op`) | Lệnh thực thi thành công nhưng không có bản ghi nào thỏa mãn điều kiện để thay đổi. |
+| Cập nhật hàng loạt (`Bulk DML`) | Cập nhật trực tiếp bằng SQL, bỏ qua bộ đệm của ORM (như Hibernate/JPA). |
+| Phòng thủ nhiều lớp (`Defense in depth`) | Sử dụng Constraint tại database để bảo vệ dữ liệu bên cạnh logic tại tầng ứng dụng. |
 
-## Điều hướng tài liệu
+## 8. Điều hướng tài liệu (Navigation)
 
-- [Code read–check–write bị hỏng](broken-code.md)
-- [Timeline, row lock và predicate recheck](analysis.md)
-- [Spring/JPA/JDBC solution và trade-offs](solutions.md)
-- [PostgreSQL Testcontainers experiments](experiments.md)
-- [Atomic database operations](../../concepts/atomic-database-operations.md)
-- [PostgreSQL locks và lock lifetime](../../concepts/postgresql-locks.md)
-- [Kiểm thử đồng thời](../../concepts/concurrency-testing.md)
-- [DB-001 — Lost update dưới MVCC](../../postgresql/lost-update-mvcc/README.md)
-- [DB-007 — Row/table lock lifecycle](../../postgresql/row-table-lock-lifecycle/README.md)
+- [Phân Tích Lỗi Thiết Kế (broken-code.md)](broken-code.md)
+- [Phân Tích Chuyên Sâu lock Và SSI (analysis.md)](analysis.md)
+- [Giải Pháp Cập Nhật An Toàn (solutions.md)](solutions.md)
+- [Thực Nghiệm Với Testcontainers (experiments.md)](experiments.md)
+- [Thao Tác Nguyên Tử (Atomic database operations)](../../concepts/atomic-database-operations.md)
+- [Vòng Đời lock PostgreSQL (PostgreSQL locks)](../../concepts/postgresql-locks.md)
+- [Kiểm Thử Tương Tranh (Concurrency testing)](../../concepts/concurrency-testing.md)
+- [Lỗi Mất Cập Nhật (DB-001)](../../postgresql/lost-update-mvcc/README.md)
+- [Vòng Đời lock Hàng Bảng (DB-007)](../../postgresql/row-table-lock-lifecycle/README.md)
 
-## Hậu quả thảm khốc trên Production nếu dùng sai
+## 9. Tác động tới hệ thống (Production Impact)
 
-- Chấp nhận giữ chỗ nhiều hơn số lượng hàng tồn (bán âm kho).
-- Báo cáo dữ liệu (Projection) và bảng lịch sử (Audit) vênh nhau.
-- Viết lệnh UPDATE nhưng phớt lờ số dòng trả về (affected rows `0`), cứ ngỡ là cập nhật thành công và trả về Success cho khách!
-- Gọi Bulk DML trực tiếp nhưng lại vướng bộ đệm (stale managed entity) của JPA, để rồi lúc sau Hibernate gọi flush và ghi đè làm mất kết quả atomic vừa chạy.
-- Cho phép "Thử lại" (Retry) cùng một mã lệnh nhưng lại quên lưu lịch sử chống trùng (durable claim), dẫn đến bị trừ hàng nhiều lần.
-- Cố tình bắt lỗi hết hạn chờ khóa (lock timeout) rồi báo luôn là "Hết hàng" (OUT_OF_STOCK) để che giấu chuyện Server đang quá tải.
-- Gửi tin nhắn Kafka/RabbitMQ trước khi chốt sổ (commit), cuối cùng giao dịch lại bị Rollback, đẩy xuống hệ thống dưới một tin nhắn sai sự thật!
-- Dùng từ khóa `synchronized` của Java: Code chạy mượt trên máy bạn, nhưng khi đưa lên nhiều máy chủ (scale-out) thì toang toàn tập.
+Nếu áp dụng giải pháp không đúng cách, hệ thống có thể đối mặt với:
+- Bán vượt quá số lượng hàng tồn (Overselling).
+- Sai lệch số liệu giữa bảng tồn kho và bảng lịch sử (Audit data mismatch).
+- Bỏ qua kết quả số dòng bị ảnh hưởng, xem lệnh thực thi như luôn thành công và trả về thông tin sai cho người dùng.
+- Sử dụng lệnh Bulk DML trực tiếp nhưng không làm sạch bộ đệm (Persistence context) của JPA, dẫn đến trạng thái dữ liệu cũ (Stale state) bị lưu đè trong quá trình flush.
+- Không xử lý tính lũy đẳng (Idempotency), cho phép thực hiện lại một lệnh và dẫn đến trừ hàng nhiều lần.
+- Đánh đồng lỗi hết thời gian chờ lock (Lock timeout) với lỗi hết hàng (OUT_OF_STOCK), làm ẩn giấu tình trạng quá tải của database.
+- Phát ra thông điệp (Publish event) trước thời điểm commit. Khi transaction Rollback, hệ thống ngoại vi sẽ nhận các thông tin không chính xác.
+- Sử dụng từ khóa đồng bộ cấp JVM (`synchronized`): Không có tác dụng trong kiến trúc hệ thống phân tán (Multi-instance architecture).
 
-## Lời khuyên: Khi nào nên áp dụng tuyệt chiêu này?
+## 10. Khuyến nghị áp dụng (Applicability)
 
-SQL Cập nhật Nguyên tử cực kỳ phù hợp khi:
-- Dữ liệu bị trừ và điều kiện kiểm tra nằm chung trên đúng 1 dòng (dễ khoanh vùng).
-- Bạn có thể diễn đạt logic ràng buộc thành cụm `WHERE` và `SET` của SQL.
-- Kẻ chậm chân (loser) có thể ngậm ngùi nhận kết quả 0 dòng (affected-row `0`).
-- Ứng dụng không cần phải móc cả đống bảng (load aggregate graph) lên RAM để quyết định.
-- Bạn cần tốc độ: 1 câu lệnh ngắn gọn luôn nhanh hơn việc Mở khóa -> Tải lên -> Tính toán -> Ghi lại.
+Phương pháp cập nhật nguyên tử có điều kiện (Conditional atomic UPDATE) là giải pháp tối ưu khi:
+- Các thuộc tính dữ liệu và điều kiện kiểm tra nằm gọn trong một bản ghi duy nhất.
+- Logic kiểm tra có thể được diễn đạt rõ ràng thông qua mệnh đề `WHERE` và `SET` của SQL.
+- Transaction thất bại do không thỏa mãn điều kiện chỉ cần nhận kết quả 0 dòng (Affected rows = 0) thay vì phát sinh ngoại lệ phức tạp.
+- Ứng dụng cần ưu tiên hiệu năng: Một câu lệnh ngắn gọn sẽ tối ưu hơn quy trình mở lock - tải dữ liệu - tính toán - cập nhật.
 
-Tuy nhiên, nếu quy trình duyệt đơn của bạn phức tạp phải check qua hàng chục bước, hãy xem xét dùng Khóa bi quan `PESSIMISTIC_WRITE` (Bài LOCK-003). Nếu ít khi đụng độ nhưng đối tượng rất to, hãy dùng Khóa lạc quan `@Version`. Và nếu quy tắc dính đến những dòng dữ liệu chưa tồn tại (missing rows), 1 câu lệnh UPDATE là không đủ.
+Nếu quy trình xử lý phức tạp, ảnh hưởng chéo đến nhiều bảng hoặc các bản ghi chưa tồn tại, hãy cân nhắc sử dụng lock bi quan `PESSIMISTIC_WRITE` (LOCK-003) hoặc cơ chế cô lập mức độ cao (`SERIALIZABLE`). Nếu cần xử lý đối tượng lớn có tần suất xung đột thấp, lock lạc quan `@Version` là một sự lựa chọn phù hợp.
 
-## Phạm vi tài liệu
+## 11. Phạm vi tài liệu (Scope boundary)
 
-Case study này chỉ tập trung vào việc biến điều kiện nghiệp vụ thành câu lệnh UPDATE có điều kiện trên một dòng đã biết.
-Về lỗi mất dữ liệu chung chung, hãy xem `DB-001`. Về cơ chế hoạt động của khóa, xem `DB-007`. Về chiến thuật sinh tồn khi bị ngập lụt truy cập liên tục, xem bài `LOCK-005`.
+Case study này tập trung phân tích phương pháp biến đổi logic kiểm tra thành câu lệnh UPDATE có điều kiện trên một bản ghi xác định.
+- Để tìm hiểu về lỗi mất dữ liệu tổng quát, tham khảo bài `DB-001`.
+- Để nắm rõ vòng đời cơ chế lock, tham khảo bài `DB-007`.
+- Đối với chiến lược xử lý khi hệ thống bị quá tải tương tranh (High contention/Throttling), tham khảo bài `LOCK-005`.

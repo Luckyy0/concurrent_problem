@@ -2,21 +2,18 @@
 
 ## Tóm tắt
 
-Hai thread chuyển giá trị giữa hai in-memory account. Mỗi transfer khóa source
-rồi destination. T1 chuyển A→B nên giữ Lock-A và chờ Lock-B; T2 chuyển B→A nên
-giữ Lock-B và chờ Lock-A. Hai thread tạo một wait-for cycle và không tiến tiếp.
+Hai thread chuyển giá trị giữa hai in-memory account. Mỗi thao tác chuyển khóa source rồi destination. T1 chuyển A→B nên giữ Lock-A và chờ Lock-B; T2 chuyển B→A nên giữ Lock-B và chờ Lock-A. Hai thread tạo một wait-for cycle và không tiến tiếp.
 
-Case bảo vệ các invariant:
+Tình huống bảo vệ các bất biến:
 
 ```text
-Mọi operation cần nhiều account lock phải acquire theo cùng một total order.
-Không thread nào được chờ vô hạn ngoài latency/deadline contract.
-Khi acquire thất bại hoặc bị interrupt, mọi lock đã giữ phải được release.
-Transfer hoàn tất phải bảo toàn tổng balance trong scope in-memory của case.
+Mọi thao tác cần nhiều account lock phải acquire theo cùng một total order.
+Không thread nào được chờ vô hạn ngoài ràng buộc độ trễ (latency) và thời hạn (deadline).
+Khi acquire thất bại hoặc bị ngắt (interrupt), mọi lock đã giữ phải được release.
+Thao tác chuyển hoàn tất phải bảo toàn tổng balance trong phạm vi in-memory của tình huống.
 ```
 
-> **Nói ngắn gọn:** “khóa cả hai account” vẫn có thể sai; thứ tự khóa phải giống
-> nhau cho mọi hướng transfer.
+> **Nói ngắn gọn:** “khóa cả hai account” vẫn có thể sai; thứ tự khóa phải giống nhau cho mọi hướng chuyển.
 
 ## Thuật ngữ cần biết
 
@@ -27,20 +24,19 @@ Transfer hoàn tất phải bảo toàn tổng balance trong scope in-memory c�
 | lock ordering | Quy tắc total order quyết định lock nào luôn được acquire trước |
 | intrinsic lock | Monitor dùng bởi `synchronized` |
 | ownable synchronizer | Lock như `ReentrantLock` mà JVM diagnostics biết owner |
-| interruptible acquisition | Chờ lock có thể dừng khi thread bị interrupt |
-| timed acquisition | `tryLock` với timeout giới hạn thời gian chờ |
-| livelock | Actor liên tục retry/nhường nhau nhưng vẫn không hoàn tất |
+| interruptible acquisition | Chờ lock có thể dừng khi thread bị ngắt (interrupt) |
+| timed acquisition | `tryLock` với giới hạn thời gian chờ |
+| livelock | Tác nhân liên tục thử lại (retry) hoặc nhường nhau nhưng vẫn không hoàn tất |
 
 ## Bối cảnh và contention point
 
-T1 thực hiện `transfer(A, B, 10)`, T2 thực hiện `transfer(B, A, 20)`. Account được
-lưu trong một local registry và có `ReentrantLock` ổn định.
+T1 thực hiện `transfer(A, B, 10)`, T2 thực hiện `transfer(B, A, 20)`. Account được lưu trong một local registry và có `ReentrantLock` ổn định.
 
 | Thành phần | Giá trị |
 | --- | --- |
 | Shared state | Hai `LocalAccount` và balance |
-| Actor | Hai request/worker thread |
-| Broken order | source lock trước, destination lock sau |
+| Tác nhân | Hai luồng xử lý hoặc thread yêu cầu |
+| Broken order | Khóa source trước, khóa destination sau |
 | Cycle | T1 giữ A chờ B; T2 giữ B chờ A |
 | Transaction | Không có database transaction |
 | Scope | Một JVM; PostgreSQL deadlock là `DB-008` |
@@ -51,37 +47,31 @@ lưu trong một local registry và có `ReentrantLock` ổn định.
 - [Wait-for cycle và nguyên nhân](analysis.md)
 - [Code đã sửa và lựa chọn timeout](solutions.md)
 - [Cách tái hiện và phát hiện deadlock](experiments.md)
-- [Deadlock và retry an toàn](../../concepts/deadlocks-and-retries.md)
+- [Deadlock và thử lại an toàn](../../concepts/deadlocks-and-retries.md)
 - [Kiểm thử đồng thời](../../concepts/concurrency-testing.md)
 
 ## Hậu quả production
 
-- request treo, thread pool/pool connection dần cạn;
-- timeout phía caller không tự giải phóng thread đang chờ intrinsic lock;
-- retry phía client tạo thêm work và cycle;
-- health endpoint có thể vẫn sống trong khi business traffic đứng;
-- restart process phá deadlock nhưng làm mất in-memory work.
+- Các yêu cầu bị treo, thread pool và connection pool dần cạn kiệt;
+- Quá thời gian chờ (timeout) ở phía gọi không tự giải phóng thread đang chờ intrinsic lock;
+- Việc thử lại từ phía client tạo thêm khối lượng công việc và chu trình (cycle);
+- Health endpoint có thể vẫn hoạt động bình thường trong khi lưu lượng nghiệp vụ bị đình trệ;
+- Việc khởi động lại process sẽ phá deadlock nhưng làm mất dữ liệu trên bộ nhớ (in-memory).
 
 ## Hướng sửa khuyến nghị
 
-Dùng stable account key tạo một total order: account ID nhỏ hơn luôn khóa trước,
-không phụ thuộc source/destination. Acquire interruptibly hoặc có deadline khi
-latency contract cần; release lock thứ hai rồi lock thứ nhất trong `finally`.
+Sử dụng khóa định danh account (account key) ổn định để tạo một total order: account ID nhỏ hơn luôn khóa trước, không phụ thuộc vào source hay destination. Thực hiện acquire có thể ngắt (interruptibly) hoặc có thời hạn (deadline) khi ràng buộc độ trễ yêu cầu; release lock thứ hai rồi lock thứ nhất trong `finally`.
 
-Timed acquisition không thay thế ordering. Nó là safety net giúp tránh chờ vô
-hạn; retry cần bounded attempts/backoff và chỉ chạy sau cleanup.
+Việc giới hạn thời gian acquire (timed acquisition) không thay thế cho lock ordering. Nó là một cơ chế an toàn (safety net) giúp tránh chờ vô hạn; việc thử lại cần giới hạn số lần (bounded attempts), có khoảng lùi (backoff) và chỉ chạy sau khi dọn dẹp (cleanup).
 
 ## Phạm vi
 
-Case chỉ xử lý JVM locks và in-memory balance để minh họa. Không dùng local lock
-để bảo vệ account row giữa nhiều node. PostgreSQL detection/victim/rollback thuộc
-`DB-008`; transfer tiền bền vững thuộc các banking cases.
+Tình huống chỉ xử lý JVM lock và in-memory balance để minh họa. Không dùng local lock để bảo vệ dữ liệu row của account giữa nhiều node. Việc phát hiện, chọn nạn nhân (victim), và rollback của PostgreSQL thuộc về `DB-008`; thao tác chuyển tiền bền vững thuộc các tình huống ngân hàng (banking cases).
 
 ## Khi nào dùng giải pháp nào
 
-- Deterministic order: mặc định khi phải giữ nhiều lock cùng lúc.
-- Coarse single lock: state nhỏ, contention thấp, ưu tiên dễ chứng minh.
-- `tryLock` deadline: request có latency budget, chấp nhận fail/retry có kiểm soát.
-- Thiết kế không giữ hai lock: có thể thay data model/ownership/message passing.
-- Database transaction: authoritative state là database row và nhiều node cùng
-  cập nhật.
+- Định hướng tất định (Deterministic order): mặc định khi phải giữ nhiều lock cùng lúc.
+- Coarse single lock: trạng thái nhỏ, contention thấp, ưu tiên dễ chứng minh.
+- `tryLock` với deadline: yêu cầu có ngân sách độ trễ (latency budget), chấp nhận thất bại hoặc thử lại có kiểm soát.
+- Thiết kế không giữ hai lock: có thể thay đổi mô hình dữ liệu, quyền sở hữu (ownership), hoặc truyền thông điệp (message passing).
+- Database transaction: trạng thái xác thực (authoritative state) là database row và có nhiều node cùng cập nhật.

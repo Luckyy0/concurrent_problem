@@ -38,8 +38,7 @@ public class WorkItem {
 }
 ```
 
-Random primary key chỉ unique physical row. Nó không diễn đạt logical uniqueness
-của `(tenant_id, external_reference)`.
+Khóa chính ngẫu nhiên chỉ đảm bảo tính duy nhất của hàng vật lý. Nó không diễn đạt tính duy nhất logic (logical uniqueness) của `(tenant_id, external_reference)`.
 
 ## Repository
 
@@ -88,12 +87,9 @@ public class WorkItemService {
 }
 ```
 
-Code không bất cẩn hiển nhiên: check cho UX/domain outcome và method có
-`@Transactional`. Bug là assumption rằng SELECT và later INSERT tạo một atomic
-claim.
+Đoạn mã không có lỗi bất cẩn hiển nhiên: đã có thao tác kiểm tra để trả về kết quả cho UX/domain và phương thức có `@Transactional`. Lỗi (bug) nằm ở giả định rằng lệnh SELECT và lệnh INSERT sau đó tạo thành một quyền sở hữu nguyên tử (atomic claim).
 
-> **Nói ngắn gọn:** transaction bảo đảm mỗi request tự commit/rollback; nó không
-> ngăn transaction khác chen vào giữa check và INSERT.
+> **Nói ngắn gọn:** transaction bảo đảm mỗi yêu cầu tự commit/rollback; nó không ngăn các transaction khác chen vào giữa thao tác kiểm tra và lệnh INSERT.
 
 ## Broken schema
 
@@ -106,7 +102,7 @@ create table work_item (
 );
 ```
 
-Không index/constraint nào conflict khi A/B dùng different UUIDs.
+Không có index/ràng buộc nào gây xung đột khi A và B dùng các UUID khác nhau.
 
 ## Concrete interleaving
 
@@ -124,13 +120,11 @@ B COMMIT
 final logical row count -> 2
 ```
 
-Plain SELECT không acquire a lock trên absent key. INSERT row/index locks target
-different primary keys, nên không conflict.
+Lệnh SELECT thông thường không xin cấp khóa (acquire a lock) trên một key chưa tồn tại. Các thao tác khóa hàng/index của lệnh INSERT nhắm vào các khóa chính khác nhau, nên không xảy ra xung đột.
 
 ## Hibernate flush timing
 
-`save()` thường chỉ làm entity managed. Với application-assigned UUID, SQL INSERT
-có thể đợi tới flush/commit:
+`save()` thường chỉ đưa entity vào trạng thái được quản lý (managed). Với UUID do ứng dụng tự gán, câu lệnh SQL INSERT có thể phải đợi tới thời điểm flush/commit:
 
 ```text
 service returns CREATED internally
@@ -139,9 +133,7 @@ Hibernate flushes INSERT
 database error may appear here
 ```
 
-Vì vậy method code có thể không thấy unique exception nếu chỉ gọi `save()`.
-`saveAndFlush()`/`EntityManager.flush()` đưa conflict về insert-attempt boundary,
-nhưng constraint vẫn phải tồn tại.
+Vì vậy, mã của phương thức có thể không thấy ngoại lệ duy nhất (unique exception) nếu chỉ gọi `save()`. Việc dùng `saveAndFlush()` hoặc `EntityManager.flush()` sẽ đưa xung đột về ranh giới của lần thử insert, nhưng ràng buộc thì vẫn phải tồn tại.
 
 ## Broken catch pattern sau khi thêm constraint
 
@@ -160,50 +152,43 @@ public CreateWorkItemResult createOrFind(...) {
 }
 ```
 
-Sau PostgreSQL `23505`, physical transaction đã abort và Spring thường đánh dấu
-rollback-only. SELECT trong catch có thể fail với “current transaction is aborted”,
-hoặc method kết thúc bằng `UnexpectedRollbackException`. Catch không hồi sinh
-transaction.
+Sau lỗi `23505` của PostgreSQL, transaction vật lý đã bị hủy và Spring thường đánh dấu trạng thái chỉ-rollback (rollback-only). Lệnh SELECT trong khối catch có thể thất bại với thông báo “current transaction is aborted”, hoặc phương thức kết thúc bằng `UnexpectedRollbackException`. Việc xử lý ngoại lệ (Catch) không làm sống lại transaction.
 
-## Preconditions tái hiện
+## Điều kiện tiền đề (Preconditions) để tái hiện
 
 1. Business-key unique constraint chưa tồn tại.
-2. A/B dùng independent connections/transactions.
-3. Cả hai existence checks hoàn tất trước either INSERT commit.
-4. Random primary IDs khác nhau.
-5. Cùng normalized tenant/reference được gửi.
-6. Không outer test transaction che commits.
+2. A và B dùng các connections/transactions độc lập.
+3. Cả hai thao tác kiểm tra tồn tại đều hoàn tất trước khi bất kỳ lệnh INSERT nào được commit.
+4. Các khóa chính ngẫu nhiên khác nhau.
+5. Cùng một tenant/tham chiếu đã chuẩn hóa (normalized) được gửi đến.
+6. Không có transaction kiểm thử bên ngoài (outer test transaction) che khuất các thao tác commit.
 
 ## Những cách sửa chưa đủ
 
 ### Chỉ dùng `@Transactional`
 
-`READ COMMITTED` không reserve absent business key giữa statements.
+Mức độ `READ COMMITTED` không giữ chỗ một business key chưa tồn tại giữa các câu lệnh.
 
 ### Chỉ dùng `synchronized`
 
-Không coordinate multiple pods, batch jobs hoặc direct SQL.
+Không điều phối được đa tiến trình (multiple pods), các công việc hàng loạt (batch jobs) hoặc thao tác SQL trực tiếp.
 
 ### Chỉ thêm pre-check thứ hai
 
-Vẫn tồn tại window giữa last check và INSERT.
+Vẫn tồn tại khoảng trống thời gian (window) giữa lần kiểm tra cuối cùng và lệnh INSERT.
 
 ### Chỉ nâng `REPEATABLE READ`
 
-Cả hai stable snapshots có thể tiếp tục thấy key absent. Không thay unique
-constraint.
+Cả hai snapshot ổn định đều có thể tiếp tục thấy key chưa tồn tại. Không thể thay thế unique constraint.
 
 ### Catch mọi integrity exception thành duplicate
 
-Có thể che foreign-key, not-null, check hoặc unique constraint khác. Phải classify
-SQLSTATE và constraint name.
+Có thể che giấu các vi phạm khóa ngoại (foreign-key), not-null, ràng buộc kiểm tra (check) hoặc các ràng buộc duy nhất khác. Cần phân loại (classify) SQLSTATE và tên của ràng buộc.
 
 ### `SELECT ... FOR UPDATE` trên missing row
 
-Không có row để lock. Lock table/advisory key có thể serialize nhưng phức tạp hơn
-database uniqueness cho invariant này.
+Không có hàng nào để khóa. Việc khóa bảng hoặc dùng advisory key có thể giúp tuần tự hóa nhưng phức tạp hơn cơ chế duy nhất của database cho bất biến này.
 
 ### Dùng cache/Redis `SETNX` làm sole authority
 
-Database vẫn cho duplicate nếu cache expires, bị bypass hoặc transaction DB fail.
-Single-database uniqueness phải được enforce ở database.
+Database vẫn cho phép dữ liệu trùng lặp nếu bộ nhớ đệm (cache) hết hạn, bị vượt rào (bypass) hoặc transaction của DB thất bại. Tính duy nhất trong một cơ sở dữ liệu (Single-database uniqueness) phải được thực thi tại chính database.

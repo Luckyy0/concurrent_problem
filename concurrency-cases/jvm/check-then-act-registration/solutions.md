@@ -1,9 +1,8 @@
-# Giải pháp, code đã sửa và các đánh đổi
+# Giải Pháp Kiến Trúc Tối Ưu: Cơ Chế Check-Then-Act An Toàn
 
-## Giải pháp 1: computeIfAbsent cho factory nhanh
+## 1. Phương Pháp Số 1: Trao Quyền Cho Khối Nguyên Tử (computeIfAbsent)
 
-Khi factory chạy nhanh, không thực hiện remote I/O và không gọi ngược vào cùng
-map, dùng atomic API có sẵn của `ConcurrentHashMap`:
+Phương thức đặc trị khi Tác vụ Khởi tạo (Factory) sở hữu cường độ tính toán thấp, loại trừ các lệnh I/O qua mạng, và không có hiệu ứng gọi ngược (recursive) vào khối Map trung tâm. Triệt để ứng dụng API nguyên tử hóa tích hợp sẵn của hạ tầng `ConcurrentHashMap`:
 
 ```java
 package com.example.registry;
@@ -27,6 +26,7 @@ public final class ManagedResourceRegistry {
     public ManagedResource register(String resourceKey) {
         Objects.requireNonNull(resourceKey, "resourceKey");
 
+        // Giao phó trọn gói chu trình "Kiểm tra & Cấp phát" cho một lệnh nguyên khối
         return resources.computeIfAbsent(
                 resourceKey,
                 resourceFactory::open
@@ -43,42 +43,34 @@ public final class ManagedResourceRegistry {
 }
 ```
 
-## Tại sao computeIfAbsent hoạt động
+### Cơ Trí Đảm Bảo Nguyên Tử Của `computeIfAbsent`
 
-`ConcurrentHashMap.computeIfAbsent(...)` thực hiện việc kiểm tra key và công bố
-value như một atomic map operation. Với một key đang vắng mặt:
+Hàm `ConcurrentHashMap.computeIfAbsent(...)` phong tỏa và thi hành trọn gói hành vi kiểm tra biến Key cùng với Công bố giá trị. Mô tả kịch bản khi Key chưa thiết lập:
 
-1. T1 bắt đầu tính value cho `tenant-a`;
-2. T2 đăng ký cùng key không tự chạy một chuỗi `get → open → put` khác;
-3. T2 chờ hoặc nhận value đã được T1 công bố;
-4. cả hai caller nhận cùng `ManagedResource`.
+1. Luồng T1 tiến hành khối tính toán khởi tạo (mapping) cho `tenant-a`;
+2. Luồng T2, dù đăng ký đồng thời trên cùng Key, không được phép bóc tách quy trình thành `get → open → put` thứ hai;
+3. Luồng T2 rơi vào trạng thái chờ hoặc tự động tiếp thu dữ liệu an toàn do T1 công bố;
+4. 100% Caller thu thập chính xác cùng 1 thực thể `ManagedResource`.
 
-Mapping function được áp dụng tối đa một lần cho key trong operation thành công.
-Nếu function throw hoặc trả `null`, map không ghi mapping và caller sau có thể
-thử lại.
+Hàm tính toán cam kết chỉ thiết lập tối đa 1 lượt. Trường hợp Hàm tung ngoại lệ hoặc hoàn trả định danh `null`, Map tự động phủ quyết cập nhật dữ liệu, mở cơ hội cho hệ Caller tiếp theo thử lại (retry).
 
-> **Nói ngắn gọn:** thay vì để application tự ghép ba bước, ta giao toàn bộ
-> quyết định “chưa có thì tạo” cho một atomic API của map.
+> **Nguyên tắc kỹ thuật:** Bác bỏ mọi thao tác tự nối ghép 3 bước (check-open-put) thủ công. Chuyển nhượng quyền phán quyết "Nạp khi Vắng" trực tiếp vào tầng quản trị cấu trúc API nguyên thủy.
 
-## Giới hạn của computeIfAbsent
+### Ranh Giới Chống Chỉ Định Của `computeIfAbsent`
 
-Không đặt công việc chậm hoặc không kiểm soát được vào mapping function:
+Nghiêm cấm lạm dụng Mapping Function với các chu trình mang tính trễ (Latency) hoặc bộc phát vô hình:
 
-- remote network call;
-- chờ lock khác trong thời gian dài;
-- callback cập nhật lại cùng map;
-- factory có dependency cycle;
-- operation không có timeout.
+- Yêu cầu xử lý liên kết mạng (Remote network call);
+- Chiếm giữ các mã Khóa (Lock) thời gian lớn;
+- Vòng lặp cập nhật Callback truy lại cấu trúc Map gốc;
+- Vòng lặp đứt gãy phụ thuộc qua lại (Dependency cycle);
+- Các tác vụ vô thời hạn (Không có giới hạn Timeout).
 
-`ConcurrentHashMap` có thể block các update cạnh tranh trong lúc mapping function
-chạy. Function cũng không được cập nhật đệ quy cùng key; Java có thể phát hiện và
-ném `IllegalStateException`.
+`ConcurrentHashMap` kích hoạt cơ chế Đóng Băng Cục Bộ lên các lệnh Cập nhật đan xen trong lúc Mapping Function làm việc. Việc cập nhật đệ quy cùng biến Key bị Java cấm tiệt và tung lỗi `IllegalStateException`.
 
-## Giải pháp 2: FutureTask placeholder cho factory chậm
+## 2. Phương Pháp Số 2: Định Vị Chờ Tín Hiệu (FutureTask Placeholder)
 
-Nếu mở resource tốn thời gian, đưa một placeholder vào map trước. Chỉ actor đưa
-placeholder thành công mới chạy factory; actor khác chờ cùng kết quả. Factory
-phải tự cấu hình timeout cho network/file operation của nó.
+Đáp ứng yêu cầu xử lý các tài nguyên nặng (Heavy-lifting). Trọng tâm là nạp mỏ neo giữ chỗ (Placeholder) vào Map. Chỉ định duy nhất Luồng kiến tạo thành công Placeholder được phép triệu tập Factory; Các thành viên còn lại chuyển sang chờ kết quả tại mỏ neo. Yêu cầu tự cấp cơ cấu Timeout cứng cho quá trình.
 
 ```java
 package com.example.registry;
@@ -112,32 +104,34 @@ public final class FutureManagedResourceRegistry {
             Future<ManagedResource> future = registrations.get(resourceKey);
 
             if (future == null) {
+                // Tạo Mỏ neo (Chưa chạy nghiệp vụ vật lý)
                 FutureTask<ManagedResource> candidate = new FutureTask<>(
                         () -> resourceFactory.open(resourceKey)
                 );
 
+                // Luồng nào chiếm chỗ thành công sẽ thống trị Map
                 future = registrations.putIfAbsent(resourceKey, candidate);
 
                 if (future == null) {
                     future = candidate;
-                    candidate.run();
+                    candidate.run(); // Duy nhất Luồng thắng mới mở Tài nguyên
                 }
             }
 
             try {
-                return future.get();
+                return future.get(); // Đám đông Caller cùng xếp hàng đợi ở Mỏ neo này
             } catch (CancellationException exception) {
                 registrations.remove(resourceKey, future);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 throw new ResourceRegistrationException(
-                        "Interrupted while registering " + resourceKey,
+                        "Quá trình đăng ký bị gián đoạn: " + resourceKey,
                         exception
                 );
             } catch (ExecutionException exception) {
-                registrations.remove(resourceKey, future);
+                registrations.remove(resourceKey, future); // Giải phóng mỏ neo hỏng
                 throw new ResourceRegistrationException(
-                        "Failed to register " + resourceKey,
+                        "Thất bại trong tiến trình khởi tạo: " + resourceKey,
                         exception.getCause()
                 );
             }
@@ -157,23 +151,19 @@ public final class ResourceRegistrationException extends RuntimeException {
 }
 ```
 
-### Tại sao placeholder hoạt động
+### Cơ Trí Tối Ưu Của Khối Placeholder
 
-- `putIfAbsent` chọn đúng một `FutureTask` cho key.
-- Chỉ thread thắng gọi `candidate.run()`.
-- Các thread khác gọi `get()` trên cùng future và nhận cùng resource.
-- Factory chạy ngoài internal map computation nên không giữ vùng tính toán của
-  `computeIfAbsent` trong suốt remote operation.
-- Nếu factory thất bại, entry được remove có điều kiện; lần gọi sau có thể tạo
-  placeholder mới và retry toàn bộ operation.
+- Lệnh `putIfAbsent` quyết định chỉ một chủ thể `FutureTask` thắng lợi.
+- Lệnh `candidate.run()` được độc quyền phát động bởi luồng giành chỗ thành công.
+- Tuyệt đối mọi Caller nhận về cùng đối tượng tài nguyên khi kích hoạt hàm `get()`.
+- Hàm Factory thi hành ở vị trí nằm ngoài chuỗi tính toán nội tại (internal map computation), loại trừ hiện tượng khóa cục bộ của `computeIfAbsent`.
+- Tại thời điểm đứt gãy cấu trúc (Lỗi Factory), Placeholder được xóa sổ, tạo lộ trình sạch cho hệ Caller vòng tới Retry hệ thống.
 
-Không dùng retry vô hạn tại registry. Retry policy phải giới hạn số lần, có
-backoff và chỉ retry lỗi phù hợp. Factory phải đóng phần resource đã tạo dở dang
-trước khi throw.
+Cảnh báo: Triệt tiêu cấu trúc Retry vô hạn (Infinite loop) tại Registry. Policy bắt buộc giới hạn dung lượng vòng lặp, ấn định cơ chế giãn cách (Backoff), và tập trung tự hủy (Clean up dở dang) trước khi báo Exception.
 
-## Phương án 3: putIfAbsent và đóng resource thua cuộc
+## 3. Phương Án 3: Thí Điểm Khởi Tạo & Hủy Tài Nguyên Dư Thừa
 
-Nếu factory chạy nhiều lần vẫn an toàn và resource có thể đóng ngay:
+Dành cho hệ thống an toàn nếu thi hành Factory lặp lại và tài nguyên rác có tính đàn hồi đóng ngay lập tức:
 
 ```java
 public ManagedResource register(String resourceKey) {
@@ -184,7 +174,7 @@ public ManagedResource register(String resourceKey) {
     );
 
     if (existing != null) {
-        created.close();
+        created.close(); // Thu hồi khẩn cấp mảnh tài nguyên rác
         return existing;
     }
 
@@ -192,11 +182,9 @@ public ManagedResource register(String resourceKey) {
 }
 ```
 
-Cách này bảo đảm map chỉ quản lý một resource và mọi caller trả về resource thắng.
-Nó không bảo đảm factory chỉ chạy một lần. Cleanup phải an toàn ngay cả khi
-`close()` gặp lỗi; production code cần ghi nhận và xử lý cleanup failure.
+Cấu hình bảo lưu quy tắc 1 Giá trị trong Map, 100% Caller trả chung kết quả của luồng chiếm dụng. Song không cứu chữa được bài toán Khởi chạy đa vòng của Factory. Quy trình dọn dẹp bắt buộc "Chống đạn" (Fail-safe) khi `close()` lỗi, Code môi trường phải ghim vết Cleanup failure.
 
-## Phương án 4: synchronized
+## 4. Phương Án 4: Phân Quyền Tuần Tự Toàn Cục (synchronized)
 
 ```java
 public synchronized ManagedResource register(String resourceKey) {
@@ -211,41 +199,32 @@ public synchronized ManagedResource register(String resourceKey) {
 }
 ```
 
-Cách này đúng trong một JVM nếu mọi access dùng cùng monitor, nhưng mọi key bị
-serialize chung. Một factory chậm cho `tenant-a` sẽ chặn đăng ký độc lập của
-`tenant-b`. Lock cũng không có hiệu lực ở application instance khác.
+Hiệu lực 100% đối với 1 Máy ảo, nhưng biến toàn bộ Caller (bất kể Key độc lập) thành cấu trúc Hàng đợi (Serialize). Một Factory nghẽn ở `tenant-a` sẽ lập tức gây ứ đọng trên luồng của `tenant-b`. Vô giá trị trên phạm vi hệ thống Đa Máy Chủ (Multi-instance).
 
-## So sánh các đánh đổi
+## 5. Ma Trận Đánh Đổi Hiệu Suất Hệ Thống
 
-| Giải pháp | Mức bảo đảm | Thông lượng/độ trễ | Tranh chấp và retry | Nguy cơ deadlock | Độ phức tạp | Mở rộng nhiều node |
+| Giải Pháp Kỹ Thuật | Đặc Điểm Bảo Đảm | Thông lượng/Độ Trễ | Xử Lý Tranh Chấp/Retry | Rủi Ro Deadlock | Độ Phức Tạp | Phạm Vi Khai Thác |
 | --- | --- | --- | --- | --- | --- | --- |
-| `computeIfAbsent` | Mạnh trong một JVM; factory tối đa một lần cho atomic computation thành công | Tốt nếu factory ngắn; latency tăng nếu factory chậm | Actor cùng key có thể chờ; lỗi cho phép lần sau retry | Thấp nếu function không gọi map/lock khác | Thấp | Không bảo vệ giữa node |
-| `FutureTask` placeholder | Mạnh trong một JVM; một factory execution cho placeholder thắng | Tốt cho key khác nhau; caller cùng key chờ cùng future | Có failure removal và bounded retry bên ngoài | Có thể xảy ra nếu factory tạo dependency cycle | Trung bình | Không bảo vệ giữa node |
-| `putIfAbsent` + close | Map unique nhưng factory có thể chạy nhiều lần | Tốt, đổi lại tạo resource dư | Không application retry; cần cleanup loser | Thấp | Thấp/trung bình | Không bảo vệ giữa node |
-| `synchronized` | Mạnh trong một JVM | Mọi key chạy lần lượt, latency cao hơn | Thread khác block; không retry | Thấp với một monitor, tăng khi factory dùng lock khác | Thấp | Không bảo vệ giữa node |
-| Database constraint/coordination | Có thể bảo vệ invariant dùng chung | Thêm I/O và contention tại shared boundary | Phụ thuộc transaction/retry policy | Phụ thuộc lock order | Trung bình/cao | Phù hợp cho invariant toàn hệ thống |
+| `computeIfAbsent` | Chuẩn vị trong JVM; Tối đa 1 truy cập thành công | Hiệu năng ưu việt (Nếu Factory nhẹ) | Xử lý đợi; Sẵn sàng cho Caller sau Retry | Thấp (Trừ khi map đan xen khóa) | Dễ Dàng | Phi Hỗ Trợ Đa Node |
+| Placeholder `FutureTask` | Chuẩn vị trong JVM; Tuyệt đối 1 tài nguyên thắng cuộc | Tối ưu đa Key; Đồng nhất tiến trình đợi Caller chung Key | Có xóa bỏ thất bại & Retry từ Caller | Phụ thuộc lỗi Factory Dependency | Vừa Phải | Phi Hỗ Trợ Đa Node |
+| `putIfAbsent` + Thu dọn | Map duy nhất, Factory không đảm bảo 1 lần | Thông lượng cực cao (Đổi lấy cấp rác tài nguyên) | Bỏ qua Retry Application; Cần dọn kỹ kẻ thua cuộc | Siêu Thấp | Vừa Phải | Phi Hỗ Trợ Đa Node |
+| `synchronized` | Khóa Chặt trong JVM | Tuần tự hóa, Thông lượng tê liệt | Block toàn hệ thống | Tăng dần khi Factory xài khóa ngoài | Siêu Thấp | Phi Hỗ Trợ Đa Node |
+| Khóa Điều Phối / Database | Bảo lưu Quy Tắc Xuyên Suốt Mọi Node Máy Chủ | Suy giảm độ trễ, Contention nghẽn tại Ranh giới chung | Phụ thuộc chính sách Transaction/Retry của DB | Cảnh báo khi cấu trúc đảo khóa (Lock order) | Phức Tạp | Chuẩn hệ thống |
 
-## Khi nào nên dùng
+## 6. Khuyến Nghị Phân Phối Khai Thác
 
-- Chọn `computeIfAbsent` cho object cục bộ, khởi tạo nhanh và không có I/O dài.
-- Chọn placeholder future khi khởi tạo đắt và mọi caller phải chia sẻ cùng một
-  kết quả.
-- Chọn `putIfAbsent` + cleanup khi tạo dư an toàn hơn việc giữ lock trong lúc mở
-  resource.
-- Chỉ chọn `synchronized` khi registry nhỏ, contention thấp và global lock không
-  ảnh hưởng các key độc lập.
-- Không chọn distributed lock chỉ để sửa một local registry.
+- Chọn `computeIfAbsent` định dạng kiến trúc Cục Bộ, Lõi xử lý nhanh và cách ly I/O nghẽn.
+- Chọn `Placeholder Future` (Mỏ neo) đáp ứng cấp phát khổng lồ và ép 100% người tới sau phải bám sát kết quả luồng đi trước.
+- Chọn `putIfAbsent` kết hợp dọn rác (Clean up) chỉ định trong trường hợp hệ thống dư thừa tài nguyên còn an toàn hơn đánh đổi Lock thời gian thực.
+- Kế hoạch `synchronized` là một nước đi nguy hiểm, chỉ dành cho quy mô vĩ mô nhỏ không quan tâm tới tính cách ly Key.
+- Tuyệt đối cấm khai thác cấu trúc Phân Tán (Distributed Lock) chỉ để giải bài toán cỏn con trên Local Registry.
 
-## Lưu ý khi áp dụng thực tế
+## 7. Chuẩn Phân Cấp Triển Khai Thực Tế
 
-- Đặt timeout tại factory cho network, file hoặc process operation.
-- Factory phải cleanup resource đã mở một phần trước khi throw.
-- Theo dõi số lần factory chạy theo key, registry size, active resource count và
-  cleanup failure.
-- Không dùng mapping function cập nhật đệ quy cùng map.
-- Unregister nên dùng conditional remove như `remove(key, expectedResource)` để
-  không xóa nhầm resource mới hơn.
-- Nếu resource cần reference counting hoặc lease lifecycle, tách thành case
-  riêng thay vì nhồi thêm state vào registry này.
-- Nếu uniqueness là invariant giữa nhiều node, chuyển enforcement tới database
-  hoặc protocol phân tán phù hợp.
+- Cấp phép Timeout cưỡng chế tại Factory cho Network/File operation.
+- Hàm Factory mang bổn phận đóng mọi vết rác tài nguyên dang dở trước khi tung lỗi (Throw exception).
+- Triển khai Đo lường quy mô lớn: Số lần Factory khởi chạy, Map Size, Số lượng Resource Active, và Lỗi Clean Up.
+- Khước từ Mapping Function tự lặp (đệ quy) vào cùng 1 Map chứa nó.
+- Lệnh Thu hồi (Unregister) phải dùng cấu trúc gỡ chặn có điều kiện `remove(key, expectedResource)` để né trường hợp thanh trừng nhầm tài nguyên phiên bản mới.
+- Khai thác Lease lifecycle hoặc Reference counting phải đưa vào bộ chuyên đề vòng đời riêng thay vì cố nhồi nhét vào Registry.
+- Uniqueness tại Cluster bắt buộc chuyển giao nhiệm vụ về Database hoặc Giao thức Phân tán (Distributed Protocol).

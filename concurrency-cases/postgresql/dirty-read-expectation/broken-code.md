@@ -1,4 +1,4 @@
-# Đoạn Code Ảo Tưởng Đọc Bẩn (Broken dirty-read design)
+# Đoạn Mã Lỗi: Ảo Tưởng Về Đọc Bẩn (Broken dirty-read design)
 
 ## 1. Dữ liệu trạng thái công việc (Job state)
 
@@ -20,20 +20,20 @@ public class JobRun {
 
     public void reportProgress(int progressPercent) {
         if (status != JobStatus.RUNNING) {
-            throw new IllegalStateException("Job is not RUNNING");
+            throw new IllegalStateException("Tiến trình không ở trạng thái RUNNING");
         }
         if (
             progressPercent < this.progressPercent
                 || progressPercent > 100
         ) {
             throw new IllegalArgumentException(
-                "Progress must be monotonic and <= 100" // Tiến độ chỉ được tăng dần, cấm đi lùi!
+                "Tiến độ phải tăng dần (monotonic) và không vượt quá 100"
             );
         }
         this.progressPercent = progressPercent;
     }
 
-    // Copy trạng thái hiện tại ra một DTO gọn nhẹ
+    // Bóc tách trạng thái hiện tại thành Data Transfer Object (DTO)
     public JobSnapshot snapshot() {
         return new JobSnapshot(
             jobId,
@@ -45,7 +45,7 @@ public class JobRun {
 }
 ```
 
-## 2. Kẻ làm mướn ngâm tôm (Processor transaction)
+## 2. Dịch vụ xử lý giữ giao dịch lâu (Processor transaction)
 
 ```java
 @Service
@@ -68,26 +68,26 @@ public class JobProcessor {
     ) {
         JobRun job = jobs.findById(jobId).orElseThrow();
         
-        // 1. Cập nhật tiến độ lên 80% (mới sửa trong RAM)
+        // 1. Cập nhật tiến độ lên 80% (mới chỉ cập nhật trên Entity)
         job.reportProgress(80);
 
-        // 2. Ép đẩy lệnh SQL UPDATE xuống Database ngay lập tức (Nhưng chưa thèm Commit!)
+        // 2. Ép Hibernate tạo lệnh SQL UPDATE và gửi xuống CSDL (Nhưng chưa commit)
         jobs.flush();
-        probe.afterProgressFlushed(jobId); // Cái cờ (hook) này dùng để Test bắt trúng thời điểm
+        probe.afterProgressFlushed(jobId); // Hook dùng để hỗ trợ kiểm thử
 
-        // 3. Chơi lầy: Ném lỗi giả bộ chết để Rollback, hoặc rề rà làm cái gì đó rất lâu
+        // 3. Giả lập một lỗi ngoại lệ hoặc quá trình xử lý I/O kéo dài
         if (failAfterFlush) {
             throw new ProcessingFailedException(jobId);
         }
 
-        // Còn làm một nùi việc lưu Database khác ở dưới này...
+        // Thực hiện các thao tác xử lý nghiệp vụ dài hạn khác tại đây...
     }
 }
 ```
 
-Cái `ProcessingProbe` chỉ là cái móc (hook) vô hại trên Production, nhưng khi chạy Test thì dùng nó làm rào chắn để canh me chính xác thời điểm. Chỗ gọi hàm `flush()` nhằm ép lòi ra lệnh UPDATE gửi thẳng xuống PostgreSQL, tuy nhiên cái Transaction thì vẫn đang mở toang (chưa hề commit).
+Đối tượng `ProcessingProbe` đóng vai trò như một cơ chế đồng bộ trong quá trình kiểm thử (test barrier) để kiểm soát trình tự thực thi. Lệnh `flush()` yêu cầu đẩy câu lệnh UPDATE xuống PostgreSQL, tuy nhiên giao dịch (Transaction) bao ngoài vẫn chưa kết thúc. 
 
-## 3. Người gác cổng ngây thơ đòi Đọc Bẩn (Watchdog kỳ vọng dirty read)
+## 3. Dịch vụ giám sát kỳ vọng đọc bẩn (Watchdog kỳ vọng dirty read)
 
 ```java
 @Service
@@ -103,24 +103,24 @@ public class JobWatchdog {
         this.jdbc = jdbc;
     }
 
-    // Dán lá bùa xin ĐỌC_BẨN (READ_UNCOMMITTED)
+    // Yêu cầu mức độ cô lập READ_UNCOMMITTED (Đọc bẩn)
     @Transactional(
         isolation = Isolation.READ_UNCOMMITTED,
         readOnly = true
     )
     public WatchdogDecision inspect(UUID jobId) {
-        // Đọc dữ liệu ra
+        // Lấy dữ liệu trạng thái
         JobSnapshot observed = jobs.findById(jobId)
             .orElseThrow()
             .snapshot();
 
-        // Check thử xem DB có cấp cho mình cái Mác Đọc Bẩn thật không?
+        // Kiểm tra cấu hình Isolation hiện tại của hệ thống CSDL
         String reportedIsolation = jdbc.queryForObject(
             "select current_setting('transaction_isolation')",
             String.class
         );
 
-        // Quyết định: 80% thì khen Khỏe, thấp hơn thì hô hoán "Treo rồi, Cứu!"
+        // Đánh giá: Tiến độ đạt 80% thì bình thường, ngược lại kích hoạt khôi phục
         return observed.progressPercent() >= 80
             ? WatchdogDecision.healthy(
                 observed,
@@ -134,101 +134,99 @@ public class JobWatchdog {
 }
 ```
 
-Tác giả đoạn Code này ảo tưởng tin rằng cái lá bùa `@Transactional` kia đủ linh nghiệm để giúp Ông B nhìn xuyên tường, thấy được con số `80` mà Ông A đang giấu. 
-Nhưng ở đất PostgreSQL, B chỉ hốt được cái cục `20` cũ rích đã chốt từ kiếp nào, rồi ngơ ngác trả về lệnh `startRecovery` (Chạy lại từ đầu).
+Sai lầm trong thiết kế này nằm ở việc lập trình viên tin rằng thông số `@Transactional(isolation = Isolation.READ_UNCOMMITTED)` sẽ ép buộc PostgreSQL cung cấp dữ liệu chưa commit của các giao dịch khác (như tiến độ `80%` đang chờ xử lý). 
+Trong thực tế, PostgreSQL tuân thủ nghiêm ngặt nguyên tắc MVCC và luôn trả về giá trị đã commit cuối cùng (`20%`). Do đó, Watchdog sẽ đánh giá sai tình trạng hệ thống và gọi hàm `startRecovery` một cách không cần thiết.
 
-> **Nói ngắn gọn:** Bạn nạp cái Annotation, Spring xử lý và truyền lệnh đàng hoàng, PostgreSQL gật đầu nhận lệnh. NHƯNG cái hành động (phenomenon) mà bạn mong muốn thì Database nó từ chối phục vụ!
+> **Nói ngắn gọn:** Annotation cấu hình của Spring truyền yêu cầu chính xác xuống CSDL, và PostgreSQL tiếp nhận. Tuy nhiên, hành vi truy xuất dữ liệu dở dang (dirty read phenomenon) bị PostgreSQL từ chối thực hiện từ cấp độ kiến trúc.
 
-## 4. Dòng thời gian SQL thực tế chạy dưới DB (SQL timeline)
+## 4. Trình tự SQL thực thi tại CSDL (SQL timeline)
 
-Kênh của Ông A (Session A):
+Phiên làm việc của Processor (Session A):
 
 ```sql
 begin;
 update job_run
 set progress_percent = 80
 where job_id = :jobId;
--- Im lặng, chưa thèm commit...
+-- Giao dịch đang giữ trạng thái mở, chưa gọi lệnh commit...
 ```
 
-Kênh của Ông B (Session B, chạy sau A):
+Phiên làm việc của Watchdog (Session B, thực thi sau A):
 
 ```sql
-begin isolation level read uncommitted; -- Dạ xin phép con Đọc Bẩn ạ!
-select current_setting('transaction_isolation'); -- DB trả lời: "Uh mày đang Đọc Bẩn đấy!"
+begin isolation level read uncommitted; -- Yêu cầu mức Đọc Bẩn
+select current_setting('transaction_isolation'); -- CSDL phản hồi: "read uncommitted"
 select progress_percent
 from job_run
 where job_id = :jobId;
--- NHƯNG kết quả vẫn vả vào mặt con số 20, KHÔNG PHẢI 80!
+-- PostgreSQL trả về giá trị đã commit gần nhất: 20, KHÔNG PHẢI 80.
 commit;
 ```
 
-Máy chủ (Server) có thể hiện cái Nhãn `read uncommitted` ra cho bạn yên lòng; nhưng cách hành xử của nó giống y đúc `READ COMMITTED`. 
-Bởi vậy, Code Test là phải kiểm tra (assert) vào con số thật sự Đọc được (tầm nhìn - visibility), chứ đừng rảnh rỗi đọc cái chuỗi Label rồi tự thủ dâm tinh thần.
+Máy chủ báo cáo cấu hình là `read uncommitted` nhưng thực tế vận hành giống hệt như `READ COMMITTED`. Khi xây dựng kịch bản kiểm thử, chúng ta phải tập trung kiểm tra dữ liệu kết quả (`20` hay `80`), thay vì kiểm tra chuỗi trạng thái cấu hình.
 
-## 5. Xả (Flush) không bao giờ là Chốt (Commit)
+## 5. Phân biệt Xả dữ liệu (Flush) và Xác nhận (Commit)
 
-Bạn dùng hàm:
+Sử dụng hàm:
 ```java
 jobs.saveAndFlush(job);
 ```
-Cái này cũng KHÔNG HỀ công bố dữ liệu ra ngoài (publish state). Việc Flush chỉ làm đúng 5 trò:
-- Gửi lệnh UPDATE xuống DB;
-- DB tạo ra 1 cái bóng dở dang (uncommitted tuple version);
-- Giữ chặt cái Giao dịch và Khóa (locks);
-- Cho chính Ông A tự sướng nhìn thấy thứ mình vừa Ghi;
-- **Giấu nhẹm** không cho lệnh SELECT chay của B thấy cái bóng đó.
+Chỉ thực hiện việc đồng bộ câu lệnh SQL xuống cơ sở dữ liệu, không có tác dụng chia sẻ (publish) dữ liệu cho các giao dịch khác. Thao tác này thực hiện các nhiệm vụ:
+- Gửi lệnh `UPDATE` xuống PostgreSQL.
+- PostgreSQL tạo ra một phiên bản dữ liệu nháp (uncommitted tuple version).
+- Giữ vững giao dịch và các khóa (locks) liên quan.
+- Đảm bảo tính nhất quán (visibility) chỉ cho giao dịch hiện hành (Processor).
+- **Ngăn chặn hoàn toàn** các giao dịch đọc thông thường khác nhìn thấy dữ liệu nháp này.
 
-Chỉ khi bạn gõ lệnh Commit thì thiên hạ (cross-transaction) mới nhìn thấy.
+Sự kiện `COMMIT` mới là ranh giới duy nhất công bố dữ liệu ra toàn hệ thống (cross-transaction).
 
-## 6. Chuyện người thua cuộc (Aborted writer)
+## 6. Xử lý khi giao dịch ghi thất bại (Aborted writer)
 
-Nếu vô tình vấp lỗi `failAfterFlush = true`:
-
-```text
-Ông A xả (flush) số 80 xuống
-Ông B nhảy vào đọc thấy số 20 (bản đã chốt cũ)
-Ông A lăn đùng ra chết (ném exception) -> Rút lại lời nói (rollback)
-Kết quả chung cuộc tiến độ chốt sổ vẫn là 20.
-```
-
-Con số `80` đẻ non kia KHÔNG BAO GIỜ có cơ hội ngóc đầu lên làm phiền ông B. PostgreSQL và công cụ hút bụi (VACUUM) sau này sẽ âm thầm hốt dọn cái xác vật lý đó theo luật MVCC.
-
-## 7. Ảo mộng bê code (Migration assumption)
-
-Bê code từ Database khác (như SQL Server, MySQL) sang có thể nảy sinh ảo tưởng:
+Nếu Processor gặp ngoại lệ (`failAfterFlush = true`):
 
 ```text
-Cứ set READ_UNCOMMITTED / gắn cờ NOLOCK
-=> Chắc chắn tao sẽ ngó trộm được Data đang ghi nửa chừng (in-flight writes).
+Processor ghi giá trị 80 và gọi flush.
+Watchdog vào đọc và nhận giá trị 20 (phiên bản đã commit cũ).
+Processor gặp lỗi và Rollback giao dịch.
+Kết quả cuối cùng trên CSDL: Tiến độ vẫn là 20.
 ```
 
-Mấy cái tên mức độ cô lập (Isolation names) chỉ là từ vựng chuẩn mực để gọi tên, chứ các Hãng Database được toàn quyền Cung cấp luật lệ khắt khe hơn. PostgreSQL ánh xạ (maps) luật chơi `READ_UNCOMMITTED` thành trò "Chỉ Đọc Hàng Đã Chốt" (committed-only).
+Phiên bản giá trị `80` chưa từng được công bố và sẽ bị PostgreSQL đánh dấu là dữ liệu rác để công cụ `VACUUM` dọn dẹp sau này theo quy trình MVCC.
 
-## 8. Lệnh Đọc Chay không thèm chờ Khóa (Plain SELECT không block)
+## 7. Giả định tương thích nền tảng (Migration assumption)
 
-Lệnh UPDATE của A giữ cái Khóa Dòng (row lock), nhưng lệnh Đọc Chay của B chả thèm quan tâm cái Khóa đối nghịch đó; luật MVCC cho phép B đi lối tắt móc cái dòng cũ đã chốt ra mà xài. Dù bạn có tăng cái Query Timeout lên 1 tiếng đồng hồ thì cũng vô vọng, chả bao giờ làm cái bóng chưa chốt kia lòi ra được.
+Khi chuyển đổi mã nguồn từ các CSDL hỗ trợ Đọc Bẩn (như SQL Server, MySQL), các lập trình viên thường có giả định:
 
-Dùng lệnh `SELECT ... FOR UPDATE` (Đọc Lấy Khóa) lại là 1 game hoàn toàn khác: nó sẽ đứng xếp hàng chờ A chốt sổ/hủy kèo, sau đó lượm kết quả phù hợp (outcome). Trò đó KHÔNG PHẢI là Đọc Bẩn!
+```text
+Sử dụng cờ READ_UNCOMMITTED / NOLOCK sẽ giúp đọc được dữ liệu đang cập nhật giữa chừng (in-flight writes).
+```
 
-## 9. Điều kiện hội tụ để nổ Bug (Preconditions tái hiện)
+Tuy nhiên, tiêu chuẩn SQL chỉ định nghĩa các mức độ cô lập (Isolation levels) nhằm thiết lập yêu cầu tối thiểu. Các nhà sản xuất RDBMS hoàn toàn có quyền cung cấp các cơ chế an toàn hơn để loại bỏ những rủi ro bất thường. PostgreSQL ánh xạ (maps) yêu cầu `READ_UNCOMMITTED` sang luồng xử lý của `READ_COMMITTED` (chỉ đọc dữ liệu đã commit).
 
-- Tiến độ gốc Đã Chốt ban đầu là `20`.
-- Ông A gửi UPDATE và Xả (flush) số `80` trong cái Giao dịch đang mở toang.
-- Ông B dùng Kết nối/Giao dịch độc lập (independent connection).
-- Ông B phát lệnh SELECT vào lúc A chưa làm xong nhiệm vụ (chưa completion).
-- Ông B cầu xin `READ_UNCOMMITTED`.
-- Lệnh query là Đọc Chay (plain SELECT), không có trò ép Khóa (locking clause).
-- Ông Watchdog (B) vỗ đùi cái đét, kết luận tiến độ dậm chân tại chỗ cũ rích là do "Job Treo Rồi!".
+## 8. Truy vấn thông thường không bị khóa chặn (Plain SELECT không block)
 
-## 10. Những ngõ cụt chắp vá (Những cách sửa chưa đủ)
+Lệnh `UPDATE` của Processor nắm giữ khóa cấp dòng (row lock). Ngược lại, lệnh `SELECT` thông thường của Watchdog không yêu cầu cấp khóa và không bị khóa chặn (block). Cơ chế MVCC hỗ trợ Watchdog lấy dữ liệu từ phiên bản đã commit trước đó một cách mượt mà. Kể cả khi bạn thiết lập `Query Timeout` rất cao, câu lệnh đọc cũng sẽ ngay lập tức trả về `20` thay vì đợi giá trị `80`.
 
-Nhiều pháp sư chọn những trò đi vào ngõ cụt sau, nhưng vĩnh viễn không sửa được:
-- Cố nhét thêm `saveAndFlush()` hòng nặn Data ra.
-- Trả thù bằng cách lặp vòng lặp Hỏi liên tục (Poll) vào lúc Ông A còn đang ngâm Giao dịch.
-- Đổi cài đặt Label/Default của Session thành `read uncommitted`.
-- Tăng Timeout của Query/Transaction lên thật cao.
-- Quăng cái thư viện Spring Data đi, ráng gõ SQL chay (Native SQL) nhưng vẫn dùng lệnh Đọc Chay.
-- Tự sướng với cái chuỗi (String) Label Isolation đọc được từ Database và lấy đó làm bằng chứng "Hệ thống có Đọc Bẩn".
-- Đổi cả hệ quản trị Cơ Sở Dữ Liệu chỉ để chứa chấp cái thiết kế (Design) lố bịch chuyên đi ngó trộm Dữ Liệu Rác (dirty state).
-- Thêm cờ Biến trong RAM (in-memory flag) cắm vào Code để Watchdog đọc ké, nhưng vỡ mồm khi Load Balancer quăng Watchdog qua cái Server (multi-instance) khác.
+Sử dụng câu lệnh `SELECT ... FOR UPDATE` (Đọc có khóa) lại là một cơ chế đồng bộ hoàn toàn khác: Giao dịch của Watchdog sẽ buộc phải chờ Processor xử lý xong (commit/rollback) rồi mới tiếp tục, tuy nhiên nó không giúp đọc được dữ liệu nháp.
+
+## 9. Điều kiện tái hiện hiện tượng (Preconditions)
+
+- Giá trị đã commit ban đầu là `20`.
+- Processor thực hiện `UPDATE` và `flush` giá trị `80` bên trong một giao dịch chưa đóng.
+- Watchdog sử dụng một kết nối (connection) độc lập.
+- Watchdog truy vấn trước khi Processor kết thúc quá trình xử lý (completion).
+- Mức độ cô lập yêu cầu là `READ_UNCOMMITTED`.
+- Câu lệnh truy vấn là đọc thông thường (plain SELECT), không đính kèm khóa truy cập.
+- Watchdog dựa vào kết quả truy vấn lỗi thời để đưa ra các quyết định xử lý hệ thống nguy hiểm (Recovery).
+
+## 10. Các giải pháp tạm bợ và sai lầm (Những cách sửa chưa đủ)
+
+Việc sửa chữa các sự cố này thường bị sa đà vào các biện pháp đối phó không mang lại hiệu quả:
+- Chèn thêm nhiều phương thức `saveAndFlush()` một cách vô định.
+- Chạy vòng lặp kiểm tra liên tục (Polling) trong khi Processor vẫn đang giữ giao dịch.
+- Can thiệp thay đổi cấu hình mặc định của phiên làm việc (Session default).
+- Nâng giới hạn thời gian chờ của Query hoặc Transaction (Timeout).
+- Từ bỏ Spring Data JPA và chuyển sang dùng Native SQL với các lệnh `SELECT` truyền thống.
+- Sử dụng việc CSDL trả về nhãn "read uncommitted" để khẳng định rằng logic Đọc Bẩn đã hoạt động.
+- Từ bỏ hệ quản trị CSDL MVCC an toàn để chọn một CSDL chấp nhận thiết kế chia sẻ trạng thái bẩn rủi ro cao.
+- Khai báo các cờ (flags) trong bộ nhớ ứng dụng (in-memory) để chia sẻ tiến độ, nhưng thất bại khi hệ thống được mở rộng (scaling/load-balancing) sang nhiều máy chủ khác nhau.

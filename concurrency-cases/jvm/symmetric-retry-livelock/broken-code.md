@@ -1,6 +1,6 @@
-# Broken retry loop
+# Vòng lặp retry bị lỗi (Broken retry loop)
 
-## Code tránh deadlock nhưng tạo livelock
+## Đoạn code tránh được deadlock nhưng lại tạo ra livelock
 
 ```java
 package com.example.channel;
@@ -64,35 +64,32 @@ public final class Channel {
 }
 ```
 
-T1 gọi `swap(A, B)`, T2 gọi `swap(B, A)`. `tryLock` ngăn hai thread block vô hạn,
-nhưng loop không có deadline/attempt limit. Fixed backoff giữ cùng phase nên có
-thể tái tạo conflict.
+T1 gọi `swap(A, B)`, T2 gọi `swap(B, A)`. `tryLock` ngăn hai thread bị block vô hạn, nhưng vòng lặp không có deadline hay attempt limit. Việc sử dụng fixed backoff giữ các luồng ở cùng một chu kỳ (phase) nên có thể liên tục tái tạo conflict.
 
-## Vì sao code trông hợp lý
+## Lý do đoạn code trông có vẻ hợp lý
 
-- không thread nào giữ lock rồi block vô hạn;
-- mọi attempt thua đều unlock trong `finally`;
-- operation chỉ mutate sau khi có đủ hai lock;
-- backoff có vẻ giảm contention;
-- unit test một worker luôn pass.
+- không có thread nào giữ lock rồi bị block vô hạn;
+- mọi attempt thất bại đều thực hiện unlock trong khối `finally`;
+- operation chỉ thực hiện mutation sau khi có đủ hai lock;
+- backoff có vẻ giúp giảm contention;
+- unit test với một worker luôn pass.
 
-> **Nói ngắn gọn:** code đã bảo vệ safety nhưng chưa bảo vệ liveness/progress.
+> **Nói ngắn gọn:** đoạn code đã bảo vệ được safety nhưng chưa bảo đảm được liveness hay progress.
 
 ## Điều kiện tái hiện
 
-1. hai actor chọn first lock đối nghịch;
-2. cả hai acquire first lock trong cùng phase;
-3. cả hai fail second lock, release gần đồng thời;
-4. backoff/CPU scheduling giữ chúng cùng nhịp;
-5. retry không có terminal budget.
+1. hai actor chọn lock đầu tiên đối nghịch nhau;
+2. cả hai acquire thành công lock đầu tiên trong cùng một chu kỳ (phase);
+3. cả hai đều không lấy được lock thứ hai và tiến hành release gần như đồng thời;
+4. cơ chế backoff hoặc CPU scheduling giữ chúng lặp lại cùng nhịp;
+5. cơ chế retry không có điểm dừng (terminal budget).
 
-## Các cách sửa chưa đủ
+## Các cách sửa chữa không triệt để
 
-- Chỉ đổi `lock()` thành `tryLock()`; deadlock có thể thành livelock.
-- Fixed backoff giống nhau cho mọi actor.
-- Random jitter nhưng vẫn retry vô hạn.
-- Tăng thread count; contention trên cùng hai resource không biến mất.
-- Log mỗi retry ở mức WARN; có thể tạo logging storm.
-- Catch interrupt rồi tiếp tục; request cancellation mất hiệu lực.
-- Mutate một phần trước khi lấy lock thứ hai rồi rollback; retry side effect trở
-  nên khó chứng minh và có thể lộ intermediate state.
+- Chỉ đổi `lock()` thành `tryLock()`; khi đó deadlock có thể biến thành livelock.
+- Sử dụng fixed backoff giống hệt nhau cho mọi actor.
+- Sử dụng random jitter nhưng vẫn cho phép retry vô hạn.
+- Tăng số lượng thread; contention trên cùng hai resource vẫn không biến mất.
+- Ghi log cho mỗi lần retry ở mức WARN; điều này có thể tạo ra logging storm.
+- Catch interrupt rồi vẫn tiếp tục vòng lặp; khi đó việc huỷ request (cancellation) sẽ mất hiệu lực.
+- Thực hiện mutate một phần trước khi lấy lock thứ hai rồi mới rollback; khi đó các side effect của retry trở nên khó chứng minh tính đúng đắn và có thể để lộ trạng thái trung gian (intermediate state).

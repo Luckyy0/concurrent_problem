@@ -1,6 +1,6 @@
-# Phân Tích Chuyên Sâu: Trò Ảo Thuật MVCC Và Nỗi Đau Mất Dữ Liệu (MVCC and lost-update analysis)
+# Phân Tích Chuyên Sâu: Cơ Chế MVCC Và Sự Cố Mất Dữ Liệu Cập Nhật (MVCC and lost-update analysis)
 
-## 1. Hiện trường ban đầu (Initial state)
+## 1. Trạng thái khởi đầu (Initial state)
 
 ```text
 job_id          = IMPORT-42
@@ -9,67 +9,67 @@ total_units     = 100
 effective isolation = read committed
 ```
 
-Ông Công Nhân A (Worker A) và Ông Công Nhân B (Worker B) đang hùng hục làm việc ở hai ngả khác nhau (disjoint batches). Số lượng hoàn thành báo về (accepted deltas) lần lượt là `3` và `4`.
+Luồng Worker A và Worker B đang xử lý hai tập dữ liệu độc lập (disjoint batches). Số lượng hoàn thành báo về (accepted deltas) lần lượt là `3` và `4`.
 
-## 2. Mong mỏi và Thực tế Phũ phàng (Expected versus actual)
+## 2. Kỳ vọng theo thiết kế và Thực tế (Expected versus actual)
 
-Điều Đáng Lý Phải Xảy Ra (Expected additive invariant):
+Điều kiện cộng dồn lý tưởng (Expected additive invariant):
 ```text
-10 + 3 + 4 = 17 (Chuẩn toán lớp 1)
+10 + 3 + 4 = 17
 ```
 
-Sự Thật Cay Đắng khi Ông B chốt sổ con số cũ rích cuối cùng:
+Thực tế xảy ra khi luồng B ghi đè dữ liệu:
 ```text
-A báo về: Tui làm từ 10 lên 13 nha sếp!
-B báo về: Tui làm từ 10 lên 14 nha sếp!
-Kết cục Database chốt số: completed_units=14
+A tính toán: Hoàn thành từ 10 lên 13.
+B tính toán: Hoàn thành từ 10 lên 14.
+Kết quả lưu cuối cùng trên CSDL: completed_units = 14
 ```
 
-Nhìn cục bộ, ông nào cũng tưởng mình đã làm tốt nhiệm vụ, không ai thấy lỗi. Nhưng xét trên tổng thể toàn cục (global committed invariant), cái phần công sức `3` của ông A đã "bay màu" không kèn không trống.
+Nhìn từ góc độ cục bộ, mỗi luồng đều đã thực thi chính xác phần việc của mình và không phát sinh ngoại lệ. Tuy nhiên, xét trên tổng thể toàn cục (global committed invariant), phần công sức tương đương `3` đơn vị của luồng A đã bị loại bỏ khỏi hệ thống mà không có bất kỳ cảnh báo nào.
 
-## 3. Phân Giải Án Mạng 2 Hung Thủ (Mandatory two-actor timeline)
+## 3. Dòng Thời Gian Tương Tranh Hai Luồng (Mandatory two-actor timeline)
 
-| Bước | Ông Công Nhân A — Giao dịch Tx-A | Ông Công Nhân B — Giao dịch Tx-B |
+| Bước | Worker A — Giao dịch Tx-A | Worker B — Giao dịch Tx-B |
 | --- | --- | --- |
 | T0 | BẮT ĐẦU (BEGIN) | |
-| T1 | Chụp ảnh (S-A): Thấy đang là `10` | |
+| T1 | Ảnh chụp (Snapshot S-A): Thấy dữ liệu là `10` | |
 | T2 | | BẮT ĐẦU (BEGIN) |
-| T3 | | Chụp ảnh (S-B): Vẫn thấy đang là `10` |
-| T4 | Java nhẩm tính: `10 + 3 = 13` | Java nhẩm tính: `10 + 4 = 14` |
-| T5 | Ghi thẳng `13`; Ôm khóa cọc dòng này (lock row) | |
-| T6 | CHỐT (COMMIT); Dữ liệu `13` mới bắt đầu hiện hình | |
-| T7 | | Ghi thẳng `14`; Đè luôn lên `13` (affected 1) |
-| T8 | | CHỐT (COMMIT); Tội ác hoàn tất |
-| T9 | | Truy vấn ra số `14` cười trừ |
+| T3 | | Ảnh chụp (Snapshot S-B): Nhìn thấy dữ liệu `10` |
+| T4 | Tính toán trong JVM: `10 + 3 = 13` | Tính toán trong JVM: `10 + 4 = 14` |
+| T5 | Cập nhật số `13`; Chiếm giữ Khóa dòng (row lock) | |
+| T6 | HOÀN TẤT (COMMIT); Giá trị `13` chính thức lưu trữ | |
+| T7 | | Cập nhật số `14`; Ghi đè trực tiếp (affected 1) |
+| T8 | | HOÀN TẤT (COMMIT) |
+| T9 | | Truy vấn kết quả ra `14` |
 
-Nếu khúc T5 và lệnh UPDATE của B đụng nhau (overlap):
+Trường hợp tại bước T5, nếu luồng B cũng thực thi lệnh UPDATE đồng thời (overlap):
 ```text
-A đang ôm chặt Khóa Dòng (Row lock).
-B đâm lệnh UPDATE vào và... Đứng đợi!
-A Chốt sổ xong (commits) nhả khóa.
-B giật mình tỉnh dậy, nhảy vào làm tiếp:
-B kiểm tra điều kiện `WHERE job_id = ?` thấy vẫn ĐÚNG (true).
-B nhắm mắt điền con số 14 vô tri vào (writes parameter 14).
+A đang chiếm giữ Khóa Dòng (Row lock).
+Lệnh UPDATE của B bị chặn và phải chờ đợi (wait).
+A hoàn tất giao dịch (commit) và giải phóng khóa.
+B tiếp tục quá trình cập nhật:
+B kiểm tra điều kiện `WHERE job_id = ?`, xác nhận dữ liệu vẫn tồn tại (true).
+B ghi đè con số 14 một cách tuyệt đối (writes parameter 14) mà không cần tính toán lại.
 ```
 
-Cái Khóa Dòng (Row lock serialization) nó chỉ xếp hàng thứ tự chạy, CHỨ KHÔNG HỀ biết cộng dồn cái công sức (application deltas) của hai bên lại với nhau đâu!
+Khóa cấp dòng (Row lock serialization) chỉ có chức năng ép buộc các lệnh thi hành theo thứ tự thời gian. Nó KHÔNG HỀ có khả năng tự động hợp nhất (merge) các giá trị tính toán cục bộ (application deltas) từ các luồng khác nhau. 
 
-> **Nói ngắn gọn:** Ông B đứng chờ ông A làm xong, không có nghĩa là ông B sẽ THỨC TỈNH và vứt con số `14` đang nhẩm trong đầu đi. Điều kiện Cập nhật (predicate) cũng quá ngu ngơ, không biết hỏi câu: “Ủa, cái dòng này có còn y nguyên như lúc tui mới đọc không vậy?”.
+> **Nói ngắn gọn:** Việc luồng B đứng chờ luồng A giải phóng khóa không đồng nghĩa với việc bộ nhớ của luồng B sẽ tự động cập nhật sự thay đổi mới nhất. Điều kiện cập nhật (predicate) cũng thiếu đi việc đối chiếu tính nguyên vẹn của trạng thái trước khi ghi (ví dụ: `WHERE version = expected`).
 
-## 4. Máy Ảnh Của Từng Câu Lệnh (Snapshot của từng statement)
+## 4. Tầm Nhìn Ảnh Chụp Từng Lệnh (Statement snapshot)
 
-Ở cái mức độ `READ COMMITTED` của PostgreSQL, mỗi cú SELECT giống như bấm tách một bức ảnh (statement snapshot):
-- Máy ảnh S-A chộp được dòng Đã Chốt là `10`;
-- Máy ảnh S-B cũng chộp được dòng là `10` (Vì ông A đã chốt đâu mà thấy);
-- Không ông nào nhìn thấy cái đồ dở dang (uncommitted value) của ông kia;
-- Ông A Chốt Sổ (commit) thành công, tạo ra một bức ảnh mới có số `13` chễm chệ cho thiên hạ xem;
-- NHƯNG ông B cứng đầu, đâu có thèm chạy lại lệnh tính toán logic (business SELECT/calculation) đâu.
+Ở mức độ cô lập `READ COMMITTED` của PostgreSQL, mỗi lệnh truy vấn (SELECT) sẽ sử dụng một ảnh chụp dữ liệu ngay tại thời điểm lệnh đó bắt đầu thực thi (statement snapshot):
+- Lệnh SELECT của S-A thấy dữ liệu đã commit là `10`.
+- Lệnh SELECT của S-B cũng thấy dữ liệu `10` (Vì luồng A chưa commit).
+- Các luồng hoàn toàn không nhìn thấy sự thay đổi dữ liệu (uncommitted value) của nhau.
+- Sau khi luồng A commit thành công, một ảnh chụp dữ liệu mới chứa con số `13` mới bắt đầu hiện diện cho các giao dịch khác.
+- Tuy nhiên, luồng B sẽ không truy vấn lại dữ liệu để sử dụng cho phép toán của mình.
 
-Nếu B có tâm, lôi điện thoại ra tự chụp lại hình mới bằng lệnh SELECT sau khi A chốt, thì B sẽ thấy `13`. Nhưng ngặt nỗi cái Entity đang ôm khư khư trong Bộ nhớ đệm (persistence context) của Java thường vẫn là cái cũ kỹ đó, trừ khi bạn đập đầu nó ép load lại (refresh/clear/query). Chân lý là Đừng bao giờ dựa dẫm vào cái thói "Đọc hên xui" để mong Code chạy đúng. Correctness không nên dựa vào accidental second read.
+Nếu luồng B thực hiện lại một truy vấn `SELECT` sau khi A commit, B sẽ đọc được `13`. Tuy nhiên, trong mô hình ORM, thực thể (Entity) thường được bộ nhớ đệm (persistence context) bảo lưu trạng thái cũ, trừ khi có lệnh buộc tải lại rõ ràng (refresh/clear/query). Việc bảo đảm tính toàn vẹn của ứng dụng (Correctness) không nên phụ thuộc vào yếu tố đọc lại dữ liệu một cách ngẫu nhiên.
 
-## 5. PostgreSQL MVCC Bị Mù Trạng Thái Nghiệp Vụ (semantic staleness)
+## 5. Hạn Chế Phân Tích Của MVCC Đối Với Nghiệp Vụ (Semantic staleness)
 
-Lúc Database nhận được lệnh UPDATE tào lao của B:
+Khi PostgreSQL tiếp nhận lệnh cập nhật của B:
 ```sql
 update job_progress
 set completed_units = 14,
@@ -77,53 +77,53 @@ set completed_units = 14,
 where job_id = :id;
 ```
 
-Trong mắt PostgreSQL lúc đó, nó thấy gì?
-- Ồ, Giao dịch hợp lệ (transaction ok).
-- Dòng dữ liệu này có tồn tại (row ok).
-- Điều kiện Khóa chính khớp (primary-key predicate match).
-- Không vướng cái Ràng buộc nào (no constraint violated).
-- Đã sửa thành công 1 dòng (affected-row = 1).
+Cơ sở dữ liệu sẽ phân tích yêu cầu này như sau:
+- Giao dịch đang hợp lệ (transaction ok).
+- Dòng dữ liệu tương ứng có tồn tại (row ok).
+- Điều kiện Khóa chính hoàn toàn khớp (primary-key predicate match).
+- Không vi phạm các Ràng buộc cấp CSDL (no constraint violated).
+- Đã thực thi cập nhật thành công trên 1 dòng (affected-row = 1).
 
-Database LÀM SAO MÀ BIẾT con số `14` đó được tính ra từ con số `10` của đời nảo đời nào? Nó càng không biết ý đồ của bạn là "Cộng thêm 4" (`+4`). Nó chả thấy có xung đột (conflict) gì để phải la toáng lên cho Hibernate/Spring rút lui (rollback).
+CSDL không thể phân tích được nguồn gốc của con số `14` (được tính toán từ số `10`), và cũng không biết được nghiệp vụ yêu cầu "Cộng thêm 4" (`+4`). PostgreSQL không phát hiện ra yếu tố xung đột nghiệp vụ (conflict) nào để buộc Hibernate hoặc Spring phải hủy bỏ thao tác (rollback).
 
-## 6. Sát Thủ Giấu Mặt (Hibernate dirty checking)
+## 6. Vấn Đề Với Cơ Chế Tự Phát Hiện Lỗi (Hibernate dirty checking)
 
-Thằng Hibernate ôm khư khư cái trạng thái lúc mới tải lên:
+Cơ chế Hibernate lưu trữ trạng thái gốc của Entity từ lúc truy vấn:
 ```text
-Lúc tải lên completedUnits = 10
-Trạng thái Java hiện tại   = 14
+Trạng thái tải lên ban đầu: completedUnits = 10
+Trạng thái đối tượng Java lúc sửa đổi: 14
 ```
 
-Đến lúc xả hàng (flush), công cụ Tự soi lỗi (dirty checking) đẻ ra cái lệnh UPDATE tuyệt đối vô tri đó. Vì không có thẻ bùa `@Version` bảo vệ, Hibernate chỉ biết lấy Khóa Chính (identifier) ra mà đè dữ liệu.
+Đến thời điểm đồng bộ dữ liệu (flush), tính năng tự động theo dõi (dirty checking) sinh ra lệnh UPDATE với giá trị tuyệt đối. Do thiếu vắng cấu trúc bảo vệ phiên bản (`@Version`), Hibernate chỉ sử dụng Khóa chính (identifier) làm điều kiện cập nhật.
 
-Kể cả bạn có xài `@DynamicUpdate` để bớt cập nhật mấy cột không liên quan, thì nó CŨNG KHÔNG gắn thêm cái Rào Cản chống thiu (stale-state predicate) cho bạn đâu. Nó bảo vệ mấy cột khác thôi, còn cùng cái cột tiến độ đó thì... Nát! (same-column lost update).
+Ngay cả khi bạn bật tính năng `@DynamicUpdate` (chỉ cập nhật các cột có thay đổi), cơ chế này không tự động thêm các rào cản chống cập nhật rác (stale-state predicate). Nó chỉ giới hạn số lượng cột tham gia thao tác, còn việc ghi đè trên cùng một cột vẫn diễn ra bình thường (same-column lost update).
 
-## 7. Truy Tìm Root Cause Theo Các Tầng Lớp (Root cause theo layer)
+## 7. Phân Tích Nguyên Nhân Theo Các Lớp (Root cause theo layer)
 
-| Tầng (Layer) | Hành Vi | Đổ lỗi cho nó được không? |
+| Lớp Hệ Thống (Layer) | Đánh Giá Hành Vi | Kết Luận |
 | --- | --- | --- |
-| Java (JVM) | Ai cũng tính đúng `10 + 3` và `10 + 4` cục bộ | Không. Nó không có bổn phận phân xử với DB |
-| Spring | Quản lý Giao dịch chốt/mở rất chuẩn chỉ | Không. Boundary đóng mở chuẩn đâu cản được Ghi đè sai logic |
-| Hibernate | Soi lỗi (Dirty-check) và lưu bằng Khóa Chính | CÓ. Thiếu Cấu hình bắt quả tang ghi đè (@Version) |
-| PostgreSQL MVCC | Cho phép Đọc mượt, nhưng bắt Ghi xếp hàng | KHÔNG. DB không rảnh để đoán ý đồ cộng dồn của bạn |
-| Thiết kế Hệ thống | Ý đồ là `+delta` nhưng Code lại ép ghi Đè Trắng | LỖI TO NHẤT! (Root design error) |
+| Java (JVM) | Tính toán chính xác logic nghiệp vụ (`10 + 3` và `10 + 4`) một cách cục bộ. | Không có lỗi. Việc xử lý đồng bộ thuộc trách nhiệm của hệ thống CSDL. |
+| Spring | Quản lý vòng đời Giao dịch hoàn chỉnh và đóng mở đúng cách. | Không có lỗi. Ranh giới giao dịch không ngăn cản được logic ghi đè sai lầm. |
+| Hibernate | Theo dõi thay đổi (Dirty-check) và lưu trữ dựa trên Khóa Chính. | LỖI MỘT PHẦN. Thiếu cấu hình chặn cập nhật dữ liệu cũ (`@Version`). |
+| PostgreSQL MVCC | Duy trì trạng thái đọc mượt mà, áp đặt lệnh ghi phải xếp hàng. | Không có lỗi. CSDL thực thi đúng lệnh được gửi và không tự suy đoán nghiệp vụ cộng dồn. |
+| Thiết kế Ứng dụng | Nghiệp vụ cộng dồn (`+delta`) nhưng lại thực thi theo logic Ghi đè tuyệt đối vô điều kiện. | NGUYÊN NHÂN CHÍNH (Root design error). |
 
-Tội ác chia thành 3 nhịp ngớ ngẩn (Non-atomic operation):
+Thao tác gây lỗi bao gồm 3 bước tách rời (Non-atomic operation):
 ```text
-Đọc số liệu Database lên
-  -> Quyết định tự làm phép toán ở ngoài mà không giao quyền (outside authoritative write)
-  -> Ốp lệnh Ghi Đè Vô Điều Kiện xuống DB (unconditional absolute update)
+Truy vấn số liệu hiện tại từ DB
+  -> Thực hiện tính toán trên bộ nhớ ứng dụng (outside authoritative write)
+  -> Ban hành lệnh cập nhật trực tiếp vô điều kiện (unconditional absolute update)
 ```
 
-## 8. Khóa Cửa Đứng Đợi (Locks)
+## 8. Hành Vi Của Các Loại Khóa (Locks behavior)
 
-Đọc chay (Plain SELECT) thì không có chuyện ôm cái khóa Khóa Dòng `FOR UPDATE` đâu. Chỉ có lệnh UPDATE mới ôm Khóa và giữ chặt nó cho tới khi Chốt Sổ (transaction end).
+Lệnh đọc dữ liệu thông thường (Plain SELECT) không yêu cầu Khóa Dòng (`FOR UPDATE`). Chỉ có lệnh UPDATE mới thiết lập Khóa dòng và nắm giữ nó cho đến khi giao dịch kết thúc (transaction end).
 
-Cái Khóa đó chỉ đảm bảo Hai ông nội UPDATE không sửa cùng một Dòng trong cùng TÍCH TẮC thôi. Nó KHÔNG BAO GIỜ đảm bảo ông UPDATE thứ 2 sẽ có tâm lấy cái kết quả của ông thứ 1 ra tính lại. Để chơi hệ Chờ Đợi Đứng Đường (blocking solution), bạn phải đớp được cái Khóa ĐÓ TRƯỚC KHI ĐỌC (acquire trước read/calculate).
+Khóa dòng này chỉ có chức năng đảm bảo hai giao dịch UPDATE không thao tác trên cùng một dòng trong cùng một thời điểm. Nó hoàn toàn không đảm bảo rằng giao dịch thứ hai sẽ tự động lấy được trạng thái sau cùng của giao dịch thứ nhất để tính toán lại. Để thiết lập một giải pháp chờ đợi đồng bộ (blocking solution), ứng dụng phải chiếm giữ Khóa TRƯỚC KHI thực hiện việc đọc dữ liệu (acquire before read/calculate).
 
-## 9. Ràng Buộc Cơ Sở Dữ Liệu (Constraint behavior)
+## 9. Hạn Chế Của Ràng Buộc CSDL (Constraint behavior)
 
-Nếu bạn rào cái Schema constraint kiểu:
+Nếu bạn khai báo ràng buộc mức Schema:
 ```sql
 check (
     completed_units >= 0
@@ -131,93 +131,94 @@ check (
 )
 ```
 
-Trông oai đấy, bảo vệ được số Không bị Lố. NHƯNG con số `14` khốn khổ do lỗi Mất Dữ Liệu kia nó VẪN NẰM TRONG GIỚI HẠN! Constraint của DB chỉ bảo vệ con số hiện hữu, chứ nó không làm thầy bói gọi hồn mấy con số Công Sức (`+3`) không được lưu về (reconstruct accepted deltas).
+Ràng buộc này ngăn ngừa lỗi vượt quá định mức dự kiến. Tuy nhiên, giá trị sai lệch `14` trong trường hợp Mất Dữ Liệu vẫn hoàn toàn hợp lệ theo ràng buộc này! Ràng buộc chỉ giới hạn giới hạn hiện tại, chứ không thể phục dựng lại các thông số biến đổi (accepted deltas) đã bị mất.
 
-Muốn hối hận làm lại (reconciliation), bạn phải tự xây cuốn sổ tay (append-only progress event) ghi chép lại, và lúc gộp thì vẫn phải đảm bảo Nguyên tử (atomicity/idempotency).
+Để đảm bảo việc đối soát và khôi phục (reconciliation) khả thi, hệ thống cần duy trì nhật ký các tiến độ cục bộ (append-only progress events), đảm bảo tính nguyên tử trong khi tổng hợp dữ liệu (atomicity/idempotency).
 
-## 10. Thế Lực Thực Sự Đang Đứng Sau (Effective isolation)
+## 10. Mức Độ Cô Lập Thực Tế (Effective isolation)
 
-Muốn bắt tận tay day tận trán trong Transaction:
+Kiểm tra tham số cấu hình trong Giao dịch:
 ```sql
 select current_setting('transaction_isolation');
 ```
 
-Bài Thí nghiệm thảm họa này sẽ trả về:
+Trong kịch bản lỗi, kết quả trả về sẽ là:
 ```text
 read committed
 ```
 
-Đừng có thấy cái Annotation `@Transactional` rồi tự mãn nghĩ mình đang cô lập (isolation) cực mạnh. Ông datasource/outer boundary có thể bóp méo cái chỉ số đó (effective value) bất cứ lúc nào.
+Không nên phụ thuộc hoàn toàn vào Annotation `@Transactional` để khẳng định hệ thống đang trong trạng thái cô lập an toàn. Cấu trúc mạng hoặc cấu hình DataSource của kết nối có thể điều chỉnh mức cô lập này (effective value) bất cứ lúc nào.
 
-## 11. Đọc Lại Bị Kêu (REPEATABLE READ)
+## 11. Xử Lý Xung Đột Với Mức Độ `REPEATABLE READ`
 
-Nếu xài PostgreSQL `REPEATABLE READ`, DB sẽ ôm nguyên một cái máy ảnh bự chụp toàn cảnh (transaction snapshot). Khi tụi nó tranh nhau đè cùng một Dòng, một đứa UPDATE sẽ bị đạp văng ra ngoài với lỗi (serialization failure - SQLSTATE 40001) thay vì lẳng lặng đè số (silently overwrite).
+Nếu thiết lập `REPEATABLE READ`, PostgreSQL sẽ bảo lưu ảnh chụp dữ liệu trên phạm vi toàn bộ giao dịch (transaction snapshot). Khi phát hiện có xung đột thay đổi trên cùng một dòng, tiến trình UPDATE thứ hai sẽ bị từ chối và phát sinh lỗi (serialization failure - SQLSTATE 40001) thay vì tiếp tục ghi đè lẳng lặng (silently overwrite).
 
-Luật chơi thay đổi hoàn toàn:
+Cách thức xử lý sẽ thay đổi:
 ```text
-Một ông chốt sổ cười tươi
-Một ông ăn lỗi vỡ mồm SQLSTATE 40001
-App phải Tự Hủy kèo (roll back) và Tự thử lại từ đầu (retry)
+Giao dịch thứ nhất thành công (commit).
+Giao dịch thứ hai phát sinh ngoại lệ (SQLSTATE 40001).
+Ứng dụng phải thực hiện hủy bỏ (roll back) và chạy lại quy trình từ đầu (retry).
 ```
 
-CẤM được ngậm mồm nuốt lỗi (catch/retry) bên TRONG cái transaction đã nát kia. Xem Case SPR-006 để hiểu thêm về nghệ thuật thử lại.
+Tuyệt đối không sử dụng try-catch để che giấu lỗi và tiếp tục làm việc ngay trên giao dịch đã hỏng. Hãy xem tài liệu SPR-006 để biết cách áp dụng chiến lược thử lại tự động an toàn.
 
-## 12. Cực Đoan Hoàn Hảo (SERIALIZABLE)
+## 12. Đặc Điểm Của Cấp Độ `SERIALIZABLE`
 
-`SERIALIZABLE` là chúa tể chống thảm họa, sẵn sàng Đạp Chết (abort) bất kỳ thằng nào nhảy lộn xộn không thể xếp hàng nối đuôi nhau (serial order). NHƯNG:
-- Bị Đạp Chết và Thử Lại (abort/retry) là cơm bữa (expected control path).
-- Tất cả các bước trong Transaction phải chịu được việc đập đi xây lại (idempotent/retry-safe).
-- Càng đông người tranh nhau, tỉ lệ phải Đập đi làm lại càng cao.
-- Vẫn phải giới hạn số lần Thử (attempt/deadline limits).
-- Cho nên, nếu chỉ là sửa một cái bộ đếm quèn (single-row additive mutation), thì xài SQL Cập nhật Nguyên tử (atomic SQL) đỡ khổ hơn nhiều.
+`SERIALIZABLE` là mức độ cô lập nghiêm ngặt nhất, sẵn sàng hủy bỏ (abort) bất kỳ giao dịch nào có nguy cơ vi phạm trình tự thực thi an toàn (serial order). 
+Tuy nhiên:
+- Quá trình bị Hủy và phải Thử lại (abort/retry) diễn ra rất thường xuyên (expected control path).
+- Tất cả quy trình trong giao dịch phải được thiết kế để hoạt động ổn định khi làm lại (idempotent/retry-safe).
+- Tần suất xung đột tỷ lệ thuận với số lượng luồng tương tranh.
+- Đòi hỏi thiết lập giới hạn cho số lần Thử Lại (attempt/deadline limits).
+- Đối với các nghiệp vụ đơn giản như bộ đếm (single-row additive mutation), sử dụng câu lệnh SQL Cập nhật Nguyên tử (atomic SQL) sẽ mang lại hiệu năng cao hơn rất nhiều.
 
-Đẩy cao mức độ Cô lập (Isolation) là một giải pháp xịn, chứ không phải liều thuốc tiên đa năng cho mọi cái bộ đếm.
+Tăng mức độ Cô lập là một phương án khả thi, nhưng không phải là công cụ thay thế cho mọi vấn đề tương tranh thao tác tính toán.
 
-## 13. Sống, Chết Và Ngâm Tôm (Commit, rollback và timeout)
+## 13. Tác Động Của Quá Trình Commit, Rollback và Timeout
 
-Con đường sai lầm:
-- Ông A Chốt sống `13`;
-- Ông B Chốt đè `14`;
-- Không ai Hủy kèo (rollback);
-- Khách hàng không nhận lỗi (no exception).
+Trong các chuỗi hành động sai lầm:
+- A hoàn tất ghi nhận (commit) kết quả `13`.
+- B hoàn tất ghi đè kết quả `14`.
+- Không giao dịch nào bị Hủy (rollback).
+- Ứng dụng phản hồi thao tác thành công (no exception).
 
-Nếu ông B rớt mạng Ngâm tôm (timeout/rollback) trước khi chốt, thì hên quá, cái `13` của ông A sống sót, phần của ông B coi như chưa xong (delta chưa accepted). Lỡ mà Khách bắt B gọi lại (retry B), B phải có "Chứng minh nhân dân" (idempotency/command identity) để đừng có làm cú đúp dồn thêm công sức khi chuyện cũ chưa rõ ràng.
+Nếu giao dịch B bị ngắt kết nối hoặc hết hạn (timeout/rollback) trước khi commit, dữ liệu của A (`13`) được an toàn bảo lưu, công sức của B không được ghi nhận (delta chưa accepted). Khi hệ thống gọi lại B (retry), ứng dụng phải xác thực tính đơn nhất (idempotency/command identity) để tránh thao tác tính dồn kép lặp lại.
 
-Dùng SQL Nguyên tử hay Khóa Lạc Quan đều PHẢI biết gom cái số dòng (affected rows) thành Tuyên bố Rõ Ràng: "Xong", "Thử Lại Nhé", hoặc "Cút" (success, retry, rejection).
+Bất kể sử dụng SQL Nguyên tử hay Khóa Lạc Quan, hệ thống phải xác định rõ ràng số lượng dòng bị tác động (affected rows) nhằm quyết định hướng xử lý: "Thành công", "Thử lại", hoặc "Từ chối" (success, retry, rejection).
 
-## 14. Mất Điện (Crash behavior)
+## 14. Hành Vi Khi Gặp Sự Cố (Crash behavior)
 
-- Mất điện TRƯỚC KHI CHỐT: PostgreSQL vứt mẹ hết vào sọt rác (rollback).
-- Mất điện SAU KHI CHỐT, chưa kịp báo App: Cái kết quả đã lưu cần phải được ai đó tra cứu (outcome lookup).
-- Mất điện KHÔNG PHẢI LÀ THỦ PHẠM GÂY MẤT DỮ LIỆU; Thảm họa sinh ra ngay cả khi mọi thứ Đều Chốt Ngon Lành.
-- Muốn đập đi xây lại sổ sách (Rebuild projection), bạn bắt buộc phải có Ghi Nhớ Bền Bỉ mấy cái Tiến Độ Lẻ Tẻ và chống ghi trùng (deduplicated).
+- Máy chủ gián đoạn TRƯỚC KHI COMMIT: PostgreSQL lập tức hủy bỏ giao dịch (rollback) an toàn.
+- Máy chủ gián đoạn SAU KHI COMMIT nhưng chưa kịp gửi thông báo về: Kết quả đã ghi nhận và ứng dụng cần cơ chế truy vấn đối soát (outcome lookup).
+- Sự cố hỏng hóc KHÔNG PHẢI LÀ NGUYÊN NHÂN gây mất dữ liệu ở trường hợp này; lỗi ghi đè dữ liệu xảy ra ngay cả khi mọi hệ thống đang hoạt động tối ưu.
+- Để xây dựng cơ chế phục hồi sổ sách (Rebuild projection), hệ thống cần một hệ quản trị lưu trữ tiến độ độc lập (Event Log) kèm các thuật toán bảo vệ dữ liệu trùng lắp (deduplicated).
 
-## 15. Thử Lại Mù Quáng (Retry behavior)
+## 15. Thử Lại Một Cách An Toàn (Retry behavior)
 
-Hệ thống đang lỗi mà bạn gào thét Gọi Lại (Retry unconditional) thì cũng chẳng cứu vớt nổi cái lệnh đã bị đè. Nó có khi lại phang thêm 1 cục rác nữa hoặc đè thêm phát nữa. Retry chỉ là con người khi:
-- Bạn túm được cổ thằng gây Xung đột (conflict);
-- Lệnh cũ đã HỦY SẠCH SẼ (rollback hoàn tất);
-- Lần Thử Sau phải Lấy Lại Dữ Liệu Tươi Mới (reload current state);
-- Chắc chắn Code cùi bắp của bạn chạy lại không bị sinh trùng (command idempotency rõ);
-- Có ranh giới Thử rõ ràng (attempt/deadline bounded).
+Việc ra lệnh thử lại tự động (Retry unconditional) trên một thao tác đang gặp lỗi cấu trúc chỉ làm tăng tần suất đè dữ liệu hoặc đưa ra thông tin rác. Cơ chế thử lại chỉ an toàn khi đảm bảo các tiêu chuẩn sau:
+- Nắm rõ nguyên nhân gây ra xung đột (conflict signal).
+- Giao dịch lỗi phải được DỌN DẸP SẠCH SẼ (rollback hoàn tất).
+- Ở lần thử sau, dữ liệu phải được làm mới hoàn toàn (reload current state).
+- Thao tác thực thi luôn duy trì tính tự miễn dịch với dữ liệu trùng lặp (command idempotency).
+- Xác lập thời hạn truy cập (attempt/deadline bounded).
 
-Thường thì xài SQL Nguyên tử thì chả cần Try-Catch cho hai cái `+delta` chạy song song, vì bản thân cái Dòng (row-level) nó đã bắt tụi nó Xếp Hàng và Cộng Ngay Ngắn giùm bạn rồi.
+Thông thường khi áp dụng các cú pháp SQL Cập nhật Nguyên tử, việc triển khai mã khối Try-Catch là không cần thiết, vì CSDL tự xử lý việc đồng bộ và cộng dồn thông tin một cách ngăn nắp (row-level queue).
 
-## 16. Chạy Đa Server (Multi-instance)
+## 16. Thiết Kế Trong Môi Trường Đa Máy Chủ (Multi-instance)
 
-Nhét chữ `synchronized` vào Code Java App A chả hù dọa được App B ở Server kế bên đâu. Cái Cột/Điều kiện/Phiên Bản (row/predicate/version) ở dưới PostgreSQL mới là Ranh Giới Chia Sẻ duy nhất mà mọi ông thần (instances/direct workers) phải tuân theo.
+Sử dụng từ khóa `synchronized` trong Java chỉ có tác dụng nội bộ trong một Máy chủ duy nhất (JVM). Khóa cấp dòng, điều kiện cập nhật, hay phiên bản (row/predicate/version) tại PostgreSQL mới là vùng Ranh Giới Chia Sẻ đáng tin cậy duy nhất cho tất cả các máy chủ cùng vận hành (instances/direct workers).
 
-Dùng mấy cái Khóa Phân Tán (distributed mutex) bên ngoài lằng nhằng rắc rối, mệt tim quản lý (failure/lease/fencing), tự nhiên rước họa vào thân, thua xa trò đập vô Cú SQL Nguyên Tử cho nhanh!
+Xây dựng một hệ thống Khóa Phân Tán (distributed mutex) qua Redis hay Zookeeper sẽ tăng độ trễ và độ phức tạp cấu trúc (failure/lease/fencing). Thao tác cập nhật nguyên tử vào CSDL thường là giải pháp dễ duy trì và ổn định hơn hẳn.
 
-## 17. Giám Sát Sức Khỏe (Observability)
+## 17. Giám Sát Và Phát Hiện Lỗi Ẩn (Observability)
 
-Ghi Đè mất dữ liệu là Sát thủ Không Tiếng Động, Metrics Báo Lỗi là đồ bỏ! Hãy ôm trọn:
-- Đếm tổng số Công sức Thực tế và Gom tổng Đóng Góp (accepted command/event count / summed deltas).
-- Soi Mức lệch Sổ (projection value/reconciliation drift).
-- Số lượng Dòng bị đấm mỗi lần Cập Nhật Có Điều Kiện (affected-row count).
-- Tốc độ xảy ra Xung đột Khóa Lạc Quan/Serialization.
-- Sự phân chia tài nguyên và Điểm Nóng (hot-key distribution).
-- Đọc lén Mức độ Cô Lập lúc chẩn bệnh (effective isolation).
-- ID của Command bị Trùng để bắt mấy thằng lầy (duplicate outcome).
+Lỗi Ghi Đè Mất Dữ Liệu diễn ra một cách âm thầm, nên các số liệu cảnh báo Exception không đủ để chẩn đoán. Hệ thống cần chú trọng:
+- Đếm tổng số lượng công việc hoàn thành với số lần chấp nhận (accepted command/event count / summed deltas).
+- Kiểm tra dữ liệu đối soát trên tổng kết sổ sách (projection value/reconciliation drift).
+- Số lượng dòng bị tác động (affected-row count) trong mỗi lần Cập nhật Có Điều kiện.
+- Tần suất xuất hiện cảnh báo Xung đột Khóa Lạc Quan/Serialization.
+- Khả năng xuất hiện Điểm Nóng trên cơ sở dữ liệu (hot-key distribution).
+- Rà soát Mức độ Cô lập lúc giám định (effective isolation).
+- Ghi nhận ID của các chỉ thị để ngăn chặn hành vi trùng lặp (duplicate outcome).
 
-Tuyệt đối cấm quăng Data nhạy cảm vô File Log (payload nhạy cảm). Chống đối soát Sổ Sách (Reconciliation invariant) ngon ăn hơn ngàn lần cái kiểu đếm dòng Thành Công nhạt toẹt của SQL.
+Tuyệt đối tránh lưu thông tin cá nhân hoặc nghiệp vụ nhạy cảm vào File Log (payload nhạy cảm). Ưu tiên thiết lập quy trình đối soát Sổ Sách (Reconciliation invariant) để mang lại hiệu quả kiểm định cao hơn việc theo dõi kết quả SQL cập nhật thành công đơn thuần.

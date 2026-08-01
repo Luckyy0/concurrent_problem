@@ -1,14 +1,14 @@
-# PostgreSQL integration experiments và production verification
+# Thử nghiệm tích hợp PostgreSQL và xác minh trên production
 
 ## Chiến lược kiểm thử
 
-Unit test thuần Java không kiểm tra Spring proxy, repository transaction commit
+Unit test thuần Java không kiểm tra Spring proxy, commit của repository transaction
 hay PostgreSQL MVCC. Dùng `@SpringBootTest` + PostgreSQL Testcontainers, gọi bean
-từ application context và không annotate test method bằng `@Transactional`.
+từ application context và không annotate phương thức test bằng `@Transactional`.
 
-Một latch probe dừng writer sau khi repository debit method trả về. Với broken
-service, debit transaction đã commit. Với transactional harness, debit SQL nằm
-trong outer transaction và chưa commit.
+Một latch probe dừng luồng ghi (writer) sau khi phương thức debit của repository trả về. Với service bị lỗi,
+transaction của debit đã commit. Với harness có transaction, SQL của debit nằm
+trong transaction bên ngoài (outer transaction) và chưa commit.
 
 Xem [Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
 
@@ -39,8 +39,8 @@ class TransactionalSelfInvocationIT {
 ```
 
 Schema/migration tạo `account(id bigint primary key, balance bigint not null
-check (balance >= 0))`. Trước mỗi test insert A=100, B=100 trong committed setup
-transaction. Executor dùng hai platform thread và luôn được shutdown/await bounded.
+check (balance >= 0))`. Trước mỗi test insert A=100, B=100 trong transaction
+thiết lập ban đầu đã commit. Executor dùng hai platform thread và luôn được shutdown/await ở giới hạn.
 
 ## Latch probe
 
@@ -84,10 +84,10 @@ private static void awaitOrFail(CountDownLatch latch) {
 }
 ```
 
-Production bean của `TransferStepProbe` là no-op; test configuration thay bằng
+Production bean của `TransferStepProbe` là no-op; cấu hình test thay bằng
 `@Primary` latching probe.
 
-## Experiment 1: broken self-invocation lộ partial commit
+## Thử nghiệm 1: self-invocation bị lỗi làm lộ commit một phần
 
 ```java
 @Test
@@ -110,15 +110,15 @@ void readerSeesCommittedDebitBeforeCredit() throws Exception {
 }
 ```
 
-Business assertion `total=190` chứng minh partial state externally visible; chỉ
-assert transaction-active flag là chưa đủ.
+Business assertion `total=190` chứng minh trạng thái một phần có thể hiển thị bên ngoài (externally visible); chỉ
+kiểm tra cờ transaction-active là chưa đủ.
 
 > **Nói ngắn gọn:** test đọc bằng transaction khác, vì cùng persistence context
->hoặc outer test transaction có thể che commit boundary thật.
+>hoặc outer test transaction có thể che giấu ranh giới commit thật.
 
-## Experiment 2: credit failure không rollback broken debit
+## Thử nghiệm 2: credit thất bại không rollback debit đã lỗi
 
-Dùng destination ID không tồn tại để `credit` trả affected rows bằng 0:
+Dùng destination ID không tồn tại để `credit` trả về số dòng bị ảnh hưởng (affected rows) bằng 0:
 
 ```java
 @Test
@@ -137,15 +137,15 @@ void brokenCreditFailureLeavesDebitCommitted() {
 }
 ```
 
-Trong code test thực tế, unwrap `ExecutionException.getCause()` và assert domain
-exception; executor cleanup đặt trong `finally` nếu không dùng Java 21
+Trong mã test thực tế, unwrap `ExecutionException.getCause()` và assert ngoại lệ domain;
+dọn dẹp executor đặt trong `finally` nếu không dùng Java 21
 try-with-resources.
 
-## Experiment 3: transactional proxy giữ state invisible tới commit
+## Thử nghiệm 3: proxy transactional giữ trạng thái không hiển thị cho tới khi commit
 
-Test harness là Spring bean riêng, public method annotated `@Transactional` và có
-cùng debit → probe → credit sequence. Nó tồn tại chỉ trong `@TestConfiguration`
-để đặt deterministic barrier trong transaction.
+Test harness là Spring bean riêng, public method được annotate `@Transactional` và có
+cùng luồng debit → probe → credit. Nó tồn tại chỉ trong `@TestConfiguration`
+để đặt rào cản tất định (deterministic barrier) trong transaction.
 
 ```java
 @Test
@@ -173,17 +173,17 @@ void outerTransactionHidesDebitUntilBothUpdatesCommit() throws Exception {
 
 Probe có thể ghi lại
 `TransactionSynchronizationManager.isActualTransactionActive()` để assert `true`
-ở fixed harness và `false` sau broken repository debit, nhưng đây là structural
-assertion bổ sung, không thay invariant total.
+ở fixed harness và `false` sau debit bị lỗi của repository, nhưng đây là cấu trúc kiểm tra
+bổ sung, không thay thế business invariant tổng.
 
-## Experiment 4: failure rollback cả transfer đúng
+## Thử nghiệm 4: lỗi rollback cả transfer đúng
 
-Fixed harness transfer tới destination không tồn tại phải ném exception. Sau
-future completion, assert A=100, B=100, total=200. Bổ sung variant checked
-exception nếu production dùng `rollbackFor`; test phải chứng minh policy thực,
+Fixed harness transfer tới destination không tồn tại phải ném ra ngoại lệ. Sau
+khi future hoàn thành, assert A=100, B=100, total=200. Bổ sung biến thể checked
+exception nếu production dùng `rollbackFor`; test phải chứng minh chính sách thực tế,
 không chỉ đọc annotation.
 
-## Reader transaction độc lập
+## Transaction luồng đọc độc lập
 
 ```java
 long readTotalInNewTransaction() {
@@ -195,37 +195,37 @@ long readTotalInNewTransaction() {
 }
 ```
 
-Không reuse entity đã load trước bulk update; đọc SQL scalar trong transaction mới
-tránh persistence-context cache.
+Không dùng lại entity đã load trước bulk update; đọc vô hướng SQL (SQL scalar) trong transaction mới
+tránh cache của persistence-context.
 
-## Kiểm tra proxy và call path
+## Kiểm tra proxy và đường dẫn lời gọi (call path)
 
 - Assert bean lấy từ context là AOP proxy.
-- Gọi public entry qua injected bean, không `new` và không gọi target unwrap.
-- Dùng log/test probe xác nhận transaction active đúng boundary.
-- Test self-invocation broken và external-bean fixed như hai case riêng.
+- Gọi phương thức public đầu vào qua bean được inject, không khởi tạo (new) và không gọi target unwrap.
+- Dùng log/test probe xác nhận transaction đang active ở đúng ranh giới.
+- Test self-invocation bị lỗi và bean bên ngoài đã sửa (fixed external-bean) như hai trường hợp riêng biệt.
 - Nếu dùng `TransactionTemplate`, assert active bên trong callback và inactive
-  sau return.
+  sau khi trả về.
 
-## Production verification
+## Xác minh trên production
 
-- total-balance/conservation invariant qua reconciliation;
-- partial transfer/affected-row mismatch;
-- transaction commit/rollback/duration và rollback-only failure;
-- datasource connection use, statement/lock timeout;
-- correlation/transfer ID xuyên debit-credit;
-- event published before/after commit;
-- startup diagnostic xác nhận expected beans được proxied khi phù hợp.
+- Bất biến (invariant) bảo toàn tổng số dư qua đối soát;
+- transfer một phần/sai lệch affected-row;
+- commit/rollback/thời gian chạy của transaction và lỗi rollback-only;
+- sử dụng kết nối cơ sở dữ liệu, timeout của statement/lock;
+- ID của correlation/transfer xuyên suốt debit-credit;
+- sự kiện phát hành trước/sau commit;
+- chẩn đoán khởi động (startup diagnostic) xác nhận các bean như kỳ vọng được proxy khi phù hợp.
 
 ## Checklist chất lượng
 
 - [ ] PostgreSQL Testcontainers được dùng.
-- [ ] Test method không có outer `@Transactional` che commit.
-- [ ] Reader dùng independent `REQUIRES_NEW` transaction.
+- [ ] Phương thức test không có outer `@Transactional` che giấu commit.
+- [ ] Luồng đọc dùng transaction `REQUIRES_NEW` độc lập.
 - [ ] Latch dừng đúng sau debit, không dùng sleep.
 - [ ] Mọi latch/future có timeout.
-- [ ] Broken test thấy total 190 trước credit.
-- [ ] Broken failure giữ debit committed.
-- [ ] Fixed reader chỉ thấy total 200 và failure rollback cả hai update.
-- [ ] Proxy/transaction-active assertion bổ sung business invariant.
-- [ ] Executor và container lifecycle được cleanup.
+- [ ] Test lỗi thấy tổng 190 trước credit.
+- [ ] Lỗi ở broken code giữ nguyên debit đã commit.
+- [ ] Luồng đọc của code đã sửa chỉ thấy tổng 200 và lỗi sẽ rollback cả hai cập nhật.
+- [ ] Proxy/transaction-active assertion bổ sung cho business invariant.
+- [ ] Executor và vòng đời container được dọn dẹp.

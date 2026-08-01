@@ -2,21 +2,21 @@
 
 ## Chiến lược kiểm thử
 
-Case có hai race window khác nhau, nên cần hai deterministic test:
+Tình huống có hai cửa sổ tương tranh (race window) khác nhau, nên cần hai kiểm thử tất định (deterministic test):
 
-1. dừng hai actor sau capacity check nhưng trước increment;
+1. dừng hai tác nhân (actor) sau bước kiểm tra capacity nhưng trước khi increment;
 2. dừng transition sau khi giảm pending nhưng trước khi tăng active.
 
-Regression test cho solution phải kiểm tra invariant tổng, số actor thắng slot
-cuối, tính bảo toàn của transition và underflow/double-release behavior. Dùng
+Kiểm thử hồi quy (regression test) cho giải pháp phải kiểm tra invariant tổng, số lượng actor giành được slot
+cuối, tính bảo toàn của transition và hành vi underflow/double-release. Dùng
 latch/future có timeout, không dùng `Thread.sleep`.
 
 Nguyên tắc chung nằm tại
 [Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
 
-## Experiment 1: hai actor cùng reserve slot cuối
+## Thí nghiệm 1: hai actor cùng giữ chỗ (reserve) slot cuối
 
-Test harness dùng đúng hai `AtomicInteger` như broken code và thêm latch tại race
+Bộ kiểm thử (test harness) dùng đúng hai `AtomicInteger` như đoạn code lỗi và thêm latch tại race
 window. State bắt đầu ở `active=9`, `pending=0`, `limit=10`.
 
 ```java
@@ -115,15 +115,15 @@ class BrokenConnectionBudgetTest {
 }
 ```
 
-Assertion quan trọng không phải hai `AtomicInteger` ném exception hay không; đó là
-`used=11` dù limit bằng 10.
+Assertion quan trọng không phải là hai `AtomicInteger` có ném exception hay không; đó là
+kiểm tra `used=11` dù limit bằng 10.
 
-> **Nói ngắn gọn:** latch buộc cả hai quyết định dựa trên cùng state cũ, rồi mới
-> cho hai increment riêng lẻ chạy.
+> **Nói ngắn gọn:** latch buộc cả hai quyết định dựa trên cùng một state cũ, rồi mới
+> cho hai quá trình increment riêng lẻ chạy.
 
-## Experiment 2: transition mở capacity gap giả
+## Thí nghiệm 2: transition mở capacity gap giả
 
-Harness tiếp theo dừng completion thread sau `pending--`. Request mới chắc chắn
+Harness tiếp theo dừng thread hoàn tất (completion thread) sau `pending--`. Request mới chắc chắn sẽ
 reserve trong gap trước khi completion thread chạy `active++`.
 
 ```java
@@ -197,11 +197,11 @@ private static final class TransitionGapBudget {
 }
 ```
 
-Snippet dùng lại imports, static assertions và `awaitOrFail` từ Experiment 1.
-Đây là race khác với hai actor cùng check: chỉ một reservation thread vẫn có thể
-vượt capacity do transition nhiều counter bị tách đôi.
+Đoạn mã (snippet) dùng lại các phần import, static assertion và `awaitOrFail` từ Thí nghiệm 1.
+Đây là một race khác với việc hai actor cùng kiểm tra: chỉ một thread reservation vẫn có thể
+vượt quá capacity do transition của nhiều counter bị tách đôi.
 
-## Experiment 3: CAS chỉ cho một actor lấy slot cuối
+## Thí nghiệm 3: CAS chỉ cho một actor lấy slot cuối
 
 Khởi tạo 9 active connection bằng public transition, sau đó cho 32 virtual thread
 cạnh tranh slot thứ 10.
@@ -280,13 +280,13 @@ class ProviderConnectionBudgetTest {
 }
 ```
 
-Test assert cả số actor thắng và state cuối. Chỉ assert `used <= limit` có thể bỏ
-sót bug tất cả actor đều bị reject dù còn đúng một slot.
+Test sẽ xác nhận (assert) cả số actor thắng và state cuối. Nếu chỉ assert `used <= limit` thì có thể bỏ
+sót bug khi tất cả actor đều bị reject dù còn đúng một slot.
 
-## Experiment 4: CAS transition không tạo capacity gap
+## Thí nghiệm 4: CAS transition không tạo capacity gap
 
 Bắt đầu ở `active=9`, `pending=1`. Một actor chuyển pending sang active trong khi
-31 actor khác thử reserve. Dù CAS interleave theo thứ tự nào, không actor mới nào
+31 actor khác thử reserve. Dù CAS xen kẽ (interleave) theo thứ tự nào, không actor mới nào
 được chấp nhận vì tổng luôn bằng 10.
 
 ```java
@@ -331,10 +331,10 @@ void pendingToActiveTransitionConservesUsedCapacity() throws Exception {
 }
 ```
 
-Snippet cần static import `assertFalse`; các helper/import khác dùng lại từ
-Experiment 3.
+Snippet cần static import `assertFalse`; các helper/import khác được dùng lại từ
+Thí nghiệm 3.
 
-## Experiment 5: permit handle chống double release
+## Thí nghiệm 5: permit handle chống double release
 
 ```java
 @Test
@@ -353,27 +353,27 @@ void closingPermitTwiceDoesNotCreateExtraCapacity() {
 }
 ```
 
-Nếu `close()` release semaphore hai lần, lần acquire cuối sẽ thành công sai. Test
-này kiểm tra lifecycle identity mà aggregate counter đơn thuần không thể hiện.
+Nếu `close()` giải phóng (release) semaphore hai lần, lần acquire cuối sẽ thành công sai. Test
+này kiểm tra định danh vòng đời (lifecycle identity) mà một aggregate counter đơn thuần không thể hiện.
 
 ## Kiểm tra failure và underflow
 
-Bổ sung unit test tuần tự nhưng quan trọng:
+Bổ sung các unit test tuần tự nhưng quan trọng:
 
 - `creationFailed()` khi `pending=0` phải fail, không tạo counter âm;
 - `connectionClosed()` khi `active=0` phải fail;
-- creation timeout gọi cleanup đúng một lần;
-- callback success rồi callback failure cho cùng reservation bị từ chối bởi
+- creation timeout gọi phần cleanup đúng một lần;
+- callback thành công rồi gọi tiếp callback thất bại cho cùng một reservation sẽ bị từ chối bởi
   reservation token/state machine;
-- exception bên ngoài CAS loop không khiến transition chạy lặp.
+- exception bên ngoài CAS loop không khiến transition chạy lặp lại.
 
-Nếu dùng lock với `tryLock`, test timeout và interrupt restoration riêng. Nếu
+Nếu dùng lock với `tryLock`, cần test timeout và khôi phục (restoration) interrupt riêng. Nếu
 dùng blocking `Semaphore.acquire`, mọi test phải có bounded future timeout và
-cleanup permit trong `finally`/try-with-resources.
+cleanup permit trong khối `finally`/try-with-resources.
 
-## Stress test bổ sung
+## Kiểm thử chịu tải (Stress test) bổ sung
 
-Sau deterministic tests, chạy nhiều actor ngẫu nhiên reserve, succeed, fail và
+Sau khi chạy deterministic test, chạy nhiều actor ngẫu nhiên thực hiện reserve, succeed, fail và
 close. Ghi lại mọi state sau transition rồi assert:
 
 ```text
@@ -385,33 +385,33 @@ số active được tạo = close + active còn lại
 ```
 
 Dùng seed cố định và state machine model để so sánh. Stress test tăng độ phủ
-interleaving nhưng không thay thế deterministic race tests.
+interleaving nhưng không thay thế được các deterministic race test.
 
 ## Xác minh trong môi trường thực tế
 
 Theo dõi theo application instance:
 
 - `active`, `pending`, `used`, `limit` từ cùng một snapshot;
-- capacity rejection count và rejection rate;
-- handshake success/failure/timeout;
-- CAS retry distribution hoặc lock wait duration;
-- reservation age và pending slot quá hạn;
-- duplicate callback/double-close attempt;
-- invariant violation `used > limit` hoặc counter âm.
+- số lần từ chối (capacity rejection count) và tỷ lệ từ chối (rejection rate);
+- handshake thành công/thất bại/timeout;
+- phân phối (distribution) của việc retry CAS hoặc thời gian chờ lock;
+- reservation age và các pending slot quá hạn;
+- các duplicate callback/thử nghiệm double-close;
+- vi phạm invariant (violation) `used > limit` hoặc counter âm.
 
-Invariant violation cần log state, transition type và reservation ID, đồng thời
-alert ngay. Không tự động reset counter vì reset có thể che lifecycle leak và
-cho phép oversubscription lớn hơn.
+Khi có vi phạm invariant, cần log lại state, loại transition (transition type) và reservation ID, đồng thời
+alert ngay. Không tự động reset counter vì việc reset có thể che giấu lỗi rò rỉ vòng đời (lifecycle leak) và
+cho phép tình trạng oversubscription lớn hơn.
 
-## Checklist chất lượng của case
+## Danh sách kiểm tra (Checklist) chất lượng của tình huống
 
-- [ ] Hai race window được tái hiện bằng latch, không dùng sleep.
-- [ ] Mọi latch/future có timeout.
-- [ ] Broken tests assert state vượt limit.
+- [ ] Hai cửa sổ tương tranh (race window) được tái hiện bằng latch, không dùng sleep.
+- [ ] Mọi latch/future đều có timeout.
+- [ ] Đoạn test mã lỗi (broken test) assert được state vượt limit.
 - [ ] CAS test assert đúng một actor thắng slot cuối.
 - [ ] Transition test assert used capacity được bảo toàn.
-- [ ] Underflow và duplicate release được kiểm tra.
-- [ ] Interrupt status được khôi phục trong helper.
-- [ ] Executor được đóng sau test.
-- [ ] Production metric đọc từ một state snapshot.
-- [ ] Multi-instance quota không bị nhầm với local invariant.
+- [ ] Lỗi underflow và duplicate release được kiểm tra.
+- [ ] Trạng thái ngắt (Interrupt status) được khôi phục trong helper.
+- [ ] Executor được đóng sau khi chạy test.
+- [ ] Số liệu production (Production metric) được đọc từ một state snapshot.
+- [ ] Quota multi-instance không bị nhầm với local invariant.

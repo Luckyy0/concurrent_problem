@@ -1,6 +1,6 @@
-# Broken versioned-row implementation
+# Cài đặt versioned-row bị lỗi
 
-## Assignment entity
+## Thực thể phân công (Assignment entity)
 
 ```java
 @Entity
@@ -46,8 +46,7 @@ public class OnCallAssignment {
 }
 ```
 
-`@Version` bảo vệ stale write trên cùng assignment row. Nó không tạo một shared
-version cho toàn roster.
+`@Version` bảo vệ việc ghi dữ liệu cũ trên cùng một row phân công. Nó không tạo một phiên bản chia sẻ cho toàn danh sách trực.
 
 ## Repository
 
@@ -76,7 +75,7 @@ public interface OnCallAssignmentRepository
 }
 ```
 
-## Broken service
+## Dịch vụ lỗi (Broken service)
 
 ```java
 @Service
@@ -108,14 +107,11 @@ public class OnCallService {
 }
 ```
 
-`REPEATABLE_READ` thường được thêm với ý định “giữ count ổn định”. Điều đó đúng
-cho repeated reads trong từng transaction, nhưng chính stable snapshots cho phép A
-và B cùng tiếp tục tin rằng count là `2`.
+`REPEATABLE_READ` thường được thêm với ý định “giữ kết quả đếm ổn định”. Điều đó đúng cho các lần đọc lặp lại trong từng transaction, nhưng chính stable snapshots cho phép A và B cùng tiếp tục tin rằng số lượng là `2`.
 
-> **Nói ngắn gọn:** cả hai Hibernate UPDATEs có version predicate và affected-row
-> `1`; optimistic locking không báo lỗi vì Alice và Bob là hai rows khác nhau.
+> **Nói ngắn gọn:** cả hai thao tác UPDATE của Hibernate đều có điều kiện phiên bản và có số row bị ảnh hưởng là `1`; optimistic locking không báo lỗi vì Alice và Bob là hai rows khác nhau.
 
-## SQL khi Hibernate flush
+## Câu lệnh SQL khi Hibernate flush
 
 A:
 
@@ -139,11 +135,9 @@ where assignment_id = :bobAssignmentId
 -- affected rows = 1
 ```
 
-Hibernate chỉ ném `OptimisticLockException`/Spring optimistic-lock exception khi
-versioned UPDATE affected-row là `0`. Ở đây cả hai là `1`, nên không có conflict
-signal để retry.
+Hibernate chỉ ném `OptimisticLockException` (hoặc Spring optimistic-lock exception) khi thao tác cập nhật có version có số row bị ảnh hưởng là `0`. Ở đây cả hai là `1`, nên không có tín hiệu xung đột để thử lại.
 
-## Concrete interleaving
+## Trình tự xen kẽ cụ thể (Concrete interleaving)
 
 ```text
 A BEGIN REPEATABLE READ
@@ -161,10 +155,10 @@ final COUNT on_call=true -> 0
 
 Row locks:
 
-- A UPDATE locks Alice row tới commit;
-- B UPDATE locks Bob row tới commit;
-- locks không conflict;
-- plain COUNT không lock roster predicate.
+- Thao tác UPDATE của A locks Alice row tới lúc commit;
+- Thao tác UPDATE của B locks Bob row tới lúc commit;
+- Các locks không xung đột;
+- Lệnh đếm (COUNT) thông thường không lock điều kiện danh sách trực.
 
 ## Schema tương đương
 
@@ -185,50 +179,44 @@ create table on_call_assignment (
 );
 ```
 
-Unique constraint ngăn duplicate operator assignment; nó không enforce “ít nhất
-một row on_call=true”.
+Ràng buộc unique ngăn việc gán nhân viên trùng lặp; nó không ép buộc “ít nhất một row on_call=true”.
 
-## Preconditions tái hiện
+## Điều kiện tái hiện (Preconditions)
 
-1. Roster ban đầu có đúng hai on-call assignments.
-2. A và B có physical transactions/connections độc lập.
-3. Cả hai COUNT trước khi actor nào commit UPDATE.
-4. A update Alice row, B update Bob row.
-5. Effective isolation là `READ COMMITTED` hoặc PostgreSQL `REPEATABLE READ`.
-6. Không có guard-row lock/counter/serializable retry.
-7. Test không có outer transaction che commit.
+1. Danh sách trực ban đầu có đúng hai nhân viên on-call.
+2. A và B có physical transactions và connections độc lập.
+3. Cả hai thực hiện đếm trước khi bất kỳ ai commit thao tác UPDATE.
+4. A cập nhật dòng của Alice, B cập nhật dòng của Bob.
+5. Mức cô lập hiệu lực là `READ COMMITTED` hoặc PostgreSQL `REPEATABLE READ`.
+6. Không có guard-row lock, bộ đếm hoặc thử lại tuần tự hóa (serializable retry).
+7. Test không có transaction bên ngoài (outer transaction) che lấp việc commit.
 
 ## Những cách sửa chưa đủ
 
 ### Chỉ thêm `@Version`
 
-Đã có; version scopes theo assignment row, trong khi invariant scopes theo roster.
+Đã có; phạm vi phiên bản tính theo dòng phân công, trong khi phạm vi quy tắc tính theo danh sách trực.
 
 ### Nâng từ `READ COMMITTED` lên `REPEATABLE READ`
 
-Ngăn non-repeatable read/visible phantom cho transaction, không phát hiện mọi
-serialization anomaly của different-row writes.
+Ngăn chặn việc đọc không lặp lại (non-repeatable read) hoặc phantom hiển thị cho transaction, không phát hiện mọi serialization anomaly của các thao tác ghi trên các dòng khác nhau.
 
-### Lock row của chính operator
+### Lock row của chính nhân viên
 
-A và B vẫn lock different rows. Shared invariant cần shared guard hoặc lock toàn
-relevant set theo cùng protocol.
+A và B vẫn lock các rows khác nhau. Quy tắc chia sẻ cần một guard chia sẻ hoặc lock toàn bộ tập hợp liên quan theo cùng một giao thức.
 
 ### Dùng unique/check constraint đơn giản
 
-Row-level `CHECK` không query được count của sibling rows. Unique constraint không
-biểu diễn “at least one true”.
+`CHECK` ở mức dòng không truy vấn được số lượng của các rows anh em. Ràng buộc unique không biểu diễn quy tắc “ít nhất một giá trị true”.
 
 ### Dùng `synchronized`
 
-Không coordinate app node khác, admin SQL hay batch process.
+Không điều phối được các nodes ứng dụng khác, SQL từ admin hay tiến trình hàng loạt (batch process).
 
-### Retry optimistic exception
+### Thử lại ngoại lệ optimistic (Retry optimistic exception)
 
-Không exception nào xảy ra trong interleaving này. Retry same decision mà không
-reload toàn roster cũng không bảo vệ invariant.
+Không có ngoại lệ nào xảy ra trong trình tự xen kẽ này. Việc thử lại cùng một quyết định mà không tải lại toàn bộ danh sách trực cũng không bảo vệ được quy tắc bất biến.
 
-### Gửi notification trước commit
+### Gửi thông báo trước commit
 
-Nếu transaction sau đó rollback/serialization-fail, notification trở thành
-orphan side effect. Publish durable outbox trong successful transaction nếu cần.
+Nếu transaction sau đó bị rollback hoặc lỗi tuần tự hóa, thông báo trở thành một tác dụng phụ vô thừa nhận (orphan side effect). Hãy phát hành các sự kiện outbox bền bỉ trong successful transaction nếu cần thiết.

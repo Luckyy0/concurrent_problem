@@ -1,21 +1,21 @@
-# Phòng Thí Nghiệm Đập Tan Ảo Tưởng: Chạy Thật Trên PostgreSQL (Deterministic PostgreSQL experiments)
+# Phòng Thí Nghiệm: Khảo Sát Cơ Chế MVCC Trên PostgreSQL (Deterministic PostgreSQL experiments)
 
-## 1. Mục tiêu (Thí nghiệm để làm gì?)
+## 1. Mục tiêu kiểm thử
 
-Các bài Test phải chứng minh rõ ràng như ban ngày:
+Các bài kiểm thử (Test) cần thể hiện một cách khoa học các nguyên lý sau:
 
-1. Ông A và B đang chạy trên hai Giao dịch (transactions) độc lập hoàn toàn.
-2. Cả hai cú Đọc (SELECT) đều nhìn thấy con số ban đầu là `10`.
-3. Ông A nhanh tay chốt số `13` TRƯỚC KHI ông B chốt đè số cũ rích `14`.
-4. Mọi hàm gọi đều báo cáo Thành Công rực rỡ, NHƯNG chân lý cuối cùng (con số `17`) đã bị phá vỡ hoàn toàn.
-5. Nếu dùng chiêu Cộng Nguyên Tử (atomic delta), hệ thống sẽ gộp đúng ra số `17`.
-6. Nếu xài các chiêu Bắt Lỗi khác (detectors), hệ thống sẽ chủ động Chặn (block) hoặc Báo Lỗi Xung Đột (conflict) thay vì lẳng lặng đè bẹp (silent overwrite).
+1. Giao dịch A và B khởi tạo và thi hành trên hai Giao dịch (transactions) hoàn toàn riêng biệt.
+2. Cả hai thao tác Đọc (SELECT) đều nhận được số liệu gốc là `10`.
+3. Giao dịch A hoàn tất (commit) giá trị `13` TRƯỚC KHI giao dịch B ghi đè dữ liệu cũ bằng giá trị `14`.
+4. Mọi hàm xử lý trong ứng dụng đều báo cáo hoàn thành, TUY NHIÊN tính toàn vẹn của kết quả (tổng `17`) bị sai lệch hoàn toàn.
+5. Việc áp dụng Phép Cộng Nguyên Tử (atomic delta) sẽ điều phối chính xác dữ liệu ra kết quả `17`.
+6. Việc sử dụng các giải pháp Bắt lỗi (detectors) sẽ chủ động chặn yêu cầu (block) hoặc gửi cảnh báo Xung đột (conflict), loại trừ tình trạng ghi đè âm thầm (silent overwrite).
 
-> **Nói ngắn gọn:** Mình sẽ gài bẫy (dùng `CountDownLatch` latches) ép tụi nó phải chạy theo thứ tự: "Cùng Đọc -> Khác lúc Ghi", rồi mở một Giao dịch Mới Toanh để đọc kết quả cuối cùng phơi bày sự thật.
+> **Nói ngắn gọn:** Chúng ta sẽ thiết lập một Rào cản (sử dụng `CountDownLatch`) để ép các luồng chạy theo đúng trình tự: "Cùng Đọc -> Khác thời điểm Ghi", sau đó sử dụng một Giao dịch Mới hoàn toàn để đối chiếu mức độ toàn vẹn của kết quả.
 
-## 2. Dùng Database Thật Bằng Testcontainers
+## 2. Thiết Lập PostgreSQL Thực Tế Bằng Testcontainers
 
-Đừng có dại dột mà lôi H2 ra thử nghiệm trò này!
+Bắt buộc sử dụng hệ quản trị CSDL thực thay vì các CSDL giả lập bộ nhớ (như H2):
 
 ```java
 @Testcontainers
@@ -26,13 +26,13 @@ class LostUpdateIntegrationTest {
     @Container
     @ServiceConnection
     static final PostgreSQLContainer<?> POSTGRES =
-        new PostgreSQLContainer<>("postgres:16-alpine"); // PostgreSQL 100% real
+        new PostgreSQLContainer<>("postgres:16-alpine"); // PostgreSQL thực tế
 }
 ```
 
-Nhớ kỹ: File Test này tuyệt đối KHÔNG GẮN `@Transactional` ở mức Class/Method. Dùng H2 In-Memory không thể làm Bằng Chứng Chứng Minh cho cách xử lý MVCC/Khóa (lock behavior) của PostgreSQL.
+Lưu ý: Không được gán annotation `@Transactional` vào toàn bộ Class hay Phương thức Test. Việc giả lập H2 trong bộ nhớ (In-Memory) không thể phản ánh chính xác các cơ chế MVCC và Quản lý khóa (lock behavior) của PostgreSQL.
 
-Bảng thiết kế ngây ngô gây họa (Schema broken variant):
+Cấu trúc Bảng chứa lỗi (Schema broken variant):
 
 ```sql
 create table job_progress (
@@ -47,16 +47,16 @@ create table job_progress (
 );
 ```
 
-Bơm dữ liệu ban đầu (Fixture setup commit):
+Dữ liệu ban đầu (Fixture setup commit):
 
 ```sql
 insert into job_progress(job_id, completed_units, total_units)
 values (:jobId, 10, 100);
 ```
 
-## 3. Chốt Cửa Gài Bẫy (Gate ép both reads trước first commit)
+## 3. Rào Cản Điều Phối Luồng (Gate ép both reads trước first commit)
 
-Cái cổng gác này (Gate) làm nhiệm vụ bắt ép cả hai luồng (threads) phải ĐỌC XONG rồi mới được GHI.
+Rào cản này (Gate) sẽ có vai trò chặn cả hai luồng (threads) để chúng phải hoàn tất thao tác ĐỌC trước khi có thể GHI.
 
 ```java
 final class LostUpdateGate {
@@ -75,15 +75,15 @@ final class LostUpdateGate {
 
     void afterLoad(UUID actorId, int value) {
         observed.put(actorId, value);
-        bothLoaded.countDown(); // Báo cáo: "Tui đọc xong rồi!"
-        awaitOrFail(bothLoaded, Duration.ofSeconds(5)); // Đợi thằng kia cũng đọc xong!
+        bothLoaded.countDown(); // Thông báo: "Thao tác đọc hoàn tất"
+        awaitOrFail(bothLoaded, Duration.ofSeconds(5)); // Chờ luồng còn lại thao tác đọc xong
 
         if (actorId.equals(actorA)) {
-            awaitOrFail(allowA, Duration.ofSeconds(5)); // Chờ sếp cho phép chạy tiếp
+            awaitOrFail(allowA, Duration.ofSeconds(5)); // Chờ chỉ thị tiếp tục
         } else if (actorId.equals(actorB)) {
-            awaitOrFail(allowB, Duration.ofSeconds(5)); // Chờ sếp cho phép chạy tiếp
+            awaitOrFail(allowB, Duration.ofSeconds(5)); // Chờ chỉ thị tiếp tục
         } else {
-            throw new AssertionError("Ủa thằng ất ơ nào đây?");
+            throw new AssertionError("Luồng định danh không hợp lệ");
         }
     }
 
@@ -114,41 +114,41 @@ final class LostUpdateGate {
     ) {
         try {
             if (!latch.await(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                throw new AssertionError("Bị treo cmnr! (Timeout)");
+                throw new AssertionError("Lỗi treo ứng dụng do hết thời gian (Timeout)");
             }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            throw new AssertionError("Ai đá dây điện vậy?", interrupted);
+            throw new AssertionError("Xảy ra gián đoạn khi đang chờ (Interrupt)", interrupted);
         }
     }
 }
 ```
 
-Cái Cổng này chỉ dành riêng cho bài Test thôi nhé (test-only component). Service sẽ bị ép chèn đoạn code gọi `gate.afterLoad(...)` nằm chen giữa bước ĐỌC (Repository SELECT) và BƯỚC GHI ĐÈ.
+Thành phần Cổng Rào Cản này là công cụ đặc thù dành riêng cho việc kiểm thử (test-only component). Trong Service sẽ chèn thêm mã thực thi `gate.afterLoad(...)` chen giữa quá trình ĐỌC (Repository SELECT) và GHI ĐÈ.
 
-## 4. Chụp X-Quang Giao Dịch (Transaction observation)
+## 4. Công Cụ Giám Sát Giao Dịch (Transaction observation)
 
-Để chắc chắn chúng ta đang xài đúng cấp độ Cô Lập, chọt thử cái Query này vào giữa Giao Dịch đang chạy:
+Để đảm bảo mức độ Cô Lập chuẩn xác, chúng ta nhúng một Query sau vào Giao Dịch:
 
 ```sql
 select pg_current_xact_id()::text,
        current_setting('transaction_isolation');
 ```
 
-Lưu thành Bản Cáo Trạng:
+Tạo một cấu trúc lưu trữ thông tin Giám Sát:
 
 ```java
 public record TransactionObservation(
     UUID actorId,
-    String transactionId, // Tên định danh của Giao dịch
+    String transactionId, // Định danh của Giao dịch
     String isolation,     // Mức độ cách ly
     AtomicInteger completionStatus
 ) {}
 ```
 
-Chơi lớn bằng cách đăng ký Listener (`TransactionSynchronization.afterCompletion`) để khẳng định rằng cả A và B cuối cùng đều Đã Chốt Sổ Thành Công (`STATUS_COMMITTED`).
+Bổ sung tính năng theo dõi thông qua Listener (`TransactionSynchronization.afterCompletion`) để xác thực tiến trình của hai Giao dịch A và B đều kết thúc hợp lệ (`STATUS_COMMITTED`).
 
-## 5. Thí nghiệm 1 — Thảm Họa Mất Dữ Liệu Rõ Ràng Như Ban Ngày
+## 5. Thí nghiệm 1 — Kiểm Chứng Sự Cố Mất Dữ Liệu Điển Hình
 
 ```java
 @Test
@@ -167,35 +167,35 @@ void staleAbsoluteWriteSilentlyOverwritesCommittedDelta()
             broken.addCompletedUnits(actorB, JOB_ID, 4)
         );
 
-        gate.awaitBothLoaded(); // Ép hai thằng cùng bắt đầu Đọc
-        assertThat(gate.observedBy(actorA)).isEqualTo(10); // Cả hai phải nhìn thấy số 10
+        gate.awaitBothLoaded(); // Đảm bảo cả hai luồng đã tiến hành Đọc
+        assertThat(gate.observedBy(actorA)).isEqualTo(10); // Đều phải tải lên dữ liệu là 10
         assertThat(gate.observedBy(actorB)).isEqualTo(10);
 
-        gate.releaseA(); // Cho phép ông A lụm khóa và chạy trước
+        gate.releaseA(); // Cấp phát tín hiệu cho A tiếp tục xử lý
         ProgressResult resultA = a.get(5, TimeUnit.SECONDS);
-        assertThat(resultA.after()).isEqualTo(13); // Ông A tưởng mình win
+        assertThat(resultA.after()).isEqualTo(13); // A hoàn tất với 13
 
-        gate.releaseB(); // Bây giờ mới thả cho ông B đè vào
+        gate.releaseB(); // Bây giờ nhả khóa cho B xử lý đè lên
         ProgressResult resultB = b.get(5, TimeUnit.SECONDS);
-        assertThat(resultB.after()).isEqualTo(14); // Ông B cũng tưởng mình win!
+        assertThat(resultB.after()).isEqualTo(14); // B hoàn tất với 14
 
-        // X-Quang lại xem
+        // Đối chiếu hồ sơ Giao dịch
         TransactionObservation txA = probe.transaction(actorA);
         TransactionObservation txB = probe.transaction(actorB);
         assertThat(txA.transactionId())
-            .isNotEqualTo(txB.transactionId()); // Đúng là 2 giao dịch khác nhau
-        assertThat(txA.isolation()).isEqualTo("read committed"); // Đúng mức độ
+            .isNotEqualTo(txB.transactionId()); // Khẳng định 2 giao dịch phân biệt
+        assertThat(txA.isolation()).isEqualTo("read committed"); // Đúng mức Cô lập yêu cầu
         assertThat(txB.isolation()).isEqualTo("read committed");
         assertThat(txA.completionStatus().get())
-            .isEqualTo(TransactionSynchronization.STATUS_COMMITTED); // Đều báo Thành công
+            .isEqualTo(TransactionSynchronization.STATUS_COMMITTED); // Cả hai báo Thành công
         assertThat(txB.completionStatus().get())
             .isEqualTo(TransactionSynchronization.STATUS_COMMITTED);
 
-        // KẾT CỤC BI THẢM
+        // KẾT CỤC: THẤT THOÁT DỮ LIỆU
         JobProgressSnapshot finalState = inspector.read(JOB_ID);
-        assertThat(finalState.completedUnits()).isEqualTo(14); // Bằng 14 (của B)
+        assertThat(finalState.completedUnits()).isEqualTo(14); // Trạng thái cuối mang số 14
         assertThat(finalState.completedUnits())
-            .isNotEqualTo(10 + 3 + 4); // Không bao giờ lên nổi 17
+            .isNotEqualTo(10 + 3 + 4); // Toàn vẹn hệ thống bị vi phạm, không ra 17
     } finally {
         gate.releaseAll();
         probe.reset();
@@ -205,11 +205,11 @@ void staleAbsoluteWriteSilentlyOverwritesCommittedDelta()
 }
 ```
 
-Đoạn `a.get(timeout)` đảm bảo rằng Trình chặn Giao Dịch (transaction interceptor) của A đã chốt thành công 100% rồi mới cho qua. Vì vậy, B mà chạy sau đó là chắc chắn ốp đè lên bản chốt cuối cùng.
+Hàm `a.get(timeout)` giữ nhiệm vụ chờ cho Trình Chặn (transaction interceptor) của giao dịch A đạt mốc xác nhận (commit) hoàn tất. Nên khi giao dịch B tiếp tục chạy, nó chắc chắn ghi đè trực tiếp kết quả.
 
-## 6. Thí nghiệm 2 — Phép Cộng Nguyên Tử (Atomic delta compose) Cứu Rỗi Thế Giới
+## 6. Thí nghiệm 2 — Phép Cộng Nguyên Tử (Atomic delta compose) Khắc Phục Lỗi
 
-Tạo cái Cổng xuất phát đơn giản thôi: "1,2,3 Chạy nha!":
+Tạo ra một Rào cản Đồng thời ("Cùng bắt đầu"):
 
 ```java
 final class StartGate {
@@ -218,7 +218,7 @@ final class StartGate {
 
     void readyAndAwaitStart() {
         ready.countDown(); // Đã sẵn sàng
-        awaitOrFail(start, Duration.ofSeconds(5)); // Chờ sếp thổi còi
+        awaitOrFail(start, Duration.ofSeconds(5)); // Chờ chỉ thị tiến hành
     }
 
     void awaitReady() {
@@ -226,12 +226,12 @@ final class StartGate {
     }
 
     void release() {
-        start.countDown(); // Thổi còi!
+        start.countDown(); // Bắt đầu tiến trình
     }
 }
 ```
 
-Chạy Test đập tan nỗi đau:
+Tiến hành Kiểm thử:
 
 ```java
 @Test
@@ -242,20 +242,20 @@ void atomicDeltaPreservesBothConcurrentCommands() throws Exception {
     try {
         Future<ProgressApplyResult> a = actors.submit(() -> {
             gate.readyAndAwaitStart();
-            return atomic.addCompletedUnits(JOB_ID, 3); // Giao việc cho Database!
+            return atomic.addCompletedUnits(JOB_ID, 3); // Giao phó DB thực hiện phép tính cộng
         });
         Future<ProgressApplyResult> b = actors.submit(() -> {
             gate.readyAndAwaitStart();
-            return atomic.addCompletedUnits(JOB_ID, 4); // Giao việc cho Database!
+            return atomic.addCompletedUnits(JOB_ID, 4); // Giao phó DB thực hiện phép tính cộng
         });
 
-        gate.awaitReady(); // Điểm danh đủ
-        gate.release(); // Chạy!
+        gate.awaitReady(); // Hai luồng đã sẵn sàng
+        gate.release(); // Kích hoạt chạy đồng thời
 
         assertThat(a.get(5, TimeUnit.SECONDS).isApplied()).isTrue();
         assertThat(b.get(5, TimeUnit.SECONDS).isApplied()).isTrue();
 
-        // KẾT QUẢ CÔNG LÝ: 17
+        // KẾT QUẢ ĐẠT TOÀN VẸN: 17
         JobProgressSnapshot finalState = inspector.read(JOB_ID);
         assertThat(finalState.completedUnits()).isEqualTo(17);
     } finally {
@@ -266,11 +266,11 @@ void atomicDeltaPreservesBothConcurrentCommands() throws Exception {
 }
 ```
 
-Bài test này không thèm quan tâm A hay B ăn được cái Khóa Dòng (Row Lock) trước. Đứa nào tới trước thì được DB cộng dồn trước, đứa tới sau chờ tí rồi cũng được cộng dồn theo. Tuyệt đối không mất đi đâu miếng data nào (compose theo cả hai order).
+Kiểm thử này độc lập với việc Luồng nào chiếm giữ Khóa Dòng (Row Lock) trước tiên. Hệ thống DB sẽ giải quyết thứ tự thi hành và duy trì kết quả cộng dồn nguyên tử. Dữ liệu của hai bên hoàn toàn được bảo toàn (compose theo cả hai order).
 
-## 7. Thí nghiệm 3 — Cú Chặn Mức Trần Chống Lố (Conditional cap)
+## 7. Thí nghiệm 3 — Điều Kiện Cản Trở Chống Quá Tải (Conditional cap)
 
-Giả sử Số đã xong `95`, Tổng số `100`; Thằng A gởi tới `3`, thằng B gởi tới `4`:
+Nếu Số hoàn thành hiện tại là `95`, Hạn mức tổng `100`; Giao dịch A gửi Yêu cầu `3`, Giao dịch B gửi `4`:
 
 ```java
 @Test
@@ -279,35 +279,35 @@ void atomicPredicatePreventsAcceptedTotalFromCrossingCap()
     ConcurrentApplyResults results =
         runAtomicDeltasFromSameStart(95, 100, 3, 4);
 
-    // Dù có lao vào cùng lúc, chỉ có 1 thằng được duyệt thôi
+    // Mặc dù tương tranh cùng lúc, điều kiện DB sẽ chỉ cấp quyền cập nhật cho 1 luồng
     assertThat(results.appliedCount()).isEqualTo(1);
-    assertThat(results.notAppliedCount()).isEqualTo(1); // Thằng kia bị đá văng
+    assertThat(results.notAppliedCount()).isEqualTo(1); // Yêu cầu luồng còn lại bị bác bỏ
 
     int finalValue = inspector.read(JOB_ID).completedUnits();
-    assertThat(finalValue).isIn(98, 99); // Trúng thằng nào thì lấy số thằng đó
-    assertThat(finalValue).isLessThanOrEqualTo(100); // KHÔNG BAO GIỜ lố 100.
+    assertThat(finalValue).isIn(98, 99); // Kết quả sẽ phụ thuộc vào luồng được xử lý trước
+    assertThat(finalValue).isLessThanOrEqualTo(100); // KHÔNG VƯỢT QUÁ HẠN MỨC
 }
 ```
 
-Tuyệt chiêu ở đây là: Thằng nào đứng Đợi Khóa xong, lúc được nhả Khóa ra, PostgreSQL sẽ THẨM ĐỊNH LẠI CÁI ĐIỀU KIỆN (re-evaluate predicate) trên dữ liệu MỚI NHẤT hiện tại. Lố số thì số dòng bị ảnh hưởng (affected row) = 0 => Ăn rổ hành (not applied). Không có thằng nào bị lừa là "Cập nhật rồi nha" trong khi Delta đã bốc hơi cả.
+Nguyên lý bảo vệ ở đây: Luồng nào chịu trách nhiệm chờ (wait) do bị Khóa, lúc Khóa được giải phóng PostgreSQL sẽ tiến hành ĐÁNH GIÁ LẠI ĐIỀU KIỆN (re-evaluate predicate) dựa trên dữ liệu lưu trữ MỚI NHẤT. Nếu giới hạn bị vi phạm, chỉ số dòng thay đổi (affected row) sẽ rơi vào = 0 (not applied). Nhờ đó, ứng dụng hoàn toàn có thể kiểm soát và từ chối cập nhật khi hết dung lượng phân bổ.
 
-## 8. Thí nghiệm 4 — Bùa Hộ Mệnh `@Version` Gây Bão (Optimistic version conflict)
+## 8. Thí nghiệm 4 — Giải Pháp Khóa Lạc Quan Sinh Xung Đột (Optimistic version conflict)
 
-Thêm cái Cột `version` vào Bảng:
+Khai báo bổ sung trường `version` vào bảng:
 
 ```sql
 alter table job_progress
 add column version bigint not null default 0;
 ```
 
-Vẫn dùng cái Cửa Gài Bẫy (LostUpdateGate) ở bài 1, ép A và B cùng đọc lên bản có Version `7`. Ông A Chốt sổ thành công trước (Version sẽ nhích lên 8). Đến lượt ông B (đang ôm Version 7 trong bụng) cố xả hàng (flush):
+Tái sử dụng Rào cản từ kiểm thử số 1 (LostUpdateGate). Ép hai giao dịch A và B tải dữ liệu ở cùng phiên bản Version `7`. A chốt sổ hoàn thành trước (Version tự động tăng lên 8). Đến phiên B (đang mang Version 7 ở dữ liệu đệm) cố gắng đồng bộ thay đổi:
 
 ```java
 Throwable conflict = catchThrowable(() ->
     b.get(5, TimeUnit.SECONDS)
 );
 
-// Lôi ra ánh sáng! Phải quăng lỗi Lạc Quan
+// Bắt ngoại lệ! Yêu cầu từ chối Khóa Lạc Quan
 assertThat(rootCause(conflict))
     .isInstanceOfAny(
         OptimisticLockException.class,
@@ -315,75 +315,75 @@ assertThat(rootCause(conflict))
     );
 ```
 
-Phía Spring sẽ bọc lỗi này thành `ObjectOptimisticLockingFailureException` ở tầng Service. Sau khi B bị Đạp (rollback), kết quả là:
+Tầng Spring sẽ bao bọc các lỗi ngoại lệ (exception) này dưới cái tên `ObjectOptimisticLockingFailureException`. Sau khi giao dịch của B bị Hủy bỏ (rollback), DB bảo lưu kết quả:
 
 ```text
-completed=13, version=8 (Chỉ có phần của A)
+completed=13, version=8 (Phần cập nhật từ A)
 ```
 
-Giờ nếu bắt ông B Thử Lại (Retry) ĐÀNG HOÀNG từ đầu (nhớ khởi tạo Transaction mới hoàn toàn): Tải lại số `13 / Version 8`, rồi ốp cái cộng `4` vào, chốt sổ:
+Lúc này tiến trình ứng dụng bắt buộc B thử lại từ đầu (tạo Transaction mới). B sẽ nạp bộ nhớ với số `13 / Version 8`, chạy tính toán cộng `4` và gửi dữ liệu chốt:
 
 ```text
-completed=17, version=9 (Thành công mỹ mãn!)
+completed=17, version=9 (Hoàn thành một cách hợp lệ)
 ```
 
-Máy chụp X-Quang (Probe) sẽ báo cáo cái transaction ID lúc Retry của B và Hibernate session là khác biệt hoàn toàn với lúc nãy. Đừng bao giờ Cố Đấm Ăn Xôi (không retry) ngay trên cái Transaction đã bị gạch đít rách nát (rollback-only).
+Giám Sát (Probe) xác thực Mã Định Danh Transaction khi B Retry là phiên bản mới. Chúng ta không bao giờ được phép duy trì hay sửa chữa nghiệp vụ ngay trên Giao dịch đã phát sinh Hủy Bỏ (rollback-only).
 
-## 9. Thí nghiệm 5 — Chờ Đợi Bi Quan (Pessimistic read) Xếp Hàng Trước Khi Tính
+## 9. Thí nghiệm 5 — Khóa Bi Quan Đóng Chờ Đồng Bộ (Pessimistic read)
 
-Ông A xài bùa `findByIdForUpdate`, tải lên số `10`, rồi đứng im ở Cửa Gác. Ông B lúc này ráng Chạy, nhưng Bị Treo mỏ ngay lập tức ở câu Lệnh Chọn (locked repository query).
+Giao dịch A sử dụng `findByIdForUpdate` và tải giá trị `10`. Ngay khi A đang bị giữ ở Rào cản, B cố gắng thực thi truy vấn nhưng ngay lập tức Gặp Tình Trạng Chờ (locked repository query).
 
-Check DB ngầm thì thấy ông B đang ăn bảng hiệu: `wait_event_type = 'Lock'`. Sau khi B thả ông A ra:
+Động thái kiểm tra DB sẽ xuất hiện nhãn: `wait_event_type = 'Lock'`. Sau khi A được phép xử lý xong và giải phóng:
 
 ```text
-Ông A Chốt sổ với con số 13.
-Ông B mới được nhả Khóa, Lệnh Query lúc nãy sẽ tải lên được con số TƯƠI RÓI là 13.
-Ông B nhẩm tính: 13 + 4 = 17, chốt sổ.
+A chốt lưu dữ liệu 13.
+B nhận quyền Khóa, thực thi Lệnh Query đã lên lịch và lúc này nạp giá trị hiện tại là 13.
+B thực hiện tính toán: 13 + 4 = 17 và chốt kết quả.
 ```
 
-Kiểm chứng rành rành:
+Minh chứng bằng số liệu:
 
 ```java
-assertThat(probe.loadedValue(actorA)).isEqualTo(10); // A đọc cũ
-assertThat(probe.loadedValue(actorB)).isEqualTo(13); // B đọc mới, vì B phải Đợi A!
-assertThat(inspector.read(JOB_ID).completedUnits()).isEqualTo(17); // KẾT QUẢ HOÀN HẢO
+assertThat(probe.loadedValue(actorA)).isEqualTo(10); // A đọc giá trị cũ
+assertThat(probe.loadedValue(actorB)).isEqualTo(13); // B đọc giá trị mới (Do đợi A kết thúc)
+assertThat(inspector.read(JOB_ID).completedUnits()).isEqualTo(17); // KẾT QUẢ ĐẠT CHUẨN
 ```
 
-Nhớ đặt lố giờ (timeout) cho mấy trò Đợi Khóa này, và phải luôn nhả khóa (release) trong lệnh `finally` nhé!
+Lưu ý: Luôn áp đặt hạn mức thời gian (timeout) cho các tác vụ xếp hàng Chờ Khóa, và tất cả thao tác mở khóa đều nằm ở khối `finally`.
 
-## 10. Thí nghiệm 6 — Nâng Trình Lên `REPEATABLE READ`: Không Thích Ghi Đè, Chửi Nhau Thẳng Mặt
+## 10. Thí nghiệm 6 — Mức Độ Cô Lập `REPEATABLE READ`: Sinh Lỗi Xung Đột
 
-Hai transactions dùng:
+Hai giao dịch áp dụng cấu hình:
 
 ```java
 @Transactional(isolation = Isolation.REPEATABLE_READ)
 ```
 
-Lại ép cùng Đọc chung 1 hình (snapshot), A chốt trước B Ghi (UPDATE). Mong mỏi:
+Sử dụng Rào Cản ép Đọc cùng thời điểm, sau đó A cập nhật thành công (commit). Khi B tiến hành cập nhật (UPDATE):
 
 ```text
-Một ông ăn mừng rực rỡ (one commit)
-Một ông khóc hận văng lỗi (one rollback with serialization failure)
-Lỗi chình ình mã SQLSTATE = 40001
-Tuyệt đối KHÔNG có chuyện Lặng im đè bẹp rồi cả hai ôm nhau cười (no silent two-success outcome).
+Một giao dịch hoàn tất (one commit)
+Một giao dịch từ chối tiến trình (one rollback with serialization failure)
+Ghi nhận lỗi kèm theo mã SQLSTATE = 40001
+Cơ chế ngăn ngừa toàn diện các rủi ro ghi đè âm thầm (no silent two-success outcome).
 ```
 
-Ăn lỗi vỡ mặt (abort) rồi, App bắt buộc phải Tự Động Thử Lại (retry) Nguyên 1 Cục Công Việc của B trong một Giao dịch Khác thì mới ra được con số `17`. Đừng có săm soi cái Câu báo lỗi (message text) vì Spring/Hibernate hay đổi lung tung, soi thẳng vào cái Mã Lỗi SQLSTATE (root cause) hoặc Sổ Sách Trạng Thái (committed business state) mới là người chơi chuyên nghiệp.
+Vì vấp phải ngoại lệ huỷ bỏ (abort), luồng B phải cấu hình tự gọi Thử lại (retry) trong một Giao dịch Mới hoàn toàn để hệ thống khôi phục kết quả tính toán `17`. Đừng đặt điều kiện xử lý dựa vào Thông Báo Văn Bản (message text), hãy bám sát Mã SQLSTATE (root cause) để thiết kế hệ thống vững chắc.
 
-## 11. Thí nghiệm 7 — Hệ Thống Chạy Nhiều Máy Chủ (Multi-instance equivalent)
+## 11. Thí nghiệm 7 — Thiết Kế Cụm Ứng Dụng (Multi-instance equivalent)
 
-Đám Executor Threads nãy giờ xài Giao dịch độc lập rồi đó, nhưng nếu bạn bê kịch bản đó thảy lên 2 cái Máy Chủ Ứng Dụng riêng biệt (trỏ chung 1 con PostgreSQL), thì Kết Quả Thảm Họa `14` VẪN XẢY RA! Trò ôm khóa `synchronized` trong Java đâm ra vô dụng vì chả liên quan gì nhau.
+Trong trường hợp luồng giao dịch được đặt tại 2 Máy Chủ Ứng Dụng riêng biệt truy vấn về một DB duy nhất, Hệ quả Lỗi số liệu `14` VẪN XẢY RA nếu thiếu cơ chế đồng bộ CSDL. Việc ứng dụng mã Java `synchronized` để bảo vệ tài nguyên trở nên vô dụng vì nó chỉ nằm trên máy chủ đơn thuần.
 
-Vì thế, xài Chiêu của Database thì dù 1 máy hay 100 máy chủ (single or multi-instance) kết quả vẫn Đúng-Và-Chuẩn.
+Việc vận dụng các Cú pháp Cập nhật Nguyên Tử, hoặc Khóa trong cấp độ CSDL sẽ giúp mô hình đảm bảo Toàn Vẹn nghiệp vụ ngay trong bất kể khối lượng Máy chủ mở rộng (single or multi-instance).
 
-## 12. Công Cụ Lấy Số Cuối Cùng (Inspector)
+## 12. Công Cụ Trích Xuất Phân Tích (Inspector)
 
 ```java
 @Service
 class JobProgressInspector {
     private final JdbcTemplate jdbc;
 
-    // NHẤT ĐỊNH PHẢI ĐẺ RA MỘT GIAO DỊCH MỚI HOÀN TOÀN (REQUIRES_NEW)
+    // YÊU CẦU THIẾT LẬP MỘT GIAO DỊCH MỚI HOÀN TOÀN TRƯỚC KHI TRUY VẤN (REQUIRES_NEW)
     @Transactional(
         propagation = Propagation.REQUIRES_NEW,
         readOnly = true
@@ -405,35 +405,34 @@ class JobProgressInspector {
 }
 ```
 
-Thằng này (Inspector) chỉ được chạy sau khi mấy cái ẩu đả ở trên kết thúc và luôn xài Khung Bộ Nhớ Đệm tươi mới (persistence context mới).
+Luồng (Inspector) đảm bảo dữ liệu khi được trích xuất hoàn toàn không dựa trên các Ảnh Chụp hoặc Bộ Nhớ Đệm Cũ kỹ của Giao dịch trước.
 
-## 13. Bảng Vàng Thành Tích (Coverage matrix)
+## 13. Phân Phối Ma Trận Kiểm Định (Coverage matrix)
 
-| Kịch Bản | Dữ Liệu Các Bên Đọc Lên | Hành Vi Xung Đột | Chốt Cuối |
+| Kịch Bản Thiết Lập | Kết Quả Đọc | Hành Vi Xử Lý Xung Đột | Kết Quả Chốt |
 | --- | --- | --- | --- |
-| Lỗi ngớ ngẩn (Broken JPA) | A=10, B=10 | Chả có gì; Ôm nhau chết chùm | 14 |
-| Cộng DB (Atomic delta) | Lấy giá trị Hiện Tại Của Dòng | Đợi nhau rồi Cộng Dồn mượt mà | 17 |
-| Ràng Buộc Trần (Conditional cap)| DB Check Lại Điều kiện | Có 1 ông nhịn đói (affected row 0) | 98 hoặc 99 |
-| Thẻ Bùa `@Version` Không Retry | Cùng đọc v7 | B Văng Lỗi Sấp Mặt | 13/v8 |
-| Thẻ Bùa `@Version` Tự Retry | B Tải lại bản v8 | Đánh vật rồi Tới Đích thành công | 17/v9 |
-| Khóa Bi Quan `FOR UPDATE` | A=10, B=13 | B Bị Dừng Chân Trước Cửa | 17 |
-| Cô lập Repeatable read | Cùng 1 ảnh chụp | B Bị nổ Bom (SQLSTATE 40001) | Tôn trọng lẽ phải |
+| Quy trình Hỏng (Broken JPA) | A=10, B=10 | Không nhận diện được; Ghi Đè Lỗi | 14 |
+| Cộng Nguyên Tử DB (Atomic delta) | Lấy giá trị Hiện Tại trên Dòng | Chờ Khóa rồi Cộng Dồn Nguyên Tử | 17 |
+| Ràng Buộc (Conditional cap)| DB Tái Kiểm tra Lại Điều kiện | Luồng đến muộn bị vô hiệu hoá (affected row 0) | 98 hoặc 99 |
+| Khóa Lạc Quan `@Version` Không Retry | Đọc Phiên Bản v7 | B vấp Lỗi Xung Đột Lạc Quan | 13/v8 |
+| Khóa Lạc Quan `@Version` Tự Retry | B Tải Phiên Bản v8 mới | Khởi tạo Lại Giao Dịch, Xử Lý | 17/v9 |
+| Khóa Bi Quan `FOR UPDATE` | A=10, B=13 | B Phải Đợi Ở Điểm Truy Vấn Khóa | 17 |
+| Cô lập Repeatable read | Sử Dụng Cùng Ảnh Chụp | B Đối diện Lỗi (SQLSTATE 40001) | Tôn trọng lẽ phải |
 
-## 14. Nguyên Tắc Cốt Lõi Để Viết Test Không Chập Chờn (Chống flaky)
+## 14. Nguyên Tắc Tránh Kiểm Thử Chập Chờn (Chống flaky)
 
-- Cái cổng (Gate) bảo kê thứ tự phải Chuẩn: `Cả hai Đọc 10 < A Chốt < B Đè Mù Quáng`.
-- Cái gì có chờ đợi (latch, future, Awaitility) LÀ PHẢI CÓ GIỚI HẠN GIỜ (timeout).
-- Cho vô khung `finally` việc mở cửa, dọn dẹp trước khi sập cầu dao (shutdown).
-- Test class phải chạy cùng Luồng Nhất Quán (`SAME_THREAD`); Đồ soi (probes) chỉ chơi kịch bản xài 1 lần.
-- Đừng có dán cái outer transaction bọc ngoài cục test method. Cấm!
-- Bơm dữ liệu (Fixture setup) và Bới kết quả (inspector) cũng phải dùng transaction mới toanh!
-- Xài trò Cộng DB (commutative atomic) thì khỏi cần quan tâm 100% rốt cuộc ai chốt trước.
-- **KHÔNG ĐƯỢC XÀI H2 thay thế mặt mũi PostgreSQL.**
-- Xác thực chân lý bằng con số tổng cuối cùng (final invariant), chứ đừng dựa vào việc bắt mỗi mấy cái cục Lỗi (exceptions).
+- Rào cản (Gate) cần phải kiểm soát chu trình theo đúng: `Cả hai Đọc 10 < A Chốt < B Cập nhật`.
+- Toàn bộ cơ chế kiểm soát tiến độ chờ (latch, future, Awaitility) PHẢI CÓ GIỚI HẠN GIỜ (timeout).
+- Đưa các bước mở khoá, giải phóng luồng vào khối `finally` nhằm tránh gây tắc nghẽn ứng dụng.
+- Class chạy kiểm định phải ưu tiên Đồng Luồng (`SAME_THREAD`).
+- Nghiêm cấm sử dụng annotation `Transaction` bao bọc bên ngoài phương thức Test.
+- Việc tạo dữ liệu Khởi tạo (Fixture setup) hoặc truy xuất (inspector) đòi hỏi Giao dịch Độc Lập.
+- KHÔNG sử dụng hệ quản trị CSDL Nhúng giả lập (H2) làm môi trường thực hiện kiểm thử MVC.
+- Tính vững chãi được khẳng định từ việc Phục Hồi Chính Xác, chứ không phải dừng lại ở việc Cắt Bắt Lỗi Mù Quáng (exceptions).
 
-## 15. Kiểm Kê Cuối Năm Trêm Production (Production verification)
+## 15. Xác Nhận Kiểm Định Đối Soát (Production verification)
 
-Muốn Lục lọi đếm xác lại (Reconciliation) mà có lưu Vết thì chơi SQL này:
+Công cụ rà soát Sổ Sách (Reconciliation) có thể tham chiếu logic:
 
 ```sql
 select p.job_id,
@@ -445,4 +444,4 @@ where p.job_id = :jobId
 group by p.job_id, p.completed_units;
 ```
 
-So sánh con số trên bảng (projection) với Con Số Đếm Tay (sum accepted distinct deltas) trong sổ. Dõi theo mấy vụ Dòng-Ảnh-Hưởng bằng Không, Các thể loại Đụng Khóa (optimistic/serialization conflicts), Mấy con số nhảy múa điên cuồng (hot keys) hay các màn đánh lừa Cô Lập. Trò Ghi Đè Lẳng Lặng (Silent lost update) MÃI MÃI KHÔNG bao giờ sinh ra Đồ Thị Lỗi (exception metric riêng) để bạn biết mà khóc đâu!
+Hãy tập trung so khớp kết quả từ các Giao dịch hoàn tất so với các Bản đối chiếu của sự kiện độc lập. Nghiêm túc theo dõi các Chỉ số (Metrics) số lượng Dòng Bị Bác Bỏ (Affected Row = 0), Số lượng xung đột, tỷ lệ lỗi Cô Lập. Sự nguy hiểm của "Ghi Đè Âm Thầm" (Silent lost update) là nó hoàn toàn không sinh ra Đồ thị Log Lỗi ngoại lệ trong Dashboard của ứng dụng.

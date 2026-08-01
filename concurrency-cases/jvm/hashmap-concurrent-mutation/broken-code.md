@@ -1,10 +1,8 @@
-# Cách triển khai bị lỗi
+# Phản Mẫu Thiết Kế (Anti-Patterns): Cấu Trúc Khuyết Tật
 
-## Đoạn code mutate HashMap dùng chung
+## 1. Biến Dạng HashMap Cục Bộ (In-place Mutation)
 
-Ví dụ rút gọn dưới đây là code hợp lý thường xuất hiện trong một Spring service.
-`HashMap` được tạo cùng bean, nhưng sau đó bị request thread và refresh thread
-truy cập đồng thời.
+Trường hợp dưới đây bóc trần một mã nguồn tưởng chừng rất hợp lý trong kiến trúc Spring. Cá thể `HashMap` sinh ra cùng Spring Bean, nhưng lập tức bị đưa lên giàn hỏa thiêu bởi sự càn quét đồng thời của Tuyến Yêu Cầu (Request) và Tuyến Cập Nhật (Refresh).
 
 ```java
 package com.example.routing;
@@ -20,6 +18,7 @@ import java.util.Map;
 public class PaymentRoutingRegistry {
 
     private final RoutingConfigClient configClient;
+    // LỖI: Cấu trúc lõi Không An Toàn Luồng bị thao túng trực tiếp
     private final Map<String, PaymentRoute> routes = new HashMap<>();
 
     public PaymentRoutingRegistry(RoutingConfigClient configClient) {
@@ -27,37 +26,29 @@ public class PaymentRoutingRegistry {
     }
 
     public PaymentRoute selectRoute(String merchantId) {
-        return routes.get(merchantId);
+        return routes.get(merchantId); // Xung đột Đọc trong lúc Dữ liệu bị cày xới
     }
 
     public List<String> enabledMerchants() {
         return routes.entrySet().stream()
                 .filter(entry -> entry.getValue().enabled())
                 .map(Map.Entry::getKey)
-                .toList();
+                .toList(); // Hiểm họa văng ConcurrentModificationException
     }
 
     @Scheduled(fixedDelayString = "${routing.refresh-delay:PT30S}")
     public void refresh() {
         Map<String, PaymentRoute> loaded = configClient.loadAll();
 
+        // LỖI NGHIÊM TRỌNG: Hành vi xóa trắng bản đồ tạo khe hở chết người cho luồng Yêu Cầu
         routes.clear();
         routes.putAll(loaded);
     }
 }
 ```
 
-Các type hỗ trợ có thể rất nhỏ:
-
+Các kiểu dữ liệu phụ trợ:
 ```java
-package com.example.routing;
-
-import java.util.Map;
-
-public interface RoutingConfigClient {
-    Map<String, PaymentRoute> loadAll();
-}
-
 public record PaymentRoute(
         String provider,
         boolean enabled,
@@ -65,26 +56,19 @@ public record PaymentRoute(
 ) {}
 ```
 
-`routes` là `final` chỉ có nghĩa reference không được trỏ sang map khác. Nó không
-làm nội dung của `HashMap` trở nên immutable hoặc thread-safe.
+Từ khóa `final` định danh trên `routes` chỉ mang ý nghĩa bảo vệ Con trỏ Tham chiếu (Reference) không bị hoán đổi. Nó hoàn toàn vô dụng trong việc tạo màng bảo vệ Bất biến (Immutable) hay An Toàn Luồng (Thread-safe) cho cấu trúc nội tạng của `HashMap`.
 
-## Vì sao code trông có vẻ hợp lý
+## 2. Ảo Giác An Toàn Chết Người
 
-- Spring chỉ tạo một registry nên developer cho rằng state có một owner.
-- `loadAll()` chạy xong trước khi `clear()` nên dữ liệu nguồn đã đầy đủ.
-- từng dòng `get`, `clear` và `putAll` trông đơn giản;
-- refresh ít xảy ra hơn request nên bug khó xuất hiện trên máy cá nhân;
-- unit test tuần tự luôn gọi `refresh()` xong rồi mới đọc.
+- Cảm giác về Sở Hữu (Ownership): Do Spring khởi tạo Singleton, giới lập trình ngộ nhận Trạng Thái chỉ có Một Chủ Nhân. Tuy nhiên, Một Chủ Nhân (Object) KHÔNG đồng nghĩa với Một Tuyến Vận Hành (Thread).
+- Sự hoàn hảo giả tạo của `loadAll()`: Chạy trọn vẹn trước `clear()`, ru ngủ suy nghĩ về tính toàn vẹn dữ liệu.
+- Tần suất Lỗi ngụy tạo: Hành vi Cập nhật thưa thớt hơn Yêu cầu, nên Lỗi gần như tàng hình trên môi trường Local Development, và các Khối Unit Test Tuần Tự (Sequential) luôn hoàn thành trót lọt.
 
-Vấn đề là singleton đồng nghĩa cùng object được nhiều request thread chia sẻ. Một
-owner object không đồng nghĩa một owner thread.
+> **Nguyên tắc kỹ thuật:** Biến `final HashMap` bản chất vẫn là một Nạn Nhân Khả Biến (Mutable object) nằm giữa làn đạn đa luồng; Spring không cung cấp áo giáp (Lock) cho các Phương thức của Singleton.
 
-> **Nói ngắn gọn:** `final HashMap` vẫn là một mutable object dùng chung; Spring
-> không đặt lock quanh method của singleton.
+## 3. Hoán Đổi Tham Chiếu Không An Toàn (Unsafe Publication)
 
-## Một cách sửa khác vẫn bị unsafe publication
-
-Developer có thể tránh mutate tại chỗ bằng cách tạo map mới rồi gán reference:
+Sáng kiến loại bỏ Mutate tại chỗ (In-place) bằng cách tạo Map mới rồi dán nhãn Tham chiếu:
 
 ```java
 @Service
@@ -97,62 +81,39 @@ public class UnsafeSnapshotRoutingRegistry {
     }
 
     public void refresh(Map<String, PaymentRoute> loaded) {
+        // Sao chép an toàn, nhưng...
         Map<String, PaymentRoute> next = Map.copyOf(loaded);
-        routes = next;
+        // LỖI: Gán Tham chiếu không được bảo chứng Khả kiến (Visibility)
+        routes = next; 
     }
 }
 ```
 
-Snapshot mới không bị mutate, nhưng read và write trên field `routes` vẫn là một
-data race. Không có `volatile`, lock hoặc atomic variable để tạo quan hệ
-happens-before giữa writer và reader. Java Memory Model không bảo đảm request sẽ
-nhìn thấy reference mới đúng lúc.
+Bản chụp (Snapshot) mới được bảo vệ, nhưng tiến trình Đọc/Ghi trên thuộc tính `routes` bản chất vẫn là một Cuộc Đua Dữ Liệu (Data race). Sự vắng bóng của `volatile`, Lock hay Atomic Barrier đồng nghĩa Tuyến Yêu cầu không có nghĩa vụ hay bị ép buộc phải chiêm ngưỡng Bản chụp Mới. Đây chính là lỗ hổng **Công bố không an toàn (Unsafe publication)**; khác biệt hoàn toàn với khái niệm Khởi tạo an toàn (Safe startup) của Spring Bean.
 
-Đây là lỗi **công bố không an toàn** (`unsafe publication`) của mỗi snapshot mới;
-nó khác với việc Spring đã công bố bean an toàn lúc startup.
+## 4. Tiền Đề Kích Hoạt Lỗ Hổng (Conditions for Replication)
 
-## Điều kiện để lỗi xuất hiện
+1. Chung một Hạch Tâm (Registry instance) cung cấp dịch vụ cho Đa Luồng.
+2. Tồn tại ít nhất một Tuyến Ghi (Writer) khởi động giữa vòng vây của Tuyến Đọc (Reader).
+3. Tuyến Ghi thay đổi bề mặt Map tại chỗ, hoặc gán Tham chiếu Bản chụp vào một Thuộc tính Vô danh (Không đồng bộ).
+4. Tuyến Đọc tiến hành `get` hoặc duyệt Bản chụp Giám sát mà không tuân thủ Giao thức Cân bằng Đồng bộ (Coordination).
 
-1. cùng một registry instance phục vụ nhiều thread;
-2. ít nhất một writer refresh trong khi có reader;
-3. writer mutate map tại chỗ hoặc gán snapshot qua field không được đồng bộ;
-4. reader thực hiện `get`, iterate hoặc tạo diagnostic snapshot mà không dùng
-   cùng cơ chế coordination;
-5. test không điều phối đúng cửa sổ tranh chấp nên lỗi chỉ xuất hiện ngẫu nhiên.
+## 5. Các Phương Án Sửa Lỗi Tạm Bợ Cần Tránh (Insufficient Fixes)
 
-## Những cách sửa tưởng đúng nhưng chưa đủ
+### Lạm Dụng Từ Khóa `final`
+Chỉ bảo vệ mỏ neo tại thời khắc Khởi tạo (Constructor). Hoàn toàn vô tri trước các cơn bão `clear()` và `putAll()`.
 
-### Chỉ thêm final cho field
+### Bơm `volatile` Cho HashMap Khả Biến
+Truyền tải tính Khả kiến (Visibility) cho Tham chiếu Khóa, nhưng không có năng lực ngăn cản các vết nứt Cấu trúc nội bộ của `HashMap`. Nếu Tuyến Ghi châm ngòi `clear()` rồi `putAll()`, Tuyến Đọc vẫn hứng chịu một Bản Đồ phân mảnh.
 
-`final` bảo vệ reference được thiết lập trong constructor. Nó không serialize
-các lần `clear()` và `putAll()` sau startup.
+### Dịch Chuyển Sang `Collections.synchronizedMap`
+Phong tỏa từng lệnh đơn. Nhưng `clear()` và `putAll()` vẫn bị đứt gãy làm 2 nhịp tách biệt. Hành vi Duyệt (Iterate) ép buộc hệ Caller phải tự giăng Khóa thủ công. Chỉ cần một ngả Đọc quên luật, toàn bộ Khung Giao Ước sụp đổ.
 
-### Chỉ thêm volatile cho HashMap mutable
+### Ký Thác Vào `ConcurrentHashMap`
+Giáp bảo vệ Cấu Trúc và hỗ trợ Đọc/Ghi đan xen. NHƯNG, `clear()` + N lần `put()` không hóa thân thành Cụm Nguyên Tử. Tuyến Đọc vẫn có thể bốc trúng một Thế hệ lai tạp; Bộ Duyệt mang đặc tính Nhất quán Yếu (Weakly consistent), hoàn toàn từ chối Đặc Quyền Snapshot.
 
-`volatile Map` làm cho việc đọc và ghi reference có visibility, nhưng không làm
-các mutation bên trong cùng một `HashMap` an toàn. Nếu writer vẫn gọi `clear()`
-và `putAll()` trên object hiện tại, reader vẫn thấy state trung gian.
+### Áo Choàng `@Transactional`
+Mảnh đất của Database (Thread-bound connection). Hoàn toàn bất lực trong việc phong tỏa JVM Memory Barrier.
 
-### Đổi sang Collections.synchronizedMap
-
-Từng method được khóa, nhưng chuỗi `clear()` rồi `putAll()` vẫn là hai operation
-riêng. Việc iterate còn yêu cầu caller khóa thủ công trên đúng map trong suốt
-vòng lặp. Chỉ một đường đọc quên lock là contract bị phá vỡ.
-
-### Đổi sang ConcurrentHashMap
-
-`ConcurrentHashMap` bảo vệ cấu trúc và cho phép read/write đồng thời. Tuy nhiên,
-`clear()` cộng nhiều lần `put()` không trở thành một operation atomic. Reader có
-thể thấy generation mới chỉ được cài một phần; iterator của nó có semantics nhất
-quán yếu chứ không phải snapshot.
-
-### Chỉ thêm Transactional
-
-`@Transactional` điều phối database transaction qua thread-bound connection.
-Nó không đặt monitor hoặc memory barrier cho `HashMap` trong JVM.
-
-### Bắt ConcurrentModificationException rồi retry
-
-Iterator fail-fast chỉ là cơ chế phát hiện best-effort, không phải synchronization
-contract. Không có exception không có nghĩa kết quả đã nhất quán; retry cũng có
-thể tiếp tục đụng writer hoặc ghép dữ liệu từ hai generation.
+### Bắt Ngoại Lệ `ConcurrentModificationException` Rồi Kêu Gọi Thử Lại
+Ngắt Nhanh (Fail-fast) chỉ là Hàng rào Cảnh báo, tuyệt đối không phải Hợp Đồng Đồng Bộ. Vượt ải Exception không bảo chứng tính Nhất Quán; Vòng Thử lại (Retry) lại một lần nữa lao đầu vào họng súng của Tuyến Ghi.

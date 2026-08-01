@@ -1,166 +1,99 @@
-# Dòng thời gian tranh chấp và nguyên nhân gốc
+# Phân Tích Chuyên Sâu: Dòng Thời Gian Tranh Chấp Và Cội Nguồn Bế Tắc
 
-## Trạng thái ban đầu
+## 1. Trạng Thái Khởi Điểm (Initial state)
 
-Artifact `settlement/day-1.csv` chưa tồn tại. Hai request T1 và T2 chạy trên cùng
-node, cùng gọi `generate`, nhưng mỗi call tạo một `ReentrantLock` mới.
+Tệp Đối Soát `settlement/day-1.csv` hoàn toàn vắng mặt. Hai Yêu cầu T1 và T2 đổ bộ trên cùng một Máy Chủ, đồng loạt triệu gọi `generate`. Mấu chốt sai lầm: Mỗi lần gọi tự động sinh ra một Bản Thể `ReentrantLock` hoàn toàn mới.
 
-## Interleaving với lock mới mỗi call
+## 2. Kịch Bản Đan Xen: Khóa Mới Mỗi Lần Triệu Gọi (New Lock Per Call)
 
-| Bước | T1 | T2 | Shared store |
+| Tiến Trình | Luồng T1 | Luồng T2 | Kho Lưu Trữ (Shared Store) |
 | --- | --- | --- | --- |
-| 1 | tạo Lock-A, acquire thành công | | chưa có artifact |
-| 2 | | tạo Lock-B, acquire thành công | chưa có artifact |
-| 3 | `exists(key)` → false | | chưa có |
-| 4 | | `exists(key)` → false | chưa có |
-| 5 | render content A | render content B | chưa có |
-| 6 | `put(key, A)` | | chứa A |
-| 7 | | `put(key, B)` | B ghi đè A hoặc duplicate write |
-| 8 | unlock Lock-A | unlock Lock-B | cả hai báo created |
+| 1 | Khởi tạo Lock-A, Khóa Thành Công | | Rỗng |
+| 2 | | Khởi tạo Lock-B, Khóa Thành Công | Rỗng |
+| 3 | `exists(key)` → false | | Rỗng |
+| 4 | | `exists(key)` → false | Rỗng |
+| 5 | Vận Hành Render Nội Dung A | Vận Hành Render Nội Dung B | Rỗng |
+| 6 | Thực thi `put(key, A)` | | Lưu Trữ A |
+| 7 | | Thực thi `put(key, B)` | Lỗi Ghi Đè / Dữ Liệu Nhân Bản |
+| 8 | Giải Phóng Lock-A | Giải Phóng Lock-B | Đều Báo Cáo "Đã Tạo Mới" |
 
-Hai lock đều hoạt động đúng với chính chúng; không actor nào cạnh tranh cùng lock.
+Thực chất, Hai Khóa đều vận hành hoàn hảo với phận sự của chúng; Bi kịch ở chỗ Không một Chủ thể (Actor) nào lao vào cạnh tranh chung một Ổ Khóa.
 
-> **Nói ngắn gọn:** lock không hỏng—mapping từ logical resource sang lock mới
-> hỏng. Một key đã bị ánh xạ thành hai ổ khóa khác nhau.
+> **Nguyên tắc kỹ thuật:** Bản thân công cụ Khóa không hề hỏng hóc. Cấu trúc ánh xạ (Mapping) từ Tài nguyên Logic sang Cấu trúc Khóa mới là kẻ thủ ác. Một Chìa Khóa Nghiệp Vụ đã bị gán cho hai Ổ Khóa Vật Lý hoàn toàn cách ly.
 
-## Interleaving khi critical section quá hẹp
+## 3. Kịch Bản Đan Xen: Vùng Tới Hạn Mỏng Manh (Narrow Critical Section)
 
-Ngay cả khi T1/T2 dùng cùng monitor:
+Dẫu cho T1 và T2 cùng chia sẻ chung một Khóa (Monitor):
 
-| Bước | T1 | T2 |
+| Tiến Trình | Luồng T1 | Luồng T2 |
 | --- | --- | --- |
-| 1 | acquire, check false, release | chờ |
-| 2 | bắt đầu render ngoài lock | acquire, check false, release |
-| 3 | render | render |
-| 4 | put | put |
+| 1 | Khóa, Báo Cáo False, Nhả Khóa | Bị Chặn (Chờ Đợi) |
+| 2 | Kích hoạt Render Mở Toang (Ngoài Lock) | Khóa, Báo Cáo False, Nhả Khóa |
+| 3 | Thi Hành Render | Thi Hành Render |
+| 4 | Thực Thi Phép Ghi (Put) | Thực Thi Phép Ghi (Put) |
 
-Lock chỉ serialize check chứ không serialize decision “nếu chưa có thì tạo”.
-Critical section phải khớp compound action hoặc write phải dùng atomic conflict
-detection ở authoritative store.
+Lớp Khóa chỉ có tác dụng Serialize khâu "Kiểm Tra", hoàn toàn đánh rơi Đặc Quyền Serialize Quyết định "Nếu Vắng Thì Tạo Mới". Vùng Tới Hạn bắt buộc phải bọc lót trọn vẹn Cụm Hành Vi (Compound action) hoặc Phép Ghi phải tự trang bị Cơ chế Dò Cạnh Tranh Nguyên Tử (Atomic conflict detection) tại Kho Lưu Trữ Uy Quyền (Authoritative Store).
 
-## Interleaving khi remove keyed lock quá sớm
+## 4. Kịch Bản Đan Xen: Thu Hồi Khóa Quá Sớm (Premature Lock Eviction)
 
-1. T1 giữ Lock-X cho key K.
-2. T2 lấy reference Lock-X từ map và chờ.
-3. T1 unlock rồi remove K.
-4. T2 acquire Lock-X.
-5. T3 `computeIfAbsent(K)` tạo Lock-Y và acquire.
-6. T2 và T3 cùng ở critical section cho K.
+1. T1 ôm gọn Lock-X dành cho Khóa K.
+2. T2 bốc Tham chiếu Lock-X từ Sổ Đăng Ký và rơi vào Chờ Đợi.
+3. T1 Nhả Khóa rồi Vô tình Xóa Khóa K khỏi Sổ.
+4. T2 Hân hoan chiếm đoạt Lock-X.
+5. T3 gọi lệnh `computeIfAbsent(K)`, lập tức sinh ra Lock-Y và Chiếm Khóa.
+6. Hậu Quả: T2 và T3 Đồng Đạo Diễn chung Vùng Tới Hạn cho cùng một Khóa K.
 
-`ConcurrentHashMap` chỉ làm map operation an toàn; nó không quản lý lifecycle của
-lock value và waiter đã giữ reference.
+Cấu trúc `ConcurrentHashMap` chỉ bảo chứng Tác Vụ Map an toàn; Nó hoàn toàn Từ Chối trách nhiệm Quản trị Vòng đời của các Khóa đang nằm kẹt và những kẻ đang ngóng đợi (Waiter).
 
-## Kết quả mong đợi và kết quả thực tế
+## 5. Đối Chiếu Kết Quả (Expected vs Actual)
 
-| Khía cạnh | Mong đợi | Broken implementation |
+| Hạng Mục | Kỳ Vọng (Expected) | Hệ Quả Thực Tế (Broken code) |
 | --- | --- | --- |
-| Lock identity | Cùng key trên node dùng cùng lock | Lock mới/caller key tạo identity khác |
-| Critical section | Bao trọn check-render-publish | Chỉ check được khóa |
-| Per-key concurrency | Key khác nhau chạy song song | `synchronized(this)` serialize mọi key |
-| Lock lifecycle | Không có hai live lock cho cùng key | Remove sớm tạo lock cũ và mới |
-| Multi-node | Conflict được store/DB phát hiện | Mỗi node tự acquire local lock |
-| Failure | Unlock ở mọi exit path | Thiếu `finally` có thể giữ lock vô hạn |
+| Định Danh Khóa | Cùng Mã Khóa trên Nút chia sẻ chung Ổ Khóa | Khóa Mới/Khóa Cục Bộ tự rẽ nhánh Bản Thể |
+| Vùng Tới Hạn | Bao trọn Check-Render-Publish | Chỉ khóa kín khâu Check |
+| Đồng Thời Khóa | Khóa Độc Lập cho phép chạy Song Song | Lệnh `synchronized(this)` trói chung mọi Khóa |
+| Vòng Đời Khóa | Bất khả thi có 2 Khóa Chạy cho 1 Mã Khóa | Xóa Sớm đẻ ra 1 Khóa Cũ - 1 Khóa Mới Cùng Tồn Tại |
+| Đa Nút Phân Tán | Xung đột bị Đè bẹp bởi Kho/DB | Từng Nút mộng tưởng tự phong Khóa Cục Bộ |
+| Đổ Vỡ Hệ Thống | 100% Khóa Giải Phóng ở mọi Tình Huống | Thiếu vắng `finally` chôn sống Khóa vô thời hạn |
 
-## Nguyên nhân theo từng lớp
+## 6. Phân Tích Lớp Trách Nhiệm Gây Lỗi (Root Cause Mapping)
 
-### Monitor identity
+### Định Danh Monitor (Monitor Identity)
+Lệnh `synchronized (object)` sử dụng Định danh Tham chiếu (Reference identity). Nó Tuyệt Đối Cự Tuyệt cơ chế gộp Monitor thông qua hành vi `equals()`. Phép màu `happens-before` nối từ Lệnh Unlock tới Lock kế tiếp chỉ hiển linh khi và chỉ khi 2 Actor chạm vào cùng 1 Monitor.
 
-`synchronized (object)` dùng reference identity, không gọi `equals()` để gom
-monitor. Quan hệ happens-before từ unlock tới lock sau chỉ có ý nghĩa khi hai
-actor dùng cùng monitor.
+### Cấu Trúc ReentrantLock
+`ReentrantLock` sở hữu cơ chế Định Danh y hệt Monitor. Đóng gói nó vào Biến Cục Bộ của hàm làm mất hoàn toàn tính Chia Sẻ. Khóa phải được Nhả bởi chính Luồng đã Chiếm nó; Cấm tuyệt đối chiếm Khóa trước Cửa Ngõ Bất Đồng Bộ (Async boundary) rồi Vất vưởng Nhả Khóa ở một Luồng Hồi Đáp (Callback thread) khác.
 
-### ReentrantLock
+### Ranh Giới Phạm Vi Khóa Và Trạng Thái
+Vành đai Đồng Bộ hóa phải Tương Đương hoặc Lớn Hơn Vành Đai Bất Biến. Nếu Trạng thái chia sẻ là Mã Artifact, mọi con đường Check/Publish phải chịu chung 1 Khung Phán Xét. Nếu Trạng thái nằm rải rác trên Kho Đối Tượng Liên Nút, Khóa Heap Cục Bộ hoàn toàn mất Tự Cách Trở Thành Tuyến Phòng Thủ Tuyệt Đối.
 
-`ReentrantLock` là object có identity giống monitor. Tạo trong local variable mỗi
-call làm lock không được chia sẻ. Lock phải được unlock bởi thread đã acquire;
-không được acquire trước async boundary rồi unlock trong callback thread khác.
+### Mạng Lưới Phân Tán
+Máy A và Máy B Không Thể dùng chung Vùng Nhớ Heap. Biến Tĩnh (Static field) chỉ mang tính Tĩnh nội bộ Classloader/JVM. Bất Biến Liên Nút buộc phải tìm đến Lệnh Độc Quyền CSDL (Unique record), hoặc Giao thức Phân Tán (Distributed Protocol with Lease/Fencing).
 
-### Lock scope và shared state
+## 7. Ranh Giới Điểm Hiệu Lực (Linearization Point)
 
-Synchronization boundary phải rộng ít nhất bằng invariant boundary. Nếu shared
-state là một artifact key, mọi path check/publish key đó phải dùng cùng policy.
-Nếu shared state nằm trong object store giữa node, heap lock có scope nhỏ hơn
-shared state và không thể là correctness boundary.
+- **Local Striped Lock:** Sát na chiếm Dải Khóa (Stripe) là Điểm Quyết Định; Lệnh `put` hoàn thiện là mốc Artifact Dính Chặt vào Mạch Luồng.
+- **Conditional Create:** Kho Lưu Trữ phán quyết `CREATED` hoặc `EXISTS` tại một Sát na Ghi Nguyên Tử (Atomic write); Đây là Điểm Phán Quyết Tuyệt Đối cho Toàn Mạng.
+- **DB Unique Constraint:** Vành Đai Độc Nhất phân xử Kẻ Thắng Bại bằng Luật Transaction Database.
+- **Distributed Lease:** Nắm Thẻ Thuê (Lease) là chưa đủ. Thẻ Chắn (Fencing Token) buộc phải bị Thẩm Định Bắt Buộc tại Kho Lưu Trữ trước mỗi Đợt Ghi.
 
-### Spring
+## 8. Xử Lý Phân Loại Lỗi, Hết Thời Hạn (Timeout), Gián Đoạn (Interruption)
 
-Spring singleton giúp các request trong một application context dùng cùng field
-lock. Prototype bean, manual `new`, nhiều context hoặc nhiều JVM phá giả định đó.
-Proxy/`@Transactional` không thay đổi monitor identity và không khóa object store.
+- Thiết lập Bộ đo Thời Gian cho Khóa Dương và Triển khai `tryLock` / `lockInterruptibly` để khước từ Nạn Chờ Đợi Vĩnh Hằng.
+- Bắt được Tín Hiệu Ngắt, Buộc phải dựng lại Cờ Interrupt và báo Lỗi Cụ Thể.
+- Mở Khóa Độc Quyền tại Khối `finally`, CHỈ KHI chiếm Khóa Thành Công.
+- Thất Bại Render CẤM công bố Artifact; Nhưng Khóa vẫn phải được Nhả.
+- Lưu trữ Tắt Nghẽn Mạng (Store timeout) sinh ra Hành Vi Vô Định (Có thể Write đã lọt). Vòng Thử Lại phải đọc lại Dữ liệu hoặc sử dụng Giao Thức Độc Đẳng (Idempotent).
+- Máy Ảo Sập Tự Động Phóng Thích Khóa Nội Bộ nhưng KHÔNG Tự Xóa Dấu Vết External Write dở dang.
 
-### Distributed boundary
+## 9. Bài Toán Tương Tranh Và Độ Mịn Của Khóa (Granularity)
 
-Node A và B không chia heap. Static field cũng chỉ static trong một classloader
-của một JVM. Multi-node correctness cần conditional operation tại store, unique
-record tại database, hoặc distributed protocol có lease/fencing.
+- Khóa Diện Rộng (Coarse lock) An Toàn nhưng Đổi Lại Nghẽn Đầu Cầu (Head-of-line blocking).
+- Khóa Đơn Tuyến (Per-key) Tối Đa Hóa Song Song nhưng Nan Giải Vòng Đời.
+- Khóa Phân Dải (Striped lock) Số Lượng Tĩnh Khống Chế Race Condition, nhưng Chấp Nhận Va Chạm Băm (Hash Collision) Gây Chờ Đợi Oan Uổng.
 
-Xem thêm [Java Memory Model và khóa](../../concepts/java-memory-model-and-atomicity.md).
+Chế độ Công Bằng (Fair `ReentrantLock`) không can thiệp Tính Đúng Đắn mà chỉ Tàn Phá Thông Lượng (Throughput). Chỉ Kích Hoạt khi Nạn Đói (Starvation) trở thành Khủng Hoảng Hiện Hữu.
 
-## Linearization point của các lời giải
+## 10. Ứng Dụng Trên Kiến Trúc Đa Máy Chủ (Multi-instance Fallacy)
 
-- Local striped lock: acquire stripe là điểm actor được quyền đánh giá compound
-  action; `put` hoàn tất là điểm artifact được công bố trong node workflow.
-- Conditional create: authoritative store quyết định `CREATED` hoặc `EXISTS` tại
-  một atomic write; đây là linearization point giữa các node.
-- Database unique constraint: unique index conflict tại insert/commit quyết định
-  winner theo database semantics.
-- Distributed lease: acquire lease chưa đủ nếu old owner có thể tiếp tục; fencing
-  token phải được authoritative resource kiểm tra trên write.
-
-## Timeout, interruption, failure và crash
-
-- Validate lock timeout dương và dùng `tryLock`/`lockInterruptibly` khi không muốn
-  chờ vô hạn.
-- Khi bị interrupt, khôi phục interrupt status rồi trả lỗi phù hợp.
-- Unlock trong `finally`, chỉ khi acquire thành công.
-- Render failure không được publish artifact; lock vẫn phải release.
-- Store timeout có outcome không chắc chắn: write có thể đã thành công. Retry phải
-  đọc lại hoặc dùng idempotent/conditional operation.
-- JVM crash tự giải phóng local lock nhưng không rollback external write hoặc xóa
-  partial artifact.
-- Không giữ local lock trong khi chờ một future sẽ cần cùng lock để hoàn tất.
-
-## Contention và granularity
-
-Coarse lock dễ chứng minh nhưng gây head-of-line blocking. Per-key lock cho
-concurrency tốt nhưng lifecycle khó. Striped lock có số object cố định, không
-remove race; đổi lại hai key khác nhau có thể hash vào cùng stripe và bị serialize.
-
-Fair `ReentrantLock` không sửa correctness và có thể giảm throughput. Chỉ chọn
-fairness khi starvation là requirement đã quan sát/đo.
-
-## Khi có nhiều application instance
-
-Hai instance dùng hai stripe arrays riêng. Local lock vẫn hữu ích để giảm công
-việc trùng trong từng node, nhưng cả hai node có thể render đồng thời. Correctness
-phải dựa vào `putIfAbsent`/conditional request, database uniqueness hoặc protocol
-phân tán.
-
-Nếu conditional create trả `EXISTS`, loser bỏ content đã render và đọc artifact
-winner khi cần. Nếu render rất đắt và cần single-flight toàn cluster, xem
-`DIST-001`; lease cần expiry, ownership và fencing, không chỉ Redis-style mutex
-không có token.
-
-## Hậu quả
-
-### Hậu quả kỹ thuật
-
-- duplicate CPU/DB work và write amplification;
-- overwrite, metadata inconsistency hoặc duplicate event;
-- lock timeout/head-of-line blocking không cần thiết;
-- memory leak từ unbounded lock map;
-- deadlock/leak khi unlock sai path hoặc sai thread.
-
-### Hậu quả nghiệp vụ
-
-- settlement artifact không xác định theo writer nào;
-- downstream nhận notification lặp;
-- batch window kéo dài do render trùng;
-- single-node test pass nhưng production nhiều replica sai;
-- retry sau ambiguous timeout làm che mất nguyên nhân gốc.
-
-## Phạm vi không được giải quyết trong case này
-
-Case chỉ giải thích lựa chọn/scope của local lock và chỉ ra authoritative boundary
-cho multi-node. Thiết kế lease renewal, fencing, clock/partition failure thuộc
-`DIST-001`.
+Hai Cá Thể Nút cấu hình Hai Bộ Stripe Array Độc Lập. Khóa Cục Bộ Vẫn Rực Sáng Giúp Xóa Đóng Khối Lượng Trùng Lặp Nội Bộ. Nhưng Ranh Giới Tính Đúng Đắn Buộc Phải Giao Phó Cho Cửa Ngõ Dữ Liệu `putIfAbsent` hoặc Giao thức Phân Tán. Mọi Hành Vi Dựa Dẫm Local Lock Xuyên Cluster Là Một Ảo Mộng Chết Người.

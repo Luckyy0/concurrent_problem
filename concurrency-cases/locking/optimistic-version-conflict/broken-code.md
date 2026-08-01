@@ -1,8 +1,8 @@
-# 1001 Bể Phốt Code Lỗi: Thay đổi dữ liệu mà quên "Dò Version"
+# Phản mẫu thiết kế: Cập nhật dữ liệu bỏ qua cơ chế version
 
-## 1. Class Entity Trắng Tay (không có `@Version`)
+## 1. Khai báo thực thể bỏ quên quản lý phiên bản (thiếu `@Version`)
 
-Nhìn cái Class này xem, trông có vẻ rất chuẩn mực:
+Một khai báo lớp entity cơ bản thường xuất hiện trong các dự án:
 
 ```java
 @Entity
@@ -30,7 +30,7 @@ public class ProductOffer {
 }
 ```
 
-Dưới DB cũng chỉ là một cái bảng bình thường:
+Tương ứng với cấu trúc database:
 
 ```sql
 create table product_offer (
@@ -40,9 +40,9 @@ create table product_offer (
 );
 ```
 
-Thiếu một cột `version` là khởi nguồn cho mọi tội lỗi!
+Sự thiếu vắng của cột `version` là lỗ hổng cốt lõi dẫn đến các sai phạm về xử lý tương tranh dữ liệu.
 
-## 2. Viết Service Tải -> Sửa -> Xả (read → mutate → flush)
+## 2. Kịch bản ghi đè ngầm qua vòng lặp đọc-sửa-đồng bộ
 
 ```java
 @Service
@@ -66,7 +66,7 @@ public class BrokenOfferEditor {
 }
 ```
 
-Bạn gọi hàm này, Hibernate sẽ bắn ra một câu SQL cập nhật tuyệt đối như sau:
+Quá trình này chỉ định Hibernate thực thi một chuỗi câu lệnh UPDATE tiêu chuẩn:
 
 ```sql
 update product_offer
@@ -75,38 +75,38 @@ set price = ?,
 where offer_id = ?;
 ```
 
-Mặc dù PostgreSQL có dùng khóa dòng (row lock) để xếp hàng hai ông nội A và B, nhưng sau khi A chốt sổ xong xuôi, thằng B nối gót chạy lệnh UPDATE. Khốn nỗi câu SQL của B chỉ có điều kiện khóa chính (`where offer_id = ?`), nên nó phang thẳng số của nó vào. DB báo số dòng thay đổi là `1` (thành công rực rỡ!). Database thì hiền khô, nó đâu biết lệnh này được suy luận ra từ một đống dữ liệu đã ôi thiu!
+Mặc dù PostgreSQL đảm bảo quản lý row lock cho phép chỉ một transaction được thực thi tại một thời điểm, tuy nhiên câu lệnh SQL của transaction thứ hai sẽ được triển khai ngay lập tức sau khi transaction đầu hoàn tất. Lệnh truy vấn không có mệnh đề giới hạn bảo mật (chỉ sử dụng điều kiện `offer_id = ?`), do đó trạng thái thay đổi luôn báo cáo `1` dòng bị tác động. Database vật lý không có khả năng nhận biết ứng dụng Java đang tải lên một dữ liệu đã lỗi thời.
 
-> **Nói ngắn gọn:** Khóa dòng chỉ cản 2 người cùng sửa chung 1 dòng ở cùng 1 mili-giây. Chứ nó mù lòa trong việc phát hiện logic dữ liệu bị cũ, trừ khi bạn chêm cái `expected version` vào mệnh đề `WHERE`.
+> **Ghi chú kỹ thuật:** Cơ chế row lock thuộc hạ tầng nguyên thủy chỉ đảm bảo quy trình nối tiếp transaction, nhưng hoàn toàn thiếu sót năng lực giám sát logic vòng đời dữ liệu. Khả năng bảo toàn lịch sử dữ liệu chỉ khả thi khi bổ sung mệnh đề chứa thông tin phiên bản kỳ vọng.
 
-## 3. Dòng thời gian dắt nhau xuống vực (Timeline lỗi)
+## 3. Dòng thời gian lỗi mất bản cập nhật
 
 ```text
-A bốc lên giá=100
-B bốc lên giá=100
-A sửa thành 90, xả SQL, chốt sổ!
-B sửa thành 80, xả SQL theo ngay sau A, chốt sổ!
-Giá cuối cùng dưới DB = 80; Cả A và B đều cười hề hề vì được báo Thành Công!
+Luồng A truy xuất: Giá=100
+Luồng B truy xuất: Giá=100
+Luồng A cập nhật thành 90, gửi lệnh SQL, và commit!
+Luồng B cập nhật thành 80, gửi lệnh SQL tiếp nối, và commit!
+Kết quả hệ thống: Database lưu trữ giá trị 80; Cả A và B đều nhận phản hồi cập nhật thành công!
 ```
 
-Đây chính là thảm họa Mất Dữ Liệu (lost update): Công sức của A bị B xóa sổ gọn hơ.
+Sự kiện mất dữ liệu cập nhật đã được xác lập: Toàn bộ quá trình và kết quả xử lý của Luồng A bị loại bỏ không dấu vết.
 
-## 4. Ảo tưởng hàm `save()` thần thánh
+## 4. Ảo giác an toàn từ phương thức `save()`
 
 ```java
 ProductOffer saved = offers.save(offer);
 ```
 
-Bạn nghĩ gọi `save()` là an toàn? Ồ không! Hàm `save()` chỉ giỏi trò "đã có thì sửa, chưa có thì tạo mới" (persist/merge). Chứ nếu bạn không khai báo `@Version` trong Class, nó sẽ không tự rảnh háng đi chèn thêm điều kiện dò Version cho bạn đâu. Xung đột là do Bản Hợp Đồng SQL quyết định, chứ không liên quan gì đến mấy cái tên hàm Repository kêu cho rổn rảng.
+Phương thức `save()` trong môi trường Spring Data JPA không phải là cơ chế đảm bảo an toàn đa luồng. Nó đơn thuần là quy trình quyết định vòng đời "tạo mới nếu chưa có, cập nhật nếu đã tồn tại". `save()` không tự động tiêm mã chặn xung đột nếu lớp tương ứng không được thiết lập annotation `@Version`. Tính năng toàn vẹn cấu trúc thuộc về giao ước database, không phụ thuộc vào quy ước đặt tên của repository.
 
-## 5. Dùng `@DynamicUpdate` là Đủ? Còn lâu!
+## 5. Sử dụng `@DynamicUpdate` sai mục đích
 
-`@DynamicUpdate` là trò mèo giúp Hibernate chỉ ra lệnh UPDATE những cột nào thực sự thay đổi. Trò này giúp đỡ ghi đè lung tung khi 2 người sửa 2 cột KHÁC NHAU. Nhưng nếu 2 người CÙNG SỬA cột `price` thì nó cũng bó tay chịu chết. Đây chỉ là mẹo tối ưu hiệu năng SQL, tuyệt đối không phải cơ chế bắt lỗi Xung đột!
+Khai báo `@DynamicUpdate` được Hibernate xây dựng nhằm giới hạn câu lệnh SQL UPDATE chỉ thay đổi những trường thực sự khác biệt so với bộ nhớ đệm. Cơ chế này giảm thiểu rủi ro khi 2 transaction độc lập hiệu chỉnh 2 trường riêng biệt trên cùng 1 cấu trúc. Tuy nhiên, nếu hai transaction cùng chỉ định vào trường `price`, `@DynamicUpdate` hoàn toàn vô giá trị trong việc bảo mật tính toàn vẹn. `@DynamicUpdate` thuộc nhóm tối ưu hiệu suất, không thuộc nhóm xử lý tương tranh database.
 
-## 6. Lỗ hổng to đùng: API quên mất Client đang cầm Version nào
+## 6. Lỗ hổng thiết kế API thiếu phiên bản kỳ vọng
 
 ```java
-// Thiếu mất expectedVersion ở đây nè!
+// Bỏ quên trường expectedVersion!
 public record ChangePriceRequest(BigDecimal price) {
 }
 
@@ -118,17 +118,17 @@ public OfferView changePrice(long id, ChangePriceRequest request) {
 }
 ```
 
-Kể cả khi bạn đã cài `@Version` dưới Database. Nếu trên cái Request không gửi kèm `version`, Backend sẽ ngây thơ chui xuống DB bốc cái bản MỚI NHẤT lên. Lệnh update của bạn sẽ được Hibernate điền đúng cái Version mới nhất này. Lại THÀNH CÔNG RỰC RỠ, và B lại tiếp tục xóa sạch công sức của A.
+Ngay cả khi database và Hibernate đã thiết lập cơ chế khóa lạc quan (`@Version`), nếu dữ liệu yêu cầu (payload) của phía gọi không truyền lên thông tin phiên bản gốc, máy chủ backend sẽ tải lên đối tượng có phiên bản mới nhất và gán cấu trúc cập nhật lên đó. Quy trình này sẽ tạo nên câu lệnh SQL chứa tham số version đã được cập nhật bởi transaction kề trước, và kết quả dẫn tới vòng lặp ghi đè vẫn diễn ra trơn tru.
 
-## 7. Cầm đèn chạy trước ô tô: Tự Tăng Version bằng tay
+## 7. Phản mẫu ghi đè phiên bản thủ công
 
 ```java
 offer.setVersion(offer.getVersion() + 1);
 ```
 
-Cái `version` sinh ra là để thằng Quản Gia (Hibernate / JPA) lo. Nếu bạn táy máy thò tay vào tự cộng thêm 1, nó sẽ loạn cào cào và phá nát cái mệnh đề so sánh lúc sinh câu SQL. Bỏ tay ra ngay!
+Bất cứ hành vi tương tác bằng mã lên trường `version` đều hủy hoại chu trình quản lý của trình cung cấp JPA. Nó dẫn tới hệ quả chênh lệch thông số giữa bộ nhớ đệm và database, làm vô hiệu hóa thuật toán phát sinh mệnh đề bảo mật trong câu SQL. Thuộc tính này phải được cấu hình ở chế độ hệ thống quản lý.
 
-## 8. Bắt Lỗi và Cố Đấm Ăn Xôi (Catch conflict rồi chạy tiếp)
+## 8. Khối catch không hợp lệ trong transaction hỏng
 
 ```java
 @Transactional
@@ -137,26 +137,26 @@ public OfferView editWithRetry(EditOffer command) {
         return apply(command);
     } catch (ObjectOptimisticLockingFailureException conflict) {
         entityManager.clear();
-        return apply(command); // Vẫn bám víu vào cái Giao Dịch đã CHẾT
+        return apply(command); // Sử dụng transaction đã bị đánh dấu hủy
     }
 }
 ```
 
-Một khi `OptimisticLockException` văng ra thì Giao Dịch hiện tại đã bị cắm cờ CHẾT (rollback-only). Bạn có gọi `clear()` thì nó chỉ gỡ liên kết mấy cái Object trên RAM ra thôi, chứ cái Giao Dịch vật lý dưới DB không hề được tạo mới. Cố tình code tiếp trong này là tự đào mố chôn mình. (Đọc bài `LOCK-002` để biết cách Retry chuẩn).
+Một khi ngoại lệ `OptimisticLockException` xuất hiện, cơ chế quản lý ngầm sẽ thiết lập cờ chỉ định rollback (`rollback-only`) lên ngữ cảnh transaction. Hành động gọi `clear()` chỉ có tác dụng cắt đứt cấu trúc tham chiếu trong bộ nhớ, nhưng hoàn toàn không thể tái khởi tạo lại transaction vật lý dưới tầng database. Việc yêu cầu thực thi trên một transaction đã chết sẽ sinh ra hàng loạt lỗi lan truyền.
 
-## 9. Cú sốc phút chót (Conflict ở một nơi xa)
+## 9. Phản hồi ảo trước khi thực thi SQL
 
 ```java
 @Transactional
 public OfferView edit(...) {
     offer.changePrice(...);
-    return OfferView.from(offer); // Thấy return không có nghĩa là đã an toàn!
+    return OfferView.from(offer); // Trả về thành công nhưng transaction chưa commit
 }
 ```
 
-Bạn cứ nghĩ gọi API xong trả về `OfferView` là ngon lành rồi? Chưa đâu. SQL chỉ thực sự xả xuống và Commit ở Mép Ngoài Cùng của cái Proxy. Tức là hàm Java của bạn chạy xong, đi ra ngoài rìa rồi mới văng Lỗi. Đừng bao giờ đinh ninh rằng giá trị Return có nghĩa là DB đã chốt sổ nhé!
+Việc cung cấp đối tượng trả về trong phạm vi phương thức không đại diện cho trạng thái đã commit. Thực tế, truy vấn SQL và ngoại lệ có thể chỉ được kích hoạt (flush) ở rìa phân lớp Spring proxy, sau khi luồng Java của phương thức đã chạy xong. Phản hồi nội bộ không định lượng được thành công cuối cùng của transaction.
 
-## 10. Chặn cổng Làng mà quên chặn cổng Tỉnh (Local lock sai)
+## 10. Sai lầm về khóa cục bộ trong kiến trúc phân tán
 
 ```java
 synchronized (this) {
@@ -164,26 +164,26 @@ synchronized (this) {
 }
 ```
 
-Bạn tự mãn vì đã rào `synchronized` nên không luồng nào chen vào được? Chúc mừng bạn, nó chạy tốt trên máy của bạn (1 App). Nhưng ra Production, bạn chạy 5 cái Container chia tải (load balancer). 5 máy tính chả liên quan gì đến nhau, chúng cùng thọc tay vào gọi DB, và dữ liệu lại bị ghi đè te tua vì DB thiếu cái hàng rào SQL Version.
+Rào cản `synchronized` là một giải pháp khóa mức ứng dụng tại luồng cục bộ (JVM). Khi ứng dụng triển khai trên mô hình bộ cân bằng tải / kiến trúc nhiều instance, khóa JVM không thể kiểm soát sự cạnh tranh giữa các node độc lập tới cùng một database. Tình trạng ghi đè sẽ xuất hiện trở lại do sự thiếu vắng của rào cản SQL toàn cục.
 
-## 11. Các Bước Để Dựng Lại Hiện Trường (Tái hiện lỗi)
+## 11. Các bước dựng lại môi trường kiểm chứng tái hiện lỗi
 
-1. Gieo mầm: Cho một offer giá `100` yên vị dưới DB.
-2. Dựng sân khấu: Mở 2 luồng Giao dịch Vật lý riêng biệt (persistence contexts).
-3. Cho luồng A và B cùng bốc cái offer đó lên.
-4. Lệnh cho luồng A đổi giá thành `90`, xả lệnh và chốt sổ.
-5. Lệnh cho luồng B đổi giá thành `80`, xả lệnh và chốt sổ (ngay sau A).
-6. Kiểm chứng: Cả hai không ai văng lỗi, DB chốt giá `80`. Bùm!
-7. (Nên dùng PostgreSQL thật qua Testcontainers, nhớ tháo cái `@Transactional` ở Test Class ra để mô phỏng đúng).
+1. Thiết lập database: Một bản ghi (offer) có giá `100` tồn tại.
+2. Thiết lập môi trường: Tạo 2 luồng xử lý tương ứng với 2 ngữ cảnh transaction riêng biệt.
+3. Đọc dữ liệu đồng thời: Điều khiển Luồng A và Luồng B thực hiện tải đối tượng.
+4. Thực thi A: Luồng A thay đổi thông số thành `90`, kích hoạt `flush` và commit.
+5. Thực thi B: Luồng B đổi giá thành `80`, kích hoạt `flush` và commit (tuần tự theo sau A).
+6. Khảo sát: Cả 2 luồng đều xác nhận thành công. Trạng thái database cuối cùng chốt ở giá `80`. Thất bại bảo toàn dữ liệu được xác nhận.
+7. (Lưu ý: Môi trường kiểm thử đòi hỏi gỡ bỏ annotation `@Transactional` bao quanh phương thức kiểm thử để duy trì ranh giới transaction ảo như trạng thái thực tế).
 
-## 12. Danh sách Những pha Chữa cháy Đi vào Lòng Đất
+## 12. Danh mục các phương án sửa lỗi không hợp lệ
 
-- Chỉ nhét thêm `@Transactional` vào và cầu nguyện.
-- Thay vì gọi `save()`, gọi hẳn `saveAndFlush()` cho ngầu (và vô dụng).
-- Nghe lời xúi giục đổi Mức cách ly từ `READ COMMITTED` lên `REPEATABLE READ` mà không biết cách hứng lỗi từ DB dội về.
-- Chỉ dùng `@DynamicUpdate`.
-- Khôn ngoan tới mức trả về Version cho Client, nhưng quên bắt Client phải nhét cái Version đó vào lại lúc bấm Lưu.
-- Bao hết mọi lỗi Conflict lại rồi Tự Động thử lại dù người dùng chưa cho phép.
-- Lấy Đồng hồ của hệ thống (Timestamp) ra chế thành Version (Máy chủ đồng hồ bị lệch là vỡ mồm).
-- Dùng Mutex/Lock của Java để đỡ đạn cho hệ thống nhiều Server.
-- Cài assert bắt Lỗi ngon lành nhưng quên mất kiểm tra xem Dữ liệu cuối cùng dưới DB có bị rác hay không.
+- Bọc thêm annotation `@Transactional` ở các lớp, hy vọng gia cố lỗi ngầm định.
+- Chuyển thao tác `save()` thành `saveAndFlush()` mà không bổ sung chiến lược ngoại lệ tương ứng.
+- Tự động thay đổi mức độ cách ly của database từ `READ COMMITTED` lên `REPEATABLE READ` mà thiếu kiến thức về việc database sẽ dội ngược lại các lớp lỗi.
+- Đặt niềm tin bảo mật dữ liệu hoàn toàn vào tùy biến `@DynamicUpdate`.
+- Hệ thống trả thông tin version cho phía gọi nhưng không thiết kế cơ chế bắt buộc phía gọi truyền xuống tham chiếu (xác thực không trạng thái).
+- Bao quát mọi mã lỗi tương tranh để thử lại tự động bất chấp nghiệp vụ đòi hỏi phản hồi từ người dùng.
+- Tự tạo logic version từ đồng hồ hệ thống (rủi ro lệch múi giờ phân tán).
+- Sử dụng các kiến trúc Java Mutex, ReentrantLock ở phía ứng dụng để bảo vệ database.
+- Bỏ qua công tác đối chiếu khẳng định bằng cách truy vấn ngược lại database sau khi quy trình kiểm chứng (assertion) báo cáo thành công.

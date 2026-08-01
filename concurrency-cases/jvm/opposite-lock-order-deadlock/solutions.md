@@ -1,6 +1,6 @@
 # Giải pháp, code đã sửa và các đánh đổi
 
-## Giải pháp 1: deterministic total order
+## Giải pháp 1: định hướng tất định (deterministic total order)
 
 ```java
 package com.example.transfer;
@@ -38,14 +38,11 @@ public final class OrderedLocalTransferService {
 }
 ```
 
-`accountId` phải unique, immutable và cùng comparator ở mọi call site. Acquire
-order không còn phụ thuộc transfer direction. Balance mutation chỉ chạy sau khi
-có cả hai lock; release theo thứ tự ngược.
+`accountId` phải là duy nhất, bất biến và dùng cùng comparator ở mọi nơi gọi (call site). Thứ tự acquire không còn phụ thuộc hướng chuyển. Việc thay đổi (mutation) balance chỉ chạy sau khi có cả hai lock; tiến hành release theo thứ tự ngược.
 
-> **Nói ngắn gọn:** canonical order biến hai hướng transfer thành cùng một đường
-> đi qua lock graph, nên không thể tạo cạnh chờ ngược.
+> **Nói ngắn gọn:** thứ tự chuẩn biến hai hướng chuyển thành cùng một đường đi qua đồ thị lock, nên không thể tạo cạnh chờ ngược.
 
-## Giải pháp 2: ordering kết hợp bounded interruptible acquisition
+## Giải pháp 2: định hướng kết hợp với acquire có thể ngắt và giới hạn thời gian
 
 ```java
 public boolean transferWithin(
@@ -84,37 +81,31 @@ public boolean transferWithin(
 }
 ```
 
-Các helper chọn ID order và mutate giống solution 1; exception là
-`RuntimeException` domain mỏng. Deadline chung ngăn tổng wait nhân đôi. Timeout
-loser release lock đã giữ và caller quyết định retry; không retry trong lock.
+Các hàm hỗ trợ (helper) chọn thứ tự ID và thay đổi trạng thái giống giải pháp 1; exception là một lỗi nghiệp vụ (domain exception) kế thừa `RuntimeException`. Thời hạn chung ngăn tổng thời gian chờ bị nhân đôi. Yêu cầu vượt thời gian chờ sẽ release lock đã giữ và phía gọi quyết định thử lại; không thử lại bên trong khoảng giữ lock.
 
-## Phương án 3: một coarse lock
+## Phương án 3: một lock chung (coarse lock)
 
-Một private final monitor cho toàn registry loại bỏ multi-lock cycle và dễ chứng
-minh, nhưng serialize transfer trên account không liên quan. Phù hợp state nhỏ,
-throughput thấp; không mở rộng qua JVM.
+Một private final monitor cho toàn registry sẽ loại bỏ chu trình nhiều lock và dễ chứng minh, nhưng nó chạy tuần tự các thao tác chuyển trên các account không liên quan. Phù hợp với trạng thái nhỏ, contention thấp; không mở rộng ra khỏi một JVM.
 
 ## Phương án 4: không giữ nhiều lock
 
-Partition account theo single owner, gửi command qua queue/actor hoặc đổi state
-model để một coordinator thực hiện mutation. Cách này loại hold-and-wait nhưng
-thay đổi architecture, latency và failure semantics.
+Phân chia account theo single owner, gửi lệnh qua hàng đợi hoặc tác nhân (actor), hoặc đổi mô hình trạng thái để một coordinator thực hiện thay đổi. Cách này loại bỏ tình trạng hold-and-wait nhưng sẽ thay đổi kiến trúc, độ trễ và ngữ nghĩa khi có lỗi (failure semantics).
 
 ## So sánh đánh đổi
 
-| Phương án | Deadlock prevention | Latency | Throughput | Complexity | Multi-node |
+| Phương án | Tránh deadlock (Deadlock prevention) | Độ trễ (Latency) | Thông lượng (Throughput) | Độ phức tạp | Multi-node |
 | --- | --- | --- | --- | --- | --- |
-| Total order + `lock()` | Phá circular wait | Có thể chờ contention | Account độc lập song song | Thấp | Không |
-| Order + timed `tryLock` | Prevention + bounded wait | Có deadline/rejection | Có retry overhead | Vừa | Không |
-| Coarse lock | Chỉ một lock | Head-of-line blocking | Thấp hơn | Rất thấp | Không |
-| Actor/single owner | Không giữ nhiều lock | Queueing | Theo partition | Cao | Cần protocol riêng |
+| Total order + `lock()` | Phá chu trình chờ vòng tròn (circular wait) | Có thể chờ khi contention cao | Các account độc lập có thể chạy song song | Thấp | Không |
+| Order + timed `tryLock` | Phòng ngừa + giới hạn thời gian chờ | Có thời hạn và tự chối | Có chi phí thử lại (retry overhead) | Vừa | Không |
+| Coarse lock | Chỉ dùng một lock | Gây chặn ở hàng đợi (Head-of-line blocking) | Thấp hơn | Rất thấp | Không |
+| Actor/single owner | Không giữ nhiều lock | Phụ thuộc vào hàng đợi (Queueing) | Dựa vào số phân vùng (partition) | Cao | Cần giao thức riêng |
 
-## Retry và production policy
+## Thử lại và chính sách trên production
 
-- Retry chỉ sau cleanup, dùng operation deadline và bounded attempts.
-- Backoff có jitter để tránh hai actor tái va chạm.
-- Không retry insufficient balance/validation failure.
-- External side effect cần idempotency key.
-- Metric: lock wait, timeout, retry, detector count và critical-section duration.
-- Thread dump phải lưu owner/waiter stack khi incident.
-- Không dùng solution local cho database transfer; xem `DB-008` và banking cases.
+- Chỉ thử lại sau khi đã dọn dẹp, sử dụng thời hạn thao tác và giới hạn số lượt thử.
+- Khoảng lùi (Backoff) cần có độ trễ ngẫu nhiên (jitter) để tránh hai tác nhân tái va chạm.
+- Không thử lại các lỗi do không đủ balance hoặc validation thất bại.
+- External side effect cần khóa lũy đẳng (idempotency key).
+- Số liệu: thời gian chờ lock, số timeout, số lượt thử lại, số lượng detector và khoảng thời gian chạy critical-section.
+- Thread dump phải lưu stack của owner và waiter khi có sự cố.
+- Không dùng giải pháp local cho việc chuyển tiền trên database; xem tình huống `DB-008` và các trường hợp ngân hàng.

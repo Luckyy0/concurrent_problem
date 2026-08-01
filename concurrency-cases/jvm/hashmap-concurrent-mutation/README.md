@@ -1,139 +1,102 @@
-# JVM-003 — Thay đổi HashMap đồng thời và công bố không an toàn
+# Bài toán JVM-003 — Đột biến HashMap đồng thời và Công bố trạng thái bất an toàn (Unsafe Publication)
 
-## Tóm tắt
+## 1. Tóm tắt vấn đề (Overview)
 
-Một Spring singleton giữ bảng định tuyến payment trong memory. Request thread đọc
-rule để chọn provider, còn scheduled refresh thread tải cấu hình mới rồi cập nhật
-cùng một `HashMap`.
+Khảo sát một cấu trúc Spring singleton đóng vai trò lưu trữ bảng định tuyến thanh toán (payment routing) trực tiếp trên bộ nhớ (memory). Tác vụ xử lý yêu cầu (Request thread) đọc các quy tắc để lựa chọn đối tác cung cấp (provider), trong khi đó một luồng làm mới định kỳ (Scheduled refresh thread) có nhiệm vụ tải cấu hình mới và tiến hành ghi đè trực tiếp lên chính cấu trúc `HashMap` đó.
 
-Nếu refresh dùng `clear()` rồi `putAll()`, request có thể nhìn thấy map rỗng, một
-snapshot mới chỉ có một phần, hoặc gặp lỗi trong lúc iterate. Nếu developer đổi
-sang tạo map mới rồi gán reference nhưng field không có cơ chế công bố an toàn,
-reader vẫn tham gia một data race và không được Java Memory Model bảo đảm nhìn
-thấy snapshot mới.
+Lỗ hổng chết người phát sinh khi luồng làm mới thực thi chuỗi lệnh `clear()` nối tiếp bằng `putAll()`. Luồng yêu cầu (Request) hoàn toàn có khả năng vướng vào khoảng thời gian tranh chấp và thu về một bản đồ rỗng, một mảnh dữ liệu chắp vá, hoặc thậm chí kích hoạt ngoại lệ hệ thống ngay giữa vòng lặp (iterate). 
+Nếu nhà phát triển lảng tránh việc sửa đổi trực tiếp (mutate) bằng cách khởi tạo một bản đồ mới rồi hoán đổi tham chiếu (reference), nhưng lại bỏ qua cơ chế công bố an toàn (safe publication) cho thuộc tính (field), thì Luồng đọc (Reader) vẫn rơi vào trạng thái đua dữ liệu (Data race). Trong kịch bản này, Mô hình Bộ nhớ Java (Java Memory Model - JMM) hoàn toàn không có nghĩa vụ bảo chứng cho việc Luồng đọc có nhìn thấy bản chụp (snapshot) mới hay không.
 
-Case này bảo vệ các **quy tắc luôn phải đúng** (`business invariant`) trong một
-JVM:
+Bài toán thiết lập ranh giới bảo vệ các **Quy tắc Bất biến (Business Invariant)** nội trong một không gian Máy ảo (JVM):
 
 ```text
-Mỗi request phải đọc trọn vẹn một generation của bảng định tuyến.
-Request không được quan sát map rỗng hoặc snapshot trộn giữa hai generation.
-Một PaymentRoute đã công bố không được bị thay đổi từ phía sau.
+- Từng yêu cầu đơn lẻ phải được quyền truy xuất một Thế hệ (Generation) trọn vẹn của bảng định tuyến.
+- Tuyệt đối cấm để lọt trạng thái rỗng hoặc trạng thái lai tạp giữa hai Thế hệ vào tầm ngắm của bất kỳ yêu cầu nào.
+- Một tuyến đường thanh toán (PaymentRoute) đã được công bố thì bất khả xâm phạm; mọi biến đổi sau lưng đều bị cấm.
 ```
 
-> **Nói ngắn gọn:** thread refresh phải thay cả bảng rule trong một bước có điểm
-> hiệu lực rõ ràng; không được tháo bảng cũ rồi lắp từng phần trước mặt request.
+> **Nguyên tắc kỹ thuật:** Luồng làm mới bắt buộc phải thay thế toàn bộ khối dữ liệu thông qua một thao tác duy nhất với Điểm hiệu lực (Linearization point) minh bạch. Cấm tuyệt đối hành vi tháo dỡ bảng dữ liệu cũ rồi chắp vá dữ liệu mới ngay trước mặt các luồng yêu cầu.
 
-## Thuật ngữ cần biết
+## 2. Các Thuật ngữ Chuyên ngành (Terminology)
 
-| Thuật ngữ | Giải thích dễ hiểu |
+| Thuật ngữ | Ý nghĩa trong ngữ cảnh |
 | --- | --- |
-| collection không an toàn cho nhiều luồng (`non-thread-safe collection`) | Collection không bảo vệ cấu trúc nội bộ khi nhiều thread cùng đọc và ghi |
-| công bố an toàn (`safe publication`) | Đưa object cho thread khác qua một cơ chế bảo đảm object và state đã khởi tạo được nhìn thấy |
-| quan hệ xảy ra-trước (`happens-before`) | Quy tắc của Java Memory Model bảo đảm kết quả ghi ở một thread có thể được thread khác quan sát |
-| snapshot bất biến (`immutable snapshot`) | Một bản state hoàn chỉnh, không còn bị sửa sau khi được công bố |
-| thay reference nguyên tử (`atomic reference swap`) | Đổi từ snapshot cũ sang snapshot mới bằng một thao tác duy nhất |
-| iteration nhất quán yếu (`weakly consistent iteration`) | Iterator an toàn trước thay đổi đồng thời nhưng có thể thấy một phần update mới |
-| structural modification | Thao tác làm thay đổi cấu trúc collection như thêm, xóa hoặc `clear()` |
-| generation | Phiên bản logic của toàn bộ bảng rule sau mỗi lần refresh |
+| Tập hợp bất an toàn luồng (`non-thread-safe collection`) | Cấu trúc dữ liệu không tự bảo chứng tính toàn vẹn khi phải hứng chịu hỏa lực đọc/ghi đan xen từ đa luồng. |
+| Công bố an toàn (`safe publication`) | Giao thức bàn giao đối tượng cho một luồng khác, bảo chứng đối tượng và trạng thái nội tại đã được khởi tạo toàn vẹn và khả kiến. |
+| Quan hệ hệ quả (`happens-before`) | Đặc tả của Java Memory Model cam kết kết quả của luồng A sẽ hiển hiện rành mạch trước mắt luồng B. |
+| Bản chụp bất biến (`immutable snapshot`) | Trạng thái toàn vẹn của một khoảnh khắc, vĩnh viễn không thể biến dạng sau khi xuất bản. |
+| Hoán đổi tham chiếu nguyên tử (`atomic reference swap`) | Quá trình chuyển giao từ bản chụp cũ sang mới gói gọn trong một chỉ lệnh vật lý duy nhất, cấm chia cắt. |
+| Vòng lặp nhất quán yếu (`weakly consistent iteration`) | Cơ chế duyệt an toàn trước biến động đồng thời, nhưng mang rủi ro quan sát thấy một số thay đổi dở dang (không triệt để). |
+| Biến đổi cấu trúc (`structural modification`) | Các thao tác tái định hình kiến trúc vật lý của cấu trúc bộ nhớ (thêm, xóa, hoặc `clear()`). |
+| Thế hệ (`generation`) | Phiên bản logic đánh dấu một chu kỳ vòng đời toàn vẹn của tập hợp dữ liệu sau mỗi đợt làm mới. |
 
-## Bối cảnh nghiệp vụ
+## 3. Bối cảnh nghiệp vụ (Business Context)
 
-Ứng dụng fintech định tuyến payment theo `merchantId`:
+Hệ thống Công nghệ tài chính (Fintech) điều phối giao dịch thanh toán dựa trên định danh Đối tác (`merchantId`):
 
-- request thread gọi `selectRoute(merchantId)` để chọn provider;
-- scheduled refresh thread tải toàn bộ rule từ config service mỗi 30 giây;
-- endpoint vận hành có thể yêu cầu refresh thủ công;
-- mỗi lần tải trả về một generation hoàn chỉnh, ví dụ generation 41 hoặc 42.
+- Luồng Yêu cầu triệu gọi `selectRoute(merchantId)` để xác định đối tác xử lý.
+- Luồng Làm mới (Scheduled) truy xuất dữ liệu từ Dịch vụ Cấu hình (Config service) mỗi chu kỳ 30 giây.
+- Hệ thống hỗ trợ cổng API ép buộc làm mới thủ công (Manual refresh).
+- Mỗi đợt tải dữ liệu hoàn trả một Thế hệ (Generation) trọn vẹn, được đánh số định danh (Ví dụ: Thế hệ 41 hoặc 42).
 
-Việc refresh phải có tính all-or-nothing: request có thể dùng generation cũ hoặc
-mới, nhưng không được dùng một bảng đang được dựng dở.
+Tiêu chuẩn Làm mới (Refresh) bắt buộc tuân thủ nguyên tắc Giao dịch tuyệt đối (All-or-nothing): Yêu cầu có quyền sử dụng Thế hệ Cũ hoặc Mới, nhưng nghiêm cấm việc định tuyến qua một bảng dữ liệu đang trong quá trình xây cất. Cấu trúc `PaymentRoute` phải được thiết lập dạng `record` (Bất biến). Bản thân một cấu trúc Map bất biến chỉ khóa lớp vỏ (cấu trúc Map), nó hoàn toàn vô hại đối với sự biến thiên của các thuộc tính (field) bên trong nếu bản thể dữ liệu vẫn là Khả biến (Mutable).
 
-`PaymentRoute` trong ví dụ là một immutable `record`. Nếu value vẫn mutable thì
-một map immutable chỉ khóa cấu trúc map, không ngăn field bên trong value thay
-đổi.
+## 4. Các Thực thể và Trạng thái chia sẻ (Shared state & Contention)
 
-## Trạng thái dùng chung và điểm tranh chấp
-
-| Thành phần | Giá trị |
+| Thành phần | Vai trò và Trạng thái |
 | --- | --- |
-| Object dùng chung | Singleton `PaymentRoutingRegistry` |
-| State dùng chung | Bảng `merchantId → PaymentRoute` |
-| Reader | Request thread và health/diagnostic thread |
-| Writer | Scheduled refresh hoặc manual refresh thread |
-| Chuỗi gây lỗi | `clear() → put(...) → put(...)` trên cùng `HashMap` |
-| Điểm tranh chấp | Khoảng thời gian map chỉ chứa một phần generation mới |
-| Ranh giới transaction | Không có database transaction; đây là state trong một JVM |
-| Phạm vi invariant | Một application instance |
+| Đối tượng dùng chung | Singleton `PaymentRoutingRegistry` |
+| Trạng thái dùng chung | Bảng ánh xạ `merchantId → PaymentRoute` |
+| Tuyến Đọc (Reader) | Luồng Yêu cầu (Request) và Luồng Giám sát (Diagnostic) |
+| Tuyến Ghi (Writer) | Luồng Làm mới (Scheduled) hoặc Luồng Cập nhật thủ công |
+| Chuỗi thao tác khuyết tật | `clear() → put(...) → put(...)` trên cùng một cá thể `HashMap` |
+| Ranh giới đứt gãy | Quãng thời gian kiến trúc Map chắp vá dữ liệu Thế hệ mới |
+| Phạm vi Ràng buộc | Không có Transaction Database; Thuần túy là Bộ nhớ JVM |
 
-Spring công bố singleton bean an toàn sau khi tạo xong. Điều đó không tự động làm
-cho mọi lần mutate field của bean trong lúc chạy trở nên thread-safe.
+Sự kiện Spring cấp chứng chỉ an toàn (Safe publication) cho một cá thể Singleton tại thời điểm khởi chạy hoàn toàn không đồng nghĩa với việc mọi thao tác ghi đè lên thuộc tính của cá thể đó sau này cũng tự nhiên trở thành An toàn Luồng (Thread-safe).
 
-## Phạm vi của case
+## 5. Giới hạn Áp dụng (Out of Scope)
 
-Case này giải quyết:
+Chuyên đề tập trung xử lý: 
+- Tính toàn vẹn cấu trúc của bộ nhớ Map.
+- Tính khả kiến (Visibility) khi chuyển giao Bản chụp.
+- Tính nhất quán của tiến trình đọc bảng quy tắc.
+- Tiêu chí lựa chọn Collection theo chuẩn ngữ nghĩa nghiệp vụ.
 
-- an toàn cấu trúc của map;
-- visibility khi đổi snapshot;
-- tính nhất quán của một lần đọc toàn bộ bảng rule;
-- lựa chọn collection theo semantics mà nghiệp vụ cần.
+Cấu trúc này KHÔNG sinh ra để gánh vác các Giao dịch nhiều Khóa (Multi-key transaction) cấp độ Database hay Đồng bộ hóa phiên bản xuyên suốt Đa Máy Chủ (Multi-instance). Hệ thống các Nút phân tán vẫn có thể lưu giữ các Thế hệ khác biệt nếu hạ tầng Cấu hình không cung cấp cơ chế Phiên bản (Versioning) hay Bộ điều phối giao thức (Coordination protocol) thích hợp.
 
-Case không giải quyết transaction nghiệp vụ trên nhiều key và không đồng bộ cấu
-hình giữa nhiều application instance. Mỗi node vẫn có thể đang dùng một
-generation khác nhau nếu nguồn cấu hình và cơ chế refresh không cung cấp version
-hoặc coordination phù hợp.
+## 6. Điều hướng Tài liệu (Navigation)
 
-## Điều hướng
+- [Phân Tích Lỗi Thiết Kế Hệ Thống (broken-code.md)](broken-code.md)
+- [Phân Tích Chuyên Sâu Luồng Tương Tranh (analysis.md)](analysis.md)
+- [Giải Pháp Cấu Hình Phù Hợp (solutions.md)](solutions.md)
+- [Thực Nghiệm Khóa Bi Quan Với Testcontainers (experiments.md)](experiments.md)
+- [Tổng Quan Về Mô Hình Bộ Nhớ Java (Java Memory Model)](../../concepts/java-memory-model-and-atomicity.md)
+- [Phương Pháp Kiểm Thử Đồng Thời (Concurrency testing)](../../concepts/concurrency-testing.md)
 
-- [Cách triển khai bị lỗi](broken-code.md)
-- [Dòng thời gian tranh chấp và nguyên nhân](analysis.md)
-- [Code đã sửa và các phương án lựa chọn](solutions.md)
-- [Cách kiểm thử đồng thời](experiments.md)
-- Kiến thức nền:
-  [Java Memory Model và công bố object](../../concepts/java-memory-model-and-atomicity.md)
-- Kiến thức nền:
-  [Kiểm thử đồng thời](../../concepts/concurrency-testing.md)
+## 7. Tác Động Tới Hệ Thống (Production Impact)
 
-## Hậu quả trong môi trường thực tế
+### Hệ Quả Kỹ Thuật
+- Yêu cầu thu về kết quả `null` ngay cả khi Định tuyến hợp lệ tồn tại ở cả Thế hệ cũ lẫn mới.
+- Vòng lặp (Iterator) văng ngoại lệ `ConcurrentModificationException` hoặc trích xuất sai lệch số lượng Khóa.
+- Tuyến đọc ngoan cố bám trụ Bản chụp cũ vì quy trình cập nhật không kích hoạt Cờ Khả kiến (Visibility).
+- Số liệu đo lường (Metric), Giám sát (Health) và Yêu cầu Định tuyến (Routing) ghi nhận những Trạng thái phân mảnh khác nhau.
 
-### Hậu quả kỹ thuật
+### Hệ Quả Nghiệp Vụ
+- Thanh toán bị từ chối oan uổng hoặc ép chuyển sang Đối tác dự phòng (Fallback).
+- Đối tác bị áp đặt sai lệch Quy tắc khác Thế hệ.
+- Lệnh Vận hành khẩn cấp (Khóa đối tác) có hiệu lực chập chờn, phân tán.
+- Sự cố mang rủi ro Trùng khớp chu kỳ (Timing), thách thức mọi giới hạn của Kiểm thử tuần tự.
 
-- request nhận `null` dù route hợp lệ tồn tại ở generation cũ và mới;
-- iterator ném `ConcurrentModificationException` hoặc đọc một tập key không
-  nhất quán;
-- reader tiếp tục dùng snapshot cũ vì update không được công bố đúng cách;
-- metric, health check và routing request nhìn thấy các state khác nhau;
-- value mutable bị thay đổi sau khi map đã được công bố.
+## 8. Khuyến Nghị Phân Lớp Áp Dụng (Best Practices)
 
-### Hậu quả nghiệp vụ
+1. Cường độ Đọc lớn (Read-heavy) + Làm mới Toàn bảng: Áp dụng **Bản chụp Bất biến (Immutable snapshot)** và xuất bản qua cấu trúc `AtomicReference` hoặc biến `volatile`. Yêu cầu Tuyến Ghi xây dựng bản chụp tĩnh hoàn toàn bên ngoài Tuyến Đọc và chỉ hoán đổi Tham chiếu một lần duy nhất.
+2. Nhu cầu Cập nhật riêng lẻ từng Khóa (Key-level): Sử dụng `ConcurrentHashMap` nếu hệ thống chấp nhận sự lỏng lẻo của Vòng lặp nhất quán yếu. Không lạm dụng nó để nhóm nhiều lệnh cập nhật Khóa thành một Cụm Nguyên Tử.
+3. Ràng buộc bảo toàn cấu trúc Khả biến: Áp dụng `ReentrantReadWriteLock` khi Tuyến đọc bắt buộc cần Khóa để chiêm ngưỡng một Khối Trạng Thái đồng nhất. Phương án này đi kèm rủi ro Nghẽn cổ chai (Contention) và bắt buộc 100% điểm chạm phải tuân thủ kỷ luật Khóa.
 
-- payment bị từ chối sai hoặc rơi vào provider fallback;
-- merchant bị định tuyến bằng rule không cùng generation;
-- thay đổi khẩn cấp như disable provider có hiệu lực không đồng đều;
-- sự cố phụ thuộc timing, khó tái hiện bằng unit test tuần tự.
-
-## Hướng sửa được khuyến nghị
-
-Với workload đọc nhiều và refresh thay toàn bộ bảng, dùng **snapshot bất biến**
-(`immutable snapshot`) rồi công bố qua `AtomicReference` hoặc một field
-`volatile`. Writer dựng snapshot ngoài đường đọc và đổi reference đúng một lần.
-
-Dùng `ConcurrentHashMap` khi mỗi key thật sự được cập nhật độc lập và nghiệp vụ
-chấp nhận iterator nhất quán yếu. Nó không biến một loạt update nhiều key thành
-một snapshot nguyên tử.
-
-Dùng `ReentrantReadWriteLock` khi bắt buộc giữ cấu trúc mutable và reader cần khóa
-để quan sát một trạng thái nhất quán. Cách này tạo contention và yêu cầu mọi
-đường truy cập cùng tuân thủ lock.
-
-## Khi nào nên dùng từng giải pháp
-
-- `AtomicReference<Map<...>>`: refresh toàn bộ bảng, read-heavy, cần snapshot
-  all-or-nothing và muốn lưu thêm metadata như generation.
-- `volatile Map<...>`: cùng mô hình snapshot nhưng state chỉ là một field đơn
-  giản, không cần compare-and-set hoặc update function.
-- `ConcurrentHashMap`: update theo từng key độc lập, không cần snapshot toàn bảng.
-- `ReentrantReadWriteLock`: compound read/write trên mutable state, có thể chấp
-  nhận reader bị block trong lúc refresh.
-- Database hoặc distributed configuration protocol: nhiều node phải cùng tuân
-  thủ một generation tại một thời điểm nghiệp vụ xác định.
+### Phác Đồ Lựa Chọn Cấu Trúc
+- `AtomicReference<Map<...>>`: Thay toàn bộ, nặng về Đọc, Snapshot Tuyệt Đối (All-or-nothing), cần đính kèm Metadata (Thế hệ).
+- `volatile Map<...>`: Kế thừa mô hình Snapshot nhưng Trạng thái thuần túy là 1 biến đơn lập, không đòi hỏi `compare-and-set`.
+- `ConcurrentHashMap`: Khóa biến thiên độc lập, không mưu cầu Snapshot Toàn Cục.
+- `ReentrantReadWriteLock`: Chuỗi Đọc/Ghi phức hợp, đánh đổi Độ trễ (Latency) lấy Trạng thái Tuyệt Đối.
+- Giao Thức Phân Tán (Distributed Protocol): 100% Nút Mạng phải đồng bộ nhất quán tại một sát na Nghiệp vụ.

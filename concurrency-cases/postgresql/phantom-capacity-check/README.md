@@ -1,8 +1,8 @@
-# Bệnh DB-004 — Bóng Ma "Phantom Row" Bóp Nát Vạch Giới Hạn Sức Chứa (DB-004 — Phantom rows làm vỡ capacity check)
+# DB-004 — Lỗi Bóng Ma (Phantom Row) Phá Vỡ Kiểm Tra Giới Hạn (Capacity Check)
 
-## 1. Tóm tắt Câu Chuyện (Tóm tắt)
+## Tóm tắt
 
-Một cái Bể Xử Lý (Processing pool) tên là `P-42` có giới hạn sức chứa (capacity) là `10` chỗ và hiện tại đã có `9` người đang bám vào (trạng thái `ACTIVE`). Đột nhiên, Thằng Khách A và Thằng Khách B đồng thời nhào vô để xin chỗ. Hai cu cậu chạy trên 2 dòng Giao Dịch (Spring transactions) hoàn toàn độc lập, chả ai nhìn thấy ai. Cả hai đều đếm số người đang ngồi:
+Một processing pool `P-42` có sức chứa tối đa (capacity) là `10` và hiện tại đang có `9` slot được cấp phát (trạng thái `ACTIVE`). Khách hàng A và B đồng thời gửi yêu cầu cấp phát. Cả hai yêu cầu đều chạy trong các giao dịch (transactions) hoàn toàn độc lập và thực hiện câu lệnh đếm:
 
 ```sql
 select count(*)
@@ -11,141 +11,136 @@ where pool_id = :poolId
   and status = 'ACTIVE';
 ```
 
-Thằng A thấy `9 < 10` (Còn trống 1 ghế!), thằng B cũng y chang thấy `9 < 10`. Thế là cả 2 thằng đều hả hê giành lấy, nhét vào DB 2 Dòng Phân Bổ (allocation rows) mới tinh khác nhau. Bùm! Hai thằng Chốt Sổ (commit) đều thành công; Cuối cùng, tổng số người "ACTIVE" đè vào bể là `11`!
+Cả A và B đều nhận được kết quả `9 < 10`, do đó cả hai đều quyết định tiếp tục và chèn (insert) các dòng cấp phát (allocation rows) mới với các ID khác nhau. Cả hai giao dịch cùng commit thành công, dẫn đến tổng số slot `ACTIVE` thực tế trở thành `11`.
 
-Lời Dặn Khắc Cốt Ghi Tâm (Invariant):
+Điều kiện bất biến (Invariant):
 
 ```text
-Với bất cứ cái Bể nào:
-  số người đang ngồi <= giới hạn thiết kế
+Với bất kỳ pool nào:
+  active count <= capacity
 
-Với thằng P-42 cụ thể:
-  giới hạn = 10
-  số người hiện tại = 9
-  thì CHỈ ĐƯỢC 1 THẰNG vào cửa, thằng còn lại phải cút (rejected)
+Cụ thể với P-42:
+  nếu capacity = 10
+  và active count = 9
+  thì chỉ một request được chấp nhận, request còn lại phải bị từ chối (rejected).
 ```
 
-> **Sếp chốt lại:** Trò đi Xí Chỗ 1 cái Dòng mới (row lock lúc INSERT) KHÔNG THỂ BẢO VỆ ĐƯỢC sự thật "còn đúng một ghế trống" kia! Vì cái Giới Hạn Sức Chứa (capacity) bản chất là 1 Luật Sinh Tử áp lên cả 1 TẬP HỢP CÁC DÒNG (predicate invariant), chứ không phải áp lên 1 dòng riêng lẻ!
+> **Nói ngắn gọn:** Hành động khóa dòng (row lock) khi INSERT một dòng mới không thể bảo vệ được một điều kiện lọc áp dụng trên nhiều dòng (predicate invariant) như kiểm tra giới hạn tổng sức chứa.
 
-## 2. Dàn Diễn Viên & Sân Khấu Sát Phạt (Actors và shared state)
+## Các thành phần tham gia (Actors và shared state)
 
-| Gương Mặt Vàng | Vai Diễn Sinh Tử |
+| Thành phần | Vai trò |
 | --- | --- |
-| Thằng Cấp Phát A | Nhìn thấy chỗ trống rồi lén lút nhét `A-101` vô. |
-| Thằng Cấp Phát B | Cũng liếc thấy chỗ trống, nhét luôn `B-202` vô không nể nang. |
-| Bảng `processing_pool` | Cái vỏ giữ cái Mốc Giới Hạn Sức Chứa (capacity). |
-| Bảng `slot_allocation` | Cái đống chứa mấy tờ vé chỗ ngồi của khách, kèm chữ status. |
-| Anh Cảnh Sát PostgreSQL MVCC | Người chụp ảnh tĩnh (snapshot) phát cho mấy thằng query đếm số nhìn. |
-| Thằng Lười Hibernate | Lôi từng cục entity nhả thành các lệnh INSERT rời rạc chả liên quan mẹ gì nhau. |
+| Allocator A | Đọc số lượng hiện tại và cấp phát slot `A-101`. |
+| Allocator B | Đọc số lượng hiện tại và cấp phát slot `B-202`. |
+| Bảng `processing_pool` | Lưu trữ cấu hình giới hạn (capacity). |
+| Bảng `slot_allocation` | Lưu các slot đã được cấp phát cùng trạng thái. |
+| PostgreSQL MVCC | Quản lý snapshot visibility cho các giao dịch. |
+| Hibernate | Thực thi các lệnh flush/insert riêng biệt. |
 
-Hiện trạng mồi lúc chưa cháy (Initial committed state):
-
-```text
-Bể chứa processing_pool(P-42): sức chứa tối đa=10
-Đang có: 9 tờ vé ACTIVE
-```
-
-Hiện trạng vỡ mồm sau thảm họa (Broken final state):
+Trạng thái ban đầu (Initial committed state):
 
 ```text
-A-101 = Báo Danh ACTIVE
-B-202 = Báo Danh ACTIVE
-Tổng số vé ACTIVE hiện đang cầm: 11
-CẢ HAI thằng lách qua cửa và đinh ninh mình làm đúng (ACCEPTED)
+processing_pool(P-42): capacity=10
+slot_allocation: 9 dòng ACTIVE
 ```
 
-## 3. Khung Giao Dịch & Khúc Cua Tử Thần (Transaction boundary và contention point)
-
-Mỗi lần gọi `allocate()` là chui qua cái máy quét của Spring Proxy:
+Trạng thái bị lỗi cuối cùng (Broken final state):
 
 ```text
-MỞ CỬA BƯỚC VÀO (BEGIN)
-  NGÓ XEM sức chứa tối đa là bao nhiêu?
-  ĐẾM XEM có bao nhiêu vé (COUNT(*)) ở bể P-42 đang ACTIVE?
-  Đập bàn: Ờ, còn dư 1 ghế kìa tụi bây!
-  MÓC BÚT KÝ 1 vé ACTIVE mới nhét vô! (INSERT)
-ĐÓNG CỬA ĐI RA (COMMIT)
+A-101 = ACTIVE
+B-202 = ACTIVE
+Tổng số dòng ACTIVE: 11
+Cả hai request đều ghi nhận là ACCEPTED.
 ```
 
-Quá trình Dính Liền Nát Bét (Non-atomic sequence):
+## Ranh giới giao dịch và điểm tranh chấp (Transaction boundary và contention point)
+
+Service method `allocate()` thực thi trong một Spring proxy transaction:
 
 ```text
-ngó đếm 1 đống -> bốc đếm số đó so sánh giới hạn -> nhét thêm 1 thằng mới vô cái đống đó
+BEGIN
+  Đọc capacity của pool
+  COUNT(*) các dòng ACTIVE của pool
+  So sánh COUNT < capacity
+  INSERT dòng allocation mới
+COMMIT
 ```
 
-Khúc Cua Tử Thần (Contention point) Ở Đây ĐÉO PHẢI LÀ CÁI MÃ SỐ VÉ. Nó là cái Lưới Điều Kiện Lọc (predicate):
+Vấn đề ở đây là trình tự read-then-write này không có tính nguyên tử (non-atomic). Điểm tranh chấp (contention point) không phải là khóa chính (primary key) của dòng cấp phát mới, mà là điều kiện lọc (predicate):
 
 ```text
-tất cả những dòng nào thuộc pool_id=P-42 và có chữ status=ACTIVE
+pool_id=P-42 and status=ACTIVE
 ```
 
-A chèn thẻ `A-101`, B chèn thẻ `B-202`; Bọn Rào Chắn Unique Key không hề chửi nhau xíu nào. Kể cả hàm ĐẾM (Plain COUNT) bình thường cũng đéo có chức năng Dành Trước chỗ ngồi!
+Bởi vì A insert `A-101` và B insert `B-202`, các ràng buộc khóa duy nhất (unique constraints) không hề bị xung đột. Và câu lệnh `COUNT` thông thường không hề tạo ra bất kỳ khóa (lock) nào để giữ chỗ.
 
-## 4. Thế Trận của Các Lớp Đọc (`READ COMMITTED` và `REPEATABLE READ`)
+## Hành vi theo các mức độ cô lập (Isolation levels)
 
-| Lớp Cách Ly (Isolation) | Giao Dịch Đọc Lại Liền Thì Ra Sao? | Đua Tranh Dành Chỗ Cắn Nhau Ra Sao (Capacity race) |
+| Mức cô lập (Isolation) | Hành vi khi đọc lại (Read behavior) | Xung đột kiểm tra giới hạn (Capacity race) |
 | --- | --- | --- |
-| Dễ Dãi `READ COMMITTED` | Đứa khác chốt sổ rồi là Mày THẤY liền thêm dòng ma (visible phantom) | Hai thằng cùng mù quáng đếm được `9`, cùng Nhét và cùng Chốt Sổ! |
-| Cứng Hơn Chút `REPEATABLE READ` | Cảnh sát đưa cho Mày đúng cái ảnh cũ, mày vẫn ĐẾM ra `9` suốt! | Vẫn không sao! Thằng nào nhét dòng của thằng nấy, cuối trận vẫn ra `11`! |
-| Trùm Cuối `SERIALIZABLE` | Mắt thần SSI soi luôn cả 2 thằng dẫm đạp lên điều kiện tìm kiếm. | Một thằng sẽ bị Đạp Vào Mặt (abort) với lỗi `40001`; Ứng dụng phải Tự Vác Mặt Qua Xin Chạy Lại (retry). |
+| `READ COMMITTED` | Có thể thấy dòng mới (visible phantom) khi giao dịch khác đã commit. | Hai giao dịch cùng đếm ra `9` và cùng commit thành công. |
+| `REPEATABLE READ` | Snapshot ổn định, đọc lại vẫn đếm ra `9`. | Vẫn cho phép cả hai commit, tạo ra `11` dòng. |
+| `SERIALIZABLE` | Phát hiện xung đột phụ thuộc (predicate dependency). | Sẽ hủy (abort) một giao dịch với mã lỗi `40001`; ứng dụng phải tự retry. |
 
-Anh PostgreSQL Cầm Bảng `REPEATABLE READ` Giúp Mày Không Bị Bóng Đè (không thấy dòng mới khi đếm lại liên tục), nhưng Cái Tờ Ảnh Cũ Đấy ĐÉO Tự Động Biến Thành Người Giữ Cửa bảo vệ Cái Giới Hạn Sức Chứa Gom Tụ Nhé (aggregate capacity invariant).
+Tính ổn định của `REPEATABLE READ` trong PostgreSQL chỉ giúp bạn không thấy dữ liệu thay đổi khi truy vấn nhiều lần trong cùng một giao dịch, nhưng nó **không** tự động bảo vệ điều kiện tổng quát (aggregate capacity invariant) khi bạn ghi thêm dữ liệu mới.
 
-## 5. Hiện Thực Đắng Cay Lệch Hẳn Kỳ Vọng (Expected và actual)
+## Kỳ vọng và Thực tế (Expected và actual)
 
-| Bước Đi | Khách A | Khách B | Kết Cục Máu Mủ (Final) |
+| Bước | Allocator A | Allocator B | Kết quả cuối cùng (Final) |
 | --- | --- | --- | --- |
-| CÙNG ĐẾM SỐ | 9 | 9 | |
-| PHÁN QUYẾT TỰ SƯỚNG | LÊN XE | LÊN XE | |
-| NHÉT DÒNG XUỐNG DB | `A-101` | `B-202` | |
-| KẾT CỤC TOANG HOÁC | Chốt Sổ (commit) | Chốt Sổ (commit) | Dư Xe Tới 11 Thằng! |
-| KẾT CỤC MƠ ƯỚC | 1 Thằng Lên Xe | 1 Thằng Bị Đạp Xuống Trạm | Vừa Y 10 Thằng. |
+| Đếm số (COUNT) | 9 | 9 | |
+| Quyết định | ACCEPT | ACCEPT | |
+| Chèn dữ liệu (INSERT) | `A-101` | `B-202` | |
+| Cập nhật DB | Commit | Commit | Đếm lại: 11 |
+| KỲ VỌNG | Cấp phát thành công | Bị từ chối (FULL) | Đếm lại: 10 |
 
-## 6. Sổ Tay Nhập Môn Để Tránh Chết Oan (Thuật ngữ cần biết)
+## Thuật ngữ cần biết
 
-| Chữ Nghĩa | Giải Nghĩa Tiếng Người |
+| Thuật ngữ | Giải thích |
 | --- | --- |
-| Dòng Bóng Ma (phantom row) | Con số đếm bất thình lình lòi thêm 1 dòng khi thằng khác chốt sổ mà ban đầu mình không thấy. |
-| Luật Sinh Tử Tập Hợp (predicate invariant) | Cái luật cấm áp lên 1 đám đông dựa theo điều kiện lọc cụ thể, chứ không phải một mình 1 dòng. |
-| Nhìn Xong Mới Sờ (check-then-insert) | Đếm trước 1 cục dữ liệu rồi rớ tay vào sửa thêm bằng cái Trí Nhớ có khi đã Lỗi Thời Chết Tiệt rồi (stale). |
-| Bức Ảnh Tĩnh (stable snapshot) | Trạng thái thế giới "Đông Đá" đứng yên mà Giao Dịch nhìn thấy khi chạy `REPEATABLE READ`. |
-| Gắn Bó Mật Thiết Từng Vùng (predicate dependency) | Dính lứu Ghi/Đọc Dẫm Đạp Nhau trên hẳn 1 Khu Vực, không chỉ 1 Dòng cụ thể. |
-| Kính Lúp SSI | Hàng Xịn Serializable Snapshot Isolation bảo vệ Giao Dịch Trùm của nhà PostgreSQL. |
-| Thảm Họa Đạp Nhau Ở Cấp Trùm (serialization failure) | Trạng thái 1 Lệnh bị Phản Đòn Bể Mặt Giao Dịch, Ọi Ra Lỗi `40001`. |
-| Bộ Đếm Độc Tôn (authoritative counter) | Một Ô Kẻ Cột Nhỏ Xíu Đếm Cộng Trừ ngay trên DB cho Sạch Sẽ (atomic) chứ đéo phải đếm Từng Đứa. |
+| Phantom row | Một dòng dữ liệu xuất hiện hoặc biến mất khi truy vấn cùng một điều kiện trong một giao dịch. |
+| Predicate invariant | Điều kiện đúng sai áp dụng trên một tập hợp các dòng dựa trên điều kiện lọc (chứ không phải 1 dòng cụ thể). |
+| Check-then-insert | Anti-pattern: kiểm tra trạng thái rồi mới chèn dữ liệu, dễ bị sai lệch nếu trạng thái thay đổi ở giữa. |
+| Stable snapshot | Trạng thái dữ liệu nhất quán được nhìn thấy bởi giao dịch `REPEATABLE READ`. |
+| Predicate dependency | Sự phụ thuộc read/write trên một tập hợp các dòng thỏa mãn điều kiện nhất định. |
+| SSI | Serializable Snapshot Isolation, cơ chế PostgreSQL dùng để đảm bảo mức `SERIALIZABLE`. |
+| Serialization failure | Lỗi khi PostgreSQL hủy một giao dịch để tránh sai lệch dữ liệu (mã lỗi `40001`). |
+| Authoritative counter | Biến đếm được cập nhật một cách nguyên tử tại database thay vì đếm số dòng. |
 
-## 7. Hành Trình Tham Khảo Bản Đồ Sống Còn (Điều hướng)
+## Điều hướng
 
-- [Code Vỡ Nát Lúc Đếm Xong Nhét (Broken count-then-insert)](broken-code.md)
-- [Bóc Phốt Bóng Ma Dưới Lăng Kính Phóng Phóng Sự DB (MVCC and predicate analysis)](analysis.md)
-- [Đơn Thuốc Chữa Bằng Atomic Counter Lẫn Khóa Mẹ-Con Phủ Đầu (Atomic counter, parent lock and serializable solutions)](solutions.md)
-- [Buộc Tội Tại Hiện Trường Có Bày Bin Cảnh Báo (Deterministic PostgreSQL experiments)](experiments.md)
-- [Gia Phả MVCC Của PostgreSQL](../../concepts/postgresql-mvcc.md)
-- [Hàng Rào Lớp Cách Ly Giao Dịch](../../concepts/isolation-levels.md)
-- [Biết Code Concurrent Thì Test Nó Đi!](../../concepts/concurrency-testing.md)
+- [Mã nguồn gây lỗi do count-then-insert (Broken code)](broken-code.md)
+- [Phân tích MVCC và điều kiện lọc (MVCC and predicate analysis)](analysis.md)
+- [Giải pháp dùng bộ đếm nguyên tử, khóa cha và Serializable (Solutions)](solutions.md)
+- [Các bài kiểm thử tái hiện trên PostgreSQL (PostgreSQL experiments)](experiments.md)
+- [PostgreSQL MVCC](../../concepts/postgresql-mvcc.md)
+- [Các mức độ cô lập giao dịch (Isolation levels)](../../concepts/isolation-levels.md)
+- [Kiểm thử tương tranh (Concurrency testing)](../../concepts/concurrency-testing.md)
 
-## 8. Sập Hầm Chết Cười Ngoài Thực Tế (Hậu quả production)
+## Hậu quả trên môi trường Production
 
-- Cái Bể Nhận Gánh Đồ Hút Tải Gấp Mấy Lần Thực Lực Thiết Kế, Nổ Memory, Cháy CPU, Rụi Tài Nguyên.
-- Cả Hai Cu Gọi Lệnh Đều Nghĩ Mình Ngon Trúng Giải Độc Đắc, Chả Có Thằng Nào Báo Bể Kèo, Thế Mới Khốn.
-- Lên Bảng Dashboard (Dashboard count) Số Hiện Quá Ngưỡng (vượt quá 10) Mặc Dù Từng Tờ Vé Trong Đó Hoàn Toàn Xanh Đẹp Đều Hợp Lệ Cả!!!
-- Cái Rào Unique ID Chả Có Ích Mẹ Gì Hết Đâu Để Đỡ Được Quả Trục Trặc Tập Hợp Này Nhé.
-- Xoạc Ngang Tăng Máy Chạy App Lên (Tăng application instances) Chỉ Làm Cái Cửa Tử Thần Dễ Cho Bọn Nó Lọt Xuống Nhanh Thêm Thôi.
-- Kêu Mấy Chú Vào Rửa Tay Hốt Rác (Manual cleanup) Bóp Chết Lầm Thẻ Người Chơi Hoặc Trừ Kép Thêm Nát (double-decrement counter).
-- Thấy Lỗi Mà Gọi Cứu Nháp (Retry) Bù Trù Làm Đẻ Thêm Nhiều Dòng Mới Rác Nếu Bạn Code Mù Idempotent Chưa Chuẩn.
+- Vượt quá sức chứa thực tế, có thể gây quá tải bộ nhớ, CPU hoặc làm cạn kiệt tài nguyên của hệ thống xử lý bên dưới.
+- Cả hai request đều nhận được kết quả thành công, không bên nào biết để tự xử lý lỗi.
+- Giao diện Dashboard hiển thị số lượng vượt mức tối đa dù từng request đơn lẻ đều hợp lệ.
+- Constraints dạng `UNIQUE` không giúp ích được gì trong trường hợp vi phạm tập hợp (aggregate) này.
+- Khi tăng số lượng instance của ứng dụng (scale out), lỗi này càng dễ xảy ra do số lượng giao dịch đồng thời tăng lên.
+- Xóa thủ công dữ liệu rác dễ dẫn đến lỗi trừ kép (double-decrement) nếu bộ đếm không được thiết kế kỹ.
+- Logic tự động retry sai cách có thể tạo thêm các dòng rác nếu không đảm bảo tính toàn vẹn (idempotency).
 
-## 9. Cẩm Nang Cứu Mạng Xử Lý Ổ Rác Khuyên Dùng (Hướng sửa khuyến nghị)
+## Hướng sửa chữa khuyến nghị
 
-Chọn Cách Ép Buộc Cho Cái Sức Chứa Này Có Xác Có Hồn (capacity hữu hình) Ngay Đi:
+Biến kiểm tra giới hạn sức chứa thành một rào cản có thể gây ra xung đột rõ ràng ở tầng database:
 
-1. **Ông Nội Phán Quyết Kép Lệnh:** Có Một Dòng Giữ Cửa Sinh Sinh Sự Tồn Tại, Dùng Tính Bơm Kép Cọng Trừ Bộ Đếm (atomic conditional counter update) Xong Nhét Ticket (insert allocation) Trực Tiếp Vô Trong 1 Lệnh Giao Dịch.
-2. Nếu Ám Ảnh Ghét Đếm Tạm Counter, Tóm Cổ Luôn Cái Ông Quản Lý Bể (lock parent) Bằng Cái Lệnh Móc Họng `FOR UPDATE`, Ngồi Đó Từ Từ Đếm RỒI Mới Chèn Vô; Mọi Đứa Nào Viết (writer) Bắt Buộc Đánh Xe Đi Theo Cái Cửa Đó.
-3. Biết Chắc Chắn Số Ghe Ngồi Có Hạn (finite slots), Rải Sẵn Tất Cả Vé Trống Lên (pre-create slot rows) Rồi Chỉ Việc Mò Lấy Cục `FOR UPDATE SKIP LOCKED` Giựt Từng Dòng, Nhẹ Não!
-4. Nếu Lưới Bộ Lọc Quá Loằng Ngoằng Hóc Búa Éo Gôm 1 Dòng Kịp, Xài Trùm `SERIALIZABLE` Và Viết Cái Luật Cầm Kim Bơm Uống Lại Chạy Lại Chặt Cứng (bounded full-transaction retry).
+1. **Cập nhật bộ đếm nguyên tử (Atomic conditional counter):** Thêm một biến đếm `used_slots` ở bảng cha (`processing_pool`) và sử dụng lệnh UPDATE kèm điều kiện để giành slot, thực hiện cùng transaction với lệnh chèn dữ liệu.
+2. **Khóa dòng cha (Lock parent):** Dùng lệnh `SELECT ... FOR UPDATE` trên bảng cha (pool) trước khi thực hiện COUNT. Mọi giao dịch muốn cấp phát phải đi qua nút thắt này.
+3. **Tạo sẵn slot trống (Pre-create slot rows):** Nếu số lượng slot là nhỏ và cố định, hãy chèn sẵn các dòng trống. Dùng `FOR UPDATE SKIP LOCKED` để cấp phát slot an toàn.
+4. **Sử dụng SERIALIZABLE:** Nếu điều kiện đếm quá phức tạp để áp dụng các cách trên, hãy cấu hình giao dịch ở mức `SERIALIZABLE` và bổ sung logic tự động retry (bounded retry) tại ứng dụng khi gặp lỗi `40001`.
 
-Rào Trấn Unique Mệnh Lệnh (Unique request constraint) Bắt Buộc Giữ Dùng Kè Để Ép Cái Thằng Call Gọi Trùng Điển Mệnh, Nhưng Nhớ Nó Là 1 Cái Vị Trí Khác Gắn Khác Cái Nghĩa Sức Chứa Này Nhé!
+**Lưu ý:** Ràng buộc tính duy nhất (Unique request constraint) vẫn cần thiết để tránh trùng lặp cùng một yêu cầu, nhưng nó giải quyết bài toán khác, không thay thế được kiểm tra giới hạn.
 
-## 10. Khoanh Vùng Vấn Đề Này Sâu Tới Đâu (Phạm vi)
+## Phạm vi của vấn đề
 
-Case Nghiên Cứu Lần Này Sài Vỏ Giả Lập Một Cái Trạm Bể Xử Lý Chung Kéo Với Một Cục Lưới Điều Kiện Sức Chứa (predicate capacity). Chuyện Đặt Phòng Khách Sạn Gây Hấn Semantics (Hotel/room) Quăng Qua Kho `BOOK-001` Giải Quyết. Đâm Lệnh Trái Chiều Cong Veo Quán Tính (Write skew) Dính Vào Bộ Gọi Ca Trực Chạy Qua Trạm `DB-005` Chặt Nhé.
-
+Tài liệu này tập trung vào bài toán cấp phát dùng chung (generic single-pool capacity) và các lỗi xung đột trên một tập hợp dữ liệu (predicate capacity).
+- Các bài toán cấp phát slot cụ thể có trạng thái riêng rẽ (như phòng khách sạn) sẽ được phân tích ở `BOOK-001`.
+- Lỗi write skew ảnh hưởng đến logic định tuyến sẽ được phân tích ở `DB-005`.

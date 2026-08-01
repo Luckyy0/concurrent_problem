@@ -2,15 +2,11 @@
 
 ## Chiến lược
 
-Dùng latch để buộc hai worker giữ lock đầu tiên trước khi cùng xin lock thứ hai.
-`ThreadMXBean.findDeadlockedThreads()` xác nhận wait-for cycle trên
-`ReentrantLock`. Harness dùng `lockInterruptibly` để test có thể cancel và cleanup;
-không tạo intrinsic-lock deadlock làm rò platform thread trong test JVM.
+Dùng latch để buộc hai tiến trình xử lý (worker) giữ lock đầu tiên trước khi cùng xin lock thứ hai. Gọi `ThreadMXBean.findDeadlockedThreads()` để xác nhận wait-for cycle trên `ReentrantLock`. Trình kiểm thử (harness) dùng `lockInterruptibly` để kiểm tra khả năng hủy và dọn dẹp; không tạo intrinsic-lock deadlock làm rò rỉ platform thread trong JVM kiểm thử.
 
-Không dùng `Thread.sleep`; mọi latch/future có timeout. Xem
-[Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
+Không dùng `Thread.sleep`; mọi latch và future đều có timeout. Xem [Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
 
-## Experiment 1: tạo và phát hiện cycle deterministic
+## Thử nghiệm 1: tạo và phát hiện chu trình tất định
 
 ```java
 package com.example.transfer;
@@ -100,14 +96,11 @@ class OppositeLockOrderDeadlockTest {
 }
 ```
 
-`findDeadlockedThreads` nhận cả ownable synchronizers; `findMonitorDeadlockedThreads`
-chỉ tìm intrinsic monitor cycle. `cancel(true)` hoạt động vì harness chờ bằng
-`lockInterruptibly`; production broken code dùng `lock()` có thể không thoát.
+`findDeadlockedThreads` nhận cả ownable synchronizers; `findMonitorDeadlockedThreads` chỉ tìm chu trình monitor intrinsic. Lệnh `cancel(true)` hoạt động vì trình kiểm thử chờ bằng `lockInterruptibly`; code bị lỗi trên production dùng `lock()` có thể không thoát.
 
-> **Nói ngắn gọn:** test vừa chứng minh cycle tồn tại, vừa chủ động phá cycle để
-> test suite không giữ thread chết sau khi assertion kết thúc.
+> **Nói ngắn gọn:** kiểm thử vừa chứng minh chu trình tồn tại, vừa chủ động phá chu trình để bộ kiểm thử (test suite) không giữ thread chết sau khi quá trình xác nhận kết quả (assertion) kết thúc.
 
-## Experiment 2: regression test cho deterministic ordering
+## Thử nghiệm 2: kiểm thử thoái lui (regression test) cho định hướng tất định
 
 ```java
 @Test
@@ -149,53 +142,46 @@ private static void awaitUnchecked(CountDownLatch latch) {
 }
 ```
 
-Snippet dùng imports trước và static `assertEquals`. Bounded future timeout là
-outer watchdog: nếu ordering regression tái tạo deadlock, test fail thay vì treo.
-Assertion conservation bổ sung cho progress assertion.
+Đoạn mã dùng import trước và static `assertEquals`. Bounded future timeout đóng vai trò bộ canh gác (watchdog) bên ngoài: nếu thoái lui tái tạo deadlock, bài kiểm thử sẽ thất bại thay vì bị treo. Việc xác nhận bảo toàn dữ liệu (assertion conservation) bổ sung cho việc kiểm tra tính tiến triển.
 
-## Experiment 3: timed acquisition release lock đầu
+## Thử nghiệm 3: giới hạn thời gian acquire và release lock đầu tiên
 
-Giữ second lock ở một helper thread, gọi `transferWithin` với deadline ngắn rồi
-assert method trả `false`. Sau đó main/helper khác phải acquire được first lock,
-chứng minh failure path đã release. Cũng cần test interrupt trong lúc chờ:
+Giữ lock thứ hai ở một thread hỗ trợ (helper thread), gọi `transferWithin` với thời hạn ngắn rồi kiểm tra xem hàm có trả về `false` không. Sau đó, thread chính hoặc một helper khác phải acquire được lock thứ nhất, chứng minh luồng lỗi đã release lock. Cũng cần kiểm tra ngắt (interrupt) trong lúc chờ:
 
-- method ném `TransferInterruptedException`;
-- interrupt flag của worker được giữ;
-- cả first/second lock đều không còn thuộc worker;
-- không balance nào thay đổi.
+- Hàm ném ra `TransferInterruptedException`;
+- Cờ ngắt (interrupt flag) của worker được giữ;
+- Cả lock thứ nhất và thứ hai đều không còn thuộc worker;
+- Không balance nào bị thay đổi.
 
-Không dùng millisecond duration như bằng chứng duy nhất; latch xác nhận blocker đã
-giữ lock trước khi bắt đầu attempt, future timeout làm watchdog.
+Không dùng khoảng thời gian tính bằng mili giây làm bằng chứng duy nhất; latch xác nhận yếu tố chặn (blocker) đã giữ lock trước khi bắt đầu lượt thử, future timeout đóng vai trò watchdog.
 
-## Stress và property checks
+## Kiểm thử tải (Stress test) và kiểm thử thuộc tính
 
-Sinh nhiều transfer hai chiều trên nhiều account, luôn assert:
+Sinh nhiều thao tác chuyển hai chiều trên nhiều account, luôn kiểm tra:
 
-- mọi future hoàn tất trong operation deadline;
-- tổng balance được bảo toàn;
-- balance không âm nếu domain cấm overdraft;
-- `ThreadMXBean.findDeadlockedThreads()` không chứa worker của test;
-- retry count bị giới hạn.
+- Mọi future hoàn tất trong thời hạn thao tác;
+- Tổng balance được bảo toàn;
+- Balance không âm nếu quy tắc nghiệp vụ cấm thấu chi (overdraft);
+- `ThreadMXBean.findDeadlockedThreads()` không chứa worker của bộ kiểm thử;
+- Số lượt thử lại (retry count) bị giới hạn.
 
-Stress tăng độ phủ nhưng không thay deterministic cycle/regression tests.
+Kiểm thử tải làm tăng độ phủ nhưng không thay thế được các kiểm thử thoái lui và chu trình tất định.
 
-## Xác minh production
+## Xác minh trên production
 
-- Chụp thread dump khi request latency/active thread tăng.
-- Chạy detector định kỳ với tần suất thấp, alert và lưu `ThreadInfo`/stack cho IDs.
-- Metric: lock acquisition duration/timeout, critical-section duration, retry và
-  operation deadline exceeded.
-- Log canonical first/second account ID và correlation ID, không log balance nhạy
-  cảm nếu policy cấm.
-- Phân biệt JVM detector với PostgreSQL deadlock SQLSTATE/log.
+- Chụp thread dump khi độ trễ yêu cầu hoặc số lượng active thread tăng.
+- Chạy detector định kỳ với tần suất thấp, cảnh báo và lưu `ThreadInfo` cũng như stack trace cho các ID.
+- Số liệu (Metric): thời gian acquire lock, timeout, thời gian chạy critical-section, số lượt thử lại và số yêu cầu vượt thời hạn.
+- Ghi log account ID thứ nhất và thứ hai theo thứ tự chuẩn cùng correlation ID, không ghi log balance nhạy cảm nếu chính sách cấm.
+- Phân biệt bộ phát hiện (detector) của JVM với deadlock SQLSTATE và log của PostgreSQL.
 
 ## Checklist
 
-- [ ] Broken test tạo cycle bằng latch, không bằng sleep.
-- [ ] Detector phù hợp `ReentrantLock` được dùng.
-- [ ] Deadlocked workers được cancel/cleanup.
-- [ ] Fixed test chạy hai hướng transfer và có bounded future wait.
-- [ ] Progress và balance conservation đều được assert.
-- [ ] Timeout/interrupt path release lock đã giữ.
-- [ ] Retry có deadline/attempt cap.
-- [ ] Production diagnostics lưu owner/waiter stack.
+- [ ] Kiểm thử lỗi (Broken test) tạo chu trình bằng latch, không bằng lệnh sleep.
+- [ ] Dùng đúng detector phù hợp với `ReentrantLock`.
+- [ ] Các worker bị deadlocked được hủy và dọn dẹp.
+- [ ] Kiểm thử sửa lỗi (Fixed test) chạy hai hướng chuyển và giới hạn thời gian chờ future.
+- [ ] Tiến trình và bảo toàn balance đều được xác nhận kết quả (assert).
+- [ ] Luồng ngắt hoặc timeout thực hiện release lock đã giữ.
+- [ ] Thử lại có thời hạn và giới hạn số lượt (attempt cap).
+- [ ] Chẩn đoán trên production lưu trữ owner và waiter stack.

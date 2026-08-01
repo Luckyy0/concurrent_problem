@@ -1,16 +1,16 @@
-# Giải pháp atomic claim, owner token và lease recovery
+# Giải pháp lấy việc nguyên tử, thẻ định danh quyền sở hữu và phục hồi thời hạn thuê
 
 ## Mục tiêu thiết kế
 
-Chúng ta cần thiết lập ranh giới rõ ràng giữa ba bước: Lấy việc (Claim), Xử lý (Process), và Hoàn thành (Complete):
+Chúng ta cần thiết lập ranh giới rõ ràng giữa ba bước: Lấy việc, Xử lý, và Hoàn thành:
 
 ```text
-Transaction Claim → COMMIT → Xử lý tác vụ bên ngoài → Transaction Complete
+Transaction lấy việc → commit → Xử lý tác vụ bên ngoài → Transaction hoàn thành
 ```
 
-Tuyệt đối không giữ kết nối cơ sở dữ liệu hoặc khóa dòng (row lock) trong khi xử lý tác vụ bên ngoài. Trạng thái của hàng đợi phải được thiết kế để chấp nhận việc xử lý ít nhất một lần (at-least-once) và từ chối những worker đã quá hạn (stale owner).
+Tuyệt đối không giữ kết nối database hoặc khóa dòng trong khi xử lý tác vụ bên ngoài. Trạng thái của hàng đợi phải được thiết kế để chấp nhận việc xử lý ít nhất một lần và từ chối những tiến trình đã quá hạn.
 
-## Giải pháp 1 — Atomic batch claim bằng CTE
+## Giải pháp 1 — Lấy lô công việc nguyên tử bằng CTE
 
 ### DTO
 
@@ -54,7 +54,7 @@ returning j.job_id,
           j.attempt_count;
 ```
 
-Cần đảm bảo thứ tự `ORDER BY` mang tính tất định (deterministic) và sử dụng partial index để tối ưu:
+Cần đảm bảo thứ tự `ORDER BY` mang tính tất định và sử dụng index một phần để tối ưu:
 
 ```sql
 create index ix_work_job_claim
@@ -62,9 +62,9 @@ create index ix_work_job_claim
     where status = 'READY';
 ```
 
-Bạn luôn phải kiểm chứng tính hiệu quả của chỉ mục (index usefulness) thông qua dữ liệu và query plan thực tế (production-like); không nên khiên cưỡng ép buộc query plan chỉ vì muốn tạo ra một hình thái khóa (lock shape) theo ý thích.
+Bạn luôn phải kiểm chứng tính hiệu quả của index thông qua dữ liệu và kế hoạch thực thi truy vấn thực tế; không nên khiên cưỡng ép buộc kế hoạch thực thi chỉ vì muốn tạo ra một hình thái khóa theo ý thích.
 
-### Claimer dùng JDBC cho `UPDATE RETURNING`
+### Sử dụng JDBC cho `UPDATE RETURNING`
 
 ```java
 @Repository
@@ -129,11 +129,11 @@ public class JobClaimService {
 }
 ```
 
-Caller (tiến trình gọi hàm) chỉ được phép nhận danh sách công việc sau khi proxy đã thực thi commit xong. Cấu hình `REQUIRES_NEW` là rất hợp lý ở đây vì quá trình lấy việc (polling root) không phụ thuộc vào bất kỳ giao dịch nào bên ngoài. Nếu caller vô tình chạy bên trong một giao dịch lớn hơn, kiến trúc này sẽ bảo vệ và giữ cho giao dịch lấy việc luôn độc lập.
+Phía gọi chỉ được phép nhận danh sách công việc sau khi proxy đã thực thi commit xong. Cấu hình `REQUIRES_NEW` là rất hợp lý ở đây vì quá trình lấy việc không phụ thuộc vào bất kỳ transaction nào bên ngoài. Nếu phía gọi vô tình chạy bên trong một transaction lớn hơn, kiến trúc này sẽ bảo vệ và giữ cho transaction lấy việc luôn độc lập.
 
-> **Nói ngắn gọn:** Chúng ta dùng duy nhất một câu lệnh SQL để chọn, khóa và đổi chủ sở hữu của dòng dữ liệu; sau đó transaction bắt buộc phải commit trước khi công việc này được mang ra khỏi phạm vi bảo vệ của cơ sở dữ liệu.
+> **Nói ngắn gọn:** Chúng ta dùng duy nhất một câu lệnh SQL để chọn, khóa và đổi chủ sở hữu của dòng dữ liệu; sau đó transaction bắt buộc phải commit trước khi công việc này được mang ra khỏi phạm vi bảo vệ của database.
 
-## Giải pháp 2 — Processor ngoài transaction
+## Giải pháp 2 — Xử lý bên ngoài transaction
 
 ```java
 @Component
@@ -183,11 +183,11 @@ public class JobWorker {
 }
 ```
 
-Thành phần `processor` sẽ xử lý dựa trên một idempotency key ổn định được sinh ra từ `jobId`. Ví dụ trên mô phỏng việc xử lý tuần tự trong một lần lấy việc; ở thực tế, bạn có thể đẩy lô công việc này vào một luồng xử lý song song (bounded executor) nhưng nhớ là không được vượt quá năng lực của connection pool hay các dịch vụ đích.
+Thành phần xử lý sẽ dựa trên một khóa lũy đẳng ổn định được sinh ra từ `jobId`. Ví dụ trên mô phỏng việc xử lý tuần tự trong một lần lấy việc; ở thực tế, bạn có thể đẩy lô công việc này vào một luồng xử lý song song nhưng nhớ là không được vượt quá năng lực của connection pool hay các dịch vụ đích.
 
-Quy tắc quan trọng: Không được lấy số lượng công việc nhiều hơn sức mà worker có thể bắt đầu xử lý trước khi thời hạn thuê (lease) cạn kiệt. Nếu thời gian xử lý biến động mạnh, hãy thu nhỏ kích thước batch, hoặc chỉ lấy việc khi worker đang thực sự rảnh, hoặc phải thiết kế thêm cơ chế bắn "heartbeat" để gia hạn token. Nếu không, những công việc nằm ở cuối lô có thể sẽ bị hệ thống thu hồi (reclaim) trước cả khi worker kịp đụng tới.
+Quy tắc quan trọng: Không được lấy số lượng công việc nhiều hơn sức mà tiến trình có thể bắt đầu xử lý trước khi thời hạn thuê cạn kiệt. Nếu thời gian xử lý biến động mạnh, hãy thu nhỏ kích thước lô, hoặc chỉ lấy việc khi tiến trình đang thực sự rảnh, hoặc phải thiết kế thêm cơ chế gửi tín hiệu để gia hạn thẻ định danh. Nếu không, những công việc nằm ở cuối lô có thể sẽ bị hệ thống thu hồi trước cả khi tiến trình kịp đụng tới.
 
-## Complete/fail conditional theo token
+## Hoàn thành hoặc thất bại có điều kiện theo thẻ định danh
 
 ```java
 public interface WorkJobRepository extends JpaRepository<WorkJob, UUID> {
@@ -234,11 +234,11 @@ public void complete(UUID jobId, UUID token) {
 }
 ```
 
-Cả `retryLater` và `deadLetter` cũng phải kiểm tra số dòng bị ảnh hưởng (affected-row) tương tự như hoàn thành. Thời gian chờ (backoff) nên được tính toán dựa trên số lần đã thử; `30 seconds` trong SQL trên chỉ mang tính minh họa.
+Cả `retryLater` và `deadLetter` cũng phải kiểm tra số dòng bị ảnh hưởng tương tự như hoàn thành. Thời gian chờ nên được tính toán dựa trên số lần đã thử; `30 seconds` trong SQL trên chỉ mang tính minh họa.
 
-## Lease recovery
+## Phục hồi thời hạn thuê
 
-Tiến trình Sweeper sẽ quét và tự động lấy lại các công việc quá hạn:
+Tiến trình quét sẽ tự động lấy lại các công việc quá hạn:
 
 ```sql
 with expired as (
@@ -265,8 +265,8 @@ where j.job_id = e.job_id
 returning j.job_id, j.status;
 ```
 
-Nhiều tiến trình sweeper có thể cùng chạy song song; nhờ `SKIP LOCKED`, chúng sẽ tự chia nhau các dòng hết hạn. Token cũ sẽ tự khắc mất hiệu lực.
-Nếu bạn cần cơ chế "heartbeat" cho các công việc dài hơi, hãy dùng truy vấn sau:
+Nhiều tiến trình quét có thể cùng chạy song song; nhờ `SKIP LOCKED`, chúng sẽ tự chia nhau các dòng hết hạn. Thẻ định danh cũ sẽ tự khắc mất hiệu lực.
+Nếu bạn cần cơ chế duy trì tín hiệu cho các công việc dài hơi, hãy dùng truy vấn sau:
 
 ```sql
 update work_job
@@ -277,22 +277,22 @@ where job_id = :job_id
   and lease_until >= clock_timestamp();
 ```
 
-Nếu trả về affected-row `0` nghĩa là quyền sở hữu đã mất; worker cần phải lập tức dừng công việc đang làm dở (nếu có thể).
+Nếu trả về số dòng bị ảnh hưởng là `0` nghĩa là quyền sở hữu đã mất; tiến trình cần phải lập tức dừng công việc đang làm dở (nếu có thể).
 
-## Empty poll và backpressure
+## Kết quả lấy rỗng và kiểm soát luồng
 
-Khi kết quả trả về lô trống (batch rỗng), điều đó không chứng minh rằng hàng đợi đã hết việc; có thể các dòng đó đang bị khóa bởi người khác hoặc chưa đến thời điểm `available_at`. Do đó, worker cần có thời gian chờ linh hoạt (bounded polling delay) bằng cơ chế jitter hoặc adaptive backoff.
-Luôn phải có cơ chế kiểm soát giới hạn (Admission control):
+Khi kết quả trả về lô rỗng, điều đó không chứng minh rằng hàng đợi đã hết việc; có thể các dòng đó đang bị khóa bởi người khác hoặc chưa đến thời điểm `available_at`. Do đó, tiến trình cần có thời gian chờ linh hoạt.
+Luôn phải có cơ chế kiểm soát giới hạn:
 
-- Giới hạn số lượng worker cùng lấy việc.
+- Giới hạn số lượng tiến trình cùng lấy việc.
 - Giới hạn kích thước lô công việc.
 - Giới hạn số lượng yêu cầu gọi dịch vụ bên ngoài đang chờ xử lý.
-- Có hạn mức (quota) theo từng loại công việc hoặc người dùng.
-- Giới hạn tổng số kết nối cơ sở dữ liệu.
+- Có hạn mức theo từng loại công việc hoặc người dùng.
+- Giới hạn tổng số kết nối database.
 
-Tuyệt đối không chạy vòng lặp liên tục (busy-loop) với `SKIP LOCKED` khi toàn bộ hàng đợi đang bận rộn.
+Tuyệt đối không chạy vòng lặp liên tục với `SKIP LOCKED` khi toàn bộ hàng đợi đang bận rộn.
 
-## Fairness policy
+## Chính sách công bằng
 
 Thứ tự ưu tiên cơ bản:
 
@@ -300,63 +300,63 @@ Thứ tự ưu tiên cơ bản:
 order by priority desc, available_at, job_id
 ```
 
-Nếu bạn không thể chấp nhận việc các công việc độ ưu tiên thấp bị "chết đói" (starvation), hãy áp dụng kỹ thuật aging:
+Nếu bạn không thể chấp nhận việc các công việc độ ưu tiên thấp bị chết đói, hãy áp dụng kỹ thuật tính độ ưu tiên theo thời gian chờ:
 
 ```text
-độ ưu tiên thực tế (effective priority) = độ ưu tiên cơ bản + giới hạn cộng thêm theo thời gian chờ
+độ ưu tiên thực tế = độ ưu tiên cơ bản + giới hạn cộng thêm theo thời gian chờ
 ```
 
-Hoặc cách khác là chia tách các hàng đợi riêng biệt/dành ra các worker dự phòng. Mọi chính sách phải đi kèm với việc xem xét chỉ mục và query plan, đồng thời theo dõi độ tuổi công việc chờ lâu nhất (oldest age) cho từng phân khúc; bạn không thể đòi hỏi một thứ tự strict FIFO tuyệt đối khi đã sử dụng `SKIP LOCKED`.
+Hoặc cách khác là chia tách các hàng đợi riêng biệt/dành ra các tiến trình dự phòng. Mọi chính sách phải đi kèm với việc xem xét index và kế hoạch thực thi truy vấn, đồng thời theo dõi độ tuổi công việc chờ lâu nhất cho từng phân khúc; bạn không thể đòi hỏi một thứ tự vào trước ra trước tuyệt đối khi đã sử dụng `SKIP LOCKED`.
 
-## Failure behavior
+## Hành vi khi gặp lỗi
 
-| Tình huống | Cách worker xử lý |
+| Tình huống | Cách tiến trình xử lý |
 | --- | --- |
-| Kết quả lấy việc trả về rỗng | Áp dụng thời gian chờ (backoff); không vội kết luận hàng đợi trống |
+| Kết quả lấy việc trả về rỗng | Áp dụng thời gian chờ; không vội kết luận hàng đợi trống |
 | Transaction lấy việc bị rollback | Không xử lý các đối tượng được trả về |
-| Dịch vụ bên ngoài lỗi (retryable) | Cập nhật lại hàng đợi kèm token và thời gian chờ (backoff) |
-| Lỗi vĩnh viễn hoặc hết số lần thử | Đánh dấu DEAD kèm token |
-| Thời hạn thuê (lease) cạn kiệt | Tiến trình Sweeper sẽ thu hồi hoặc đánh dấu DEAD |
-| Hoàn thành trễ (stale complete) | affected-row trả về `0`, không ghi đè trạng thái |
-| Hệ thống sập sau khi đã gọi dịch vụ | Giao lại việc (redelivery); hệ thống đích tự chống trùng lặp |
-| Gặp deadlock `40P01` hoặc timeout | Rollback transaction ngắn này; thử lại theo chính sách an toàn |
+| Dịch vụ bên ngoài lỗi (có thể thử lại) | Cập nhật lại hàng đợi kèm thẻ định danh và thời gian chờ |
+| Lỗi vĩnh viễn hoặc hết số lần thử | Đánh dấu DEAD kèm thẻ định danh |
+| Thời hạn thuê cạn kiệt | Tiến trình quét sẽ thu hồi hoặc đánh dấu DEAD |
+| Hoàn thành trễ | số dòng bị ảnh hưởng trả về `0`, không ghi đè trạng thái |
+| Hệ thống gặp sự cố sau khi đã gọi dịch vụ | Giao lại việc; hệ thống đích tự chống trùng lặp |
+| Gặp deadlock `40P01` hoặc hết giờ | Rollback transaction ngắn này; thử lại theo chính sách an toàn |
 
 ## Các phương án khác
 
 ### `FOR UPDATE` không skip
 
-Chỉ nên dùng khi yêu cầu thứ tự nghiêm ngặt (strict ordering) quan trọng hơn hiệu suất tổng thể, và thời gian chờ được giới hạn chặt chẽ. Nó không hề phù hợp nếu bạn có số lượng lớn các công việc hoàn toàn độc lập với nhau.
+Chỉ nên dùng khi yêu cầu thứ tự nghiêm ngặt quan trọng hơn hiệu suất tổng thể, và thời gian chờ được giới hạn chặt chẽ. Nó không hề phù hợp nếu bạn có số lượng lớn các công việc hoàn toàn độc lập với nhau.
 
-### Atomic `UPDATE ... WHERE status='READY'`
+### `UPDATE ... WHERE status='READY'` nguyên tử
 
-Việc lấy một công việc khi đã biết chính xác ID thông qua điều kiện `affected-row` là cực kỳ tốt. Nhưng đối với bài toán "cho tôi N công việc tiếp theo", CTE kết hợp `SKIP LOCKED` là cách tốt nhất để giải quyết bài toán lựa chọn và chiếm quyền sở hữu (selection + ownership) ngay trong lòng cơ sở dữ liệu.
+Việc lấy một công việc khi đã biết chính xác ID thông qua điều kiện số dòng bị ảnh hưởng là cực kỳ tốt. Nhưng đối với bài toán "cho tôi N công việc tiếp theo", CTE kết hợp `SKIP LOCKED` là cách tốt nhất để giải quyết bài toán lựa chọn và chiếm quyền sở hữu ngay trong lòng database.
 
 ### Advisory lock
 
-Giải pháp này đòi hỏi một giao thức quản lý riêng (protocol key, unlock, crash complexity) và bắt buộc mọi client phải tuân thủ nghiêm ngặt; trong khi đó, trạng thái, thẻ token và thời hạn thuê (lease) vẫn là điều bắt buộc. Do đó, nó không mang lại sự gọn nhẹ cho bài toán lấy công việc như cách làm ở trên.
+Giải pháp này đòi hỏi một giao thức quản lý riêng và bắt buộc mọi client phải tuân thủ nghiêm ngặt; trong khi đó, trạng thái, thẻ định danh và thời hạn thuê vẫn là điều bắt buộc. Do đó, nó không mang lại sự gọn nhẹ cho bài toán lấy công việc như cách làm ở trên.
 
-### Message broker
+### Hệ thống truyền thông điệp
 
-Các hệ thống chuyên biệt như Kafka, RabbitMQ, SQS cung cấp khả năng lưu trữ (retention), điều phối (backpressure) và hỗ trợ phân nhóm tiêu thụ dữ liệu (consumer groups) rất hoàn hảo. Tuy nhiên, nếu bạn vẫn phải thực thi các tác vụ gọi ra ngoài (side effects) từ database, bạn vẫn sẽ cần đến các cơ chế idempotency hoặc outbox pattern. Hãy chọn giải pháp dựa trên mô hình xử lý lỗi (failure model) của hệ thống, chứ đừng từ bỏ database chỉ vì sợ `SKIP LOCKED` "không scale vô hạn".
+Các hệ thống chuyên biệt như Kafka, RabbitMQ, SQS cung cấp khả năng lưu trữ, điều phối và hỗ trợ phân nhóm tiêu thụ dữ liệu rất hoàn hảo. Tuy nhiên, nếu bạn vẫn phải thực thi các tác vụ gọi ra ngoài từ database, bạn vẫn sẽ cần đến các cơ chế tính lũy đẳng hoặc outbox pattern. Hãy chọn giải pháp dựa trên mô hình xử lý lỗi của hệ thống, chứ đừng từ bỏ database chỉ vì sợ `SKIP LOCKED` không mở rộng vô hạn.
 
 ## So sánh trade-off
 
-| Phương pháp | Chống lấy trùng (Duplicate claim) | Thông lượng / Độ trễ | Công bằng (Fairness) | Phục hồi sự cố | Vận hành | Hỗ trợ nhiều máy chủ |
+| Phương pháp | Chống lấy trùng lặp | Thông lượng / Độ trễ | Sự công bằng | Phục hồi sự cố | Vận hành | Hỗ trợ nhiều máy chủ |
 | --- | --- | --- | --- | --- | --- | --- |
-| CTE `SKIP LOCKED` kèm token/lease | Ngăn chặn trực tiếp qua transaction | Chạy song song, transaction ngắn | Tương đối (Best-effort) | Dùng sweeper | Mức trung bình | Tốt |
-| Blocking `FOR UPDATE` | Ngăn chặn qua transaction | Xếp hàng chờ, tắc nghẽn | Gần với thứ tự gốc | Vẫn cần status/lease | Đơn giản | Tốt |
-| Plain SELECT | Không thể ngăn chặn | Nhanh nhưng sai lệch dữ liệu | Không đáng tin cậy | Không có | Rất thấp | Rủi ro cao |
-| Conditional UPDATE theo ID biết trước | Dùng affected-row để bảo vệ | Tốt nếu đã biết trước ID | Caller tự quyết định | Vẫn cần lease | Thấp | Tốt |
-| Message Broker | Dựa trên cơ chế của broker | Khả năng scale mạnh mẽ nhất | Phụ thuộc vào phân vùng (partition) | Gọi lại, gửi vào DLQ | Phức tạp (Cao) | Rất tốt |
+| CTE `SKIP LOCKED` kèm token/lease | Ngăn chặn trực tiếp qua transaction | Chạy song song, transaction ngắn | Tương đối | Dùng tiến trình quét | Mức trung bình | Tốt |
+| `FOR UPDATE` | Ngăn chặn qua transaction | Xếp hàng chờ, tắc nghẽn | Gần với thứ tự gốc | Vẫn cần status/lease | Đơn giản | Tốt |
+| `SELECT` thông thường | Không thể ngăn chặn | Nhanh nhưng sai lệch dữ liệu | Không đáng tin cậy | Không có | Rất thấp | Rủi ro cao |
+| `UPDATE` có điều kiện theo ID biết trước | Dùng số dòng bị ảnh hưởng để bảo vệ | Tốt nếu đã biết trước ID | Phía gọi tự quyết định | Vẫn cần lease | Thấp | Tốt |
+| Message Broker | Dựa trên cơ chế của broker | Khả năng mở rộng mạnh mẽ nhất | Phụ thuộc vào phân vùng | Gọi lại, gửi vào DLQ | Phức tạp | Rất tốt |
 
-## Checklist trước production
+## Danh sách kiểm tra trước production
 
-- [ ] Lệnh SQL lấy việc (claim SQL) có điều kiện rõ ràng, `ORDER BY` mang tính tất định, có `LIMIT` và kết hợp với partial index phù hợp.
-- [ ] Việc lấy việc phải được COMMIT trót lọt TRƯỚC KHI bắt đầu xử lý tác vụ bên ngoài.
-- [ ] Các thao tác báo hoàn thành/báo lỗi/gia hạn (heartbeat) đều phải kiểm tra thẻ token hiện tại.
-- [ ] Phải quy định rõ thời hạn thuê (lease expiry), số lần thử tối đa và cơ chế xử lý DEAD.
-- [ ] Hệ thống bên ngoài (downstream) xử lý chống trùng lặp dựa trên khóa tác vụ (stable job/effect ID).
-- [ ] Áp dụng thời gian chờ (jitter/backoff) nếu kết quả lấy việc rỗng; phải có trần giới hạn số lượng worker chạy đồng thời.
-- [ ] Có hệ thống cảnh báo (alert) cho các công việc chờ lâu (oldest READY/PROCESSING age) và lỗi hoàn thành trễ (stale completion).
-- [ ] Dù đã dùng skip lock, vẫn cần có giới hạn thời gian (timeout/coordination) đề phòng các thao tác DDL hoặc khóa bảng.
-- [ ] Có các kịch bản Testcontainers chứng minh được việc lấy việc độc lập (disjoint claims), không bị tắc nghẽn, tính năng bỏ qua (skip) và chặn worker quá hạn.
+- [ ] Lệnh SQL lấy việc có điều kiện rõ ràng, `ORDER BY` mang tính tất định, có `LIMIT` và kết hợp với index một phần phù hợp.
+- [ ] Việc lấy việc phải được commit trót lọt TRƯỚC KHI bắt đầu xử lý tác vụ bên ngoài.
+- [ ] Các thao tác báo hoàn thành/báo lỗi/gia hạn đều phải kiểm tra thẻ định danh hiện tại.
+- [ ] Phải quy định rõ thời hạn thuê, số lần thử tối đa và cơ chế xử lý DEAD.
+- [ ] Hệ thống bên ngoài xử lý chống trùng lặp dựa trên khóa tác vụ.
+- [ ] Áp dụng thời gian chờ nếu kết quả lấy việc rỗng; phải có trần giới hạn số lượng tiến trình chạy đồng thời.
+- [ ] Có hệ thống cảnh báo cho các công việc chờ lâu và lỗi hoàn thành trễ.
+- [ ] Dù đã dùng skip lock, vẫn cần có giới hạn thời gian đề phòng các thao tác cấu trúc dữ liệu hoặc khóa bảng.
+- [ ] Có các kịch bản Testcontainers chứng minh được việc lấy việc độc lập, không bị tắc nghẽn, tính năng bỏ qua và chặn tiến trình quá hạn.

@@ -1,22 +1,20 @@
-# Mở Phòng Thí Nghiệm: Ép Trẻ Trâu Kẹt Xe Và Bắt Lỗi (Các thí nghiệm PostgreSQL deadlock có điều phối)
+# Thực Nghiệm: Tái Hiện Deadlock Trong PostgreSQL (Controlled deadlock experiments)
 
-## 1. Mục Tiêu Tối Thượng (Mục tiêu)
+## 1. Mục tiêu thử nghiệm (Objectives)
 
-Bộ Lắp Ráp Test (Experiment suite) phải chứng minh được Cả Sự An Toàn Lẫn Tiến Độ Trơn Tru:
+Bộ kiểm thử tương tranh (Concurrency test suite) cần chứng minh được tính an toàn và hiệu suất hệ thống thông qua các tiêu chí:
 
-1. Bày Trận ÉP ĐƯỢC CHẮC CHẮN cái Vòng Luẩn Quẩn Kẹt Xe (wait-for cycle) Bằng Đúng 2 cái Giao Dịch Đồ Thật Của PostgreSQL;
-2. Phải Đích Xác Có Đúng 1 Kẻ Chết Thay Lãnh Đạn `40P01`, Và Kẻ Đó Phải Nằm Im Đợi Dọn Dẹp Ở Trạng Thái Chết Chìm `25P02`;
-3. Cái Tiền Vừa Trừ Lố Của Kẻ Chết Thay Lập Tức Bị Vứt Đi (rollback), Và Tổng Số Tiền Ở 2 Ví Vẫn Không Đổi 1 Xu;
-4. Chứng minh được Luật Xếp Hàng Theo Chuẩn (canonical order) Cho Phép 2 Thằng Đi Ngược Chiều Băng Qua Đường Trót Lọt;
-5. Đã Làm Lại (retry) Thì Phải Mở Giao Dịch Mới Tinh, Cấm Có Lấy Cái Cũ Ra Khè;
-6. Vạch Chân Tướng Rõ Ràng Cho Tụi Nó Thấy Lỗi Kẹt Xe Đánh Nhau Khác Hoàn Toàn Lỗi Chờ Dài Cổ (`55P03` lock timeout);
-7. Mọi Cuộc Chờ Đợi Từ Code Tới CSDL Đều Phải Bọc Đồng Hồ Đếm Giờ Chống Treo Máy (timeout).
+1. Thiết lập chính xác một tình huống chờ vòng tròn (wait-for cycle) dẫn đến deadlock thông qua sự tương tác giữa hai giao dịch PostgreSQL thực tế.
+2. Đảm bảo hệ thống xác định chính xác một giao dịch nạn nhân (victim), nhận ngoại lệ `40P01` và rơi vào trạng thái `25P02`.
+3. Khẳng định số tiền thay đổi của giao dịch nạn nhân sẽ bị khôi phục (rollback), bảo toàn nguyên vẹn tổng số dư tài khoản.
+4. Chứng minh giải pháp áp dụng trật tự khóa chuẩn (canonical order) cho phép cả hai luồng tương tác an toàn.
+5. Kiểm chứng cơ chế thử lại (retry) bắt buộc sử dụng một giao dịch cơ sở dữ liệu (database transaction) hoàn toàn mới.
+6. Phân biệt rõ ràng lỗi deadlock (`40P01`) và lỗi vượt quá thời gian chờ khóa (`55P03` - lock timeout).
+7. Áp dụng giới hạn thời gian thực thi (timeout) trên các lệnh chờ của cơ sở dữ liệu và mã nguồn Java để tránh tình trạng treo hệ thống.
 
-Tuyệt Đối Không Lấy Thằng Đồ Chơi H2 ra Múa Rìu Qua Mắt Thợ Để Phán Xét Thằng Giám Thị (detector) Của PostgreSQL. Cũng Không Xài Cái Trò Đoán Mò Mò Bằng Thời Gian Căn Ke Code Chạy Tới Đâu; Mà Phải Dựng Hàng Rào Chặn (barrier) Ngay Trực Tiếp Sau Cục Khóa Dòng Số 1.
+Việc sử dụng các cơ sở dữ liệu in-memory như H2 không đáp ứng được yêu cầu đánh giá chính xác hành vi của trình phát hiện deadlock (deadlock detector) trong PostgreSQL. Các bài kiểm thử này phải sử dụng cơ chế điều phối luồng đồng bộ (synchronization barriers) ngay sau lệnh cấp khóa đầu tiên thay vì dùng `Thread.sleep` mang tính xác suất.
 
-> **Nói ngắn gọn:** Viết Test Trình Độ Cao đéo phải chỉ là ngồi cầu nguyện chờ nó văng Lỗi (exception); Em Phải TỰ TAY DỰNG LÊN CÁI BẪY KẸT XE, Tự Bấm Đếm Quá Trình Dọn Rác (rollback), Rồi Dòm Lại Mớ Tiền Có Bị Lủng Hay Không Sau Khi Mọi Thằng Xung Đột Đã Cút Hết Ra Khỏi Khung Hình.
-
-## 2. Bàn Chơi Testcontainers Đồ Thật (Môi trường PostgreSQL Testcontainers)
+## 2. Thiết lập Môi trường Testcontainers (PostgreSQL Testcontainers setup)
 
 ```java
 package example.transfer;
@@ -101,9 +99,9 @@ class PostgreSqlDeadlockIT {
 }
 ```
 
-Trong Buổi Chơi Này, Sếp Cho Phép Em Thụt Cái Giờ Giám Thị Khám (`deadlock_timeout`) Xuống Thật Thấp Để Thấy Kịch Bản Xảy Ra Tức Thì Chứ Không Phải Chờ Dài Cổ. Lên Đấu Trường Thật (Production) MÀ CẮM ĐẦU COPY PASTE CÁI CẤU HÌNH RÁC NÀY MÀ ĐÉO ĐO ĐẠC GÌ THÌ COI CHỪNG BỊ ĐUỔI VIỆC NHÉ.
+Để tối ưu thời gian thực thi trong môi trường test, giá trị `deadlock_timeout` được thiết lập ở mức thấp. Việc áp dụng cấu hình này vào môi trường sản xuất (Production) cần phải xem xét cẩn thận dựa trên đặc điểm phân bổ tài nguyên.
 
-## 3. Thằng Vệ Sĩ Canh Cửa (Helper điều phối)
+## 3. Tiện ích Điều phối luồng (Synchronization helper)
 
 ```java
 private static void await(
@@ -112,21 +110,21 @@ private static void await(
 ) {
     try {
         if (!latch.await(5, TimeUnit.SECONDS)) {
-            throw new AssertionError("Hết giờ rồi con trai: " + description);
+            throw new AssertionError("Vượt quá thời gian chờ: " + description);
         }
     } catch (InterruptedException interrupted) {
         Thread.currentThread().interrupt();
-        throw new AssertionError("Bị đứt gánh giữa đường: " + description, interrupted);
+        throw new AssertionError("Luồng bị ngắt khi chờ: " + description, interrupted);
     }
 }
 ```
 
-Tất cả đống Lệnh `Future` bên dưới bắt buộc phải nhét Hẹn Giờ `get(timeout)`. Lỡ Code Em Viết Bị Thủng Bể, Nó Trở Thành Vòng Đợi Bất Tử (wait vô hạn), Thì Test Sẽ Nổ Tung Báo Lỗi Ngay Lập Tức Bằng Chẩn Đoán Dễ Đọc (diagnostic fail), Chứ Đéo Có Chuyện Treo Nguyên Cái Máy Chủ CI Của Đội Lên Đâu.
+Tất cả các đối tượng `Future` cần đi kèm với phương thức `get(timeout)` nhằm ngăn chặn tình trạng chờ vô hạn (infinite wait) trong trường hợp có lỗi luồng. Điều này đảm bảo CI/CD pipeline không bị treo khi kiểm thử thất bại.
 
-## 4. Cuộc Thí Nghiệm Đầu Tiên — Dựng Hiện Trường Kẹt Xe Và Bắt Tại Trận Việc Dọn Rác (Thí nghiệm 1)
+## 4. Thực nghiệm 1 — Tái hiện Deadlock và Xác minh Rollback
 
-Mỗi Thằng Lính Sẽ Lao Vào Trừ Tiền Của Đứa Chuyển (debit source) Ngay Sau Khi Ăn Được Ổ Khóa Số 1, Xong ĐỨNG HÁ MỎ DỪNG LẠI TẠI HÀNG RÀO CHẶN (barrier). Đến Khi Thấy Cả 2 Thằng Đều Đã Nắm Cục Khóa Đầu Tiên Trong Tay, Ta Bấm Nút Cho Cả 2 Cùng Phi Ra Tranh Ổ Khóa Thứ 2 (destination row).
-Lúc Này, 1 Thằng Chắc Chắn Sẽ Nằm Xuống Làm Kẻ Chết Thay; Số Tiền Nó Vừa Trừ (partial debit) PHẢI LẬP TỨC BAY MÀU (rollback).
+Thử nghiệm giả lập trường hợp hai luồng thực hiện thao tác trên tài khoản nguồn sau khi được cấp khóa dòng đầu tiên, sau đó tiếp tục yêu cầu khóa tài khoản đích.
+Lệnh `CountDownLatch` điều phối hai tiến trình cùng tiến vào giai đoạn yêu cầu khóa thứ hai, ép buộc xảy ra deadlock. Giao dịch bị chọn làm nạn nhân (victim) phải thực hiện rollback để đảo ngược trạng thái số dư tạm thời (partial debit).
 
 ```java
 record AttemptOutcome(
@@ -165,10 +163,10 @@ void oppositeOrderCreatesOneVictimAndRollsBackItsDebit() throws Exception {
             )
     );
 
-    // Chờ 2 anh tài túm được 2 Ổ khóa đầu tiên đã
+    // Chờ hai luồng được cấp khóa của tài khoản nguồn
     await(firstRowsLocked, "both source rows locked");
     
-    // Nã súng bóp còi cho 2 thằng tranh nhau chui vô hẻm hẹp
+    // Tiếp tục yêu cầu khóa tài khoản đích
     requestSecondRow.countDown();
 
     List<AttemptOutcome> outcomes = List.of(
@@ -176,7 +174,7 @@ void oppositeOrderCreatesOneVictimAndRollsBackItsDebit() throws Exception {
             t2.get(8, TimeUnit.SECONDS)
     );
 
-    // KIỂM TRA ĐẠO LÝ: Đúng 1 Kẻ Thắng (00000) - Và Đúng 1 Kẻ Chết (40P01)
+    // Đánh giá: Có duy nhất một giao dịch thành công (00000) và một giao dịch lỗi deadlock (40P01)
     assertThat(outcomes)
             .extracting(AttemptOutcome::sqlState)
             .containsExactlyInAnyOrder("00000", "40P01");
@@ -186,13 +184,13 @@ void oppositeOrderCreatesOneVictimAndRollsBackItsDebit() throws Exception {
             .findFirst()
             .orElseThrow();
             
-    // Bắt quả tang cái Xác Ướp Giao Dịch
+    // Kiểm tra trạng thái aborted của giao dịch nạn nhân
     assertThat(victim.stateBeforeRollback()).isEqualTo("25P02");
 
-    // Tiền chung phải Vẹn Nguyên Không Thiếu 1 Đồng
+    // Đảm bảo tổng số dư hai tài khoản không đổi
     assertThat(totalBalance()).isEqualByComparingTo("2000.00");
     
-    // Và Đúng Đứa Thắng Nào Nhét Tiền Vô Trước
+    // Xác minh kết quả dựa vào luồng thành công
     assertThat(readBalances()).satisfiesAnyOf(
             balances -> assertThat(balances)
                     .containsExactly("101=900.00", "202=1100.00"),
@@ -202,7 +200,7 @@ void oppositeOrderCreatesOneVictimAndRollsBackItsDebit() throws Exception {
 }
 ```
 
-Chi tiết bên trong Công Cụ Gây Án (Task implementation):
+Chi tiết triển khai (Task implementation):
 
 ```java
 private static AttemptOutcome brokenTransferAttempt(
@@ -213,7 +211,7 @@ private static AttemptOutcome brokenTransferAttempt(
         CountDownLatch requestSecondRow
 ) throws SQLException {
     try (Connection connection = open()) {
-        connection.setAutoCommit(false); // Cầm lái tay
+        connection.setAutoCommit(false); 
         configureDeadlockTestSession(connection);
 
         try {
@@ -221,14 +219,13 @@ private static AttemptOutcome brokenTransferAttempt(
             debit(connection, fromId, amount);
 
             firstRowsLocked.countDown();
-            await(requestSecondRow, "permission to lock destination"); // Ngựa Vằn Xếp Hàng Chờ Tiếng Còi
+            await(requestSecondRow, "permission to lock destination");
 
             lockRow(connection, toId);
             credit(connection, toId, amount);
             connection.commit();
             return AttemptOutcome.committed(fromId);
         } catch (SQLException failure) {
-            // Xem lúc Chết Dở cái Tình Trạng Là Mã Mẹ Gì 
             String failedTransactionState =
                     executeAndReturnSqlState(connection, "select 1");
             connection.rollback();
@@ -245,7 +242,7 @@ private static void configureDeadlockTestSession(
         Connection connection
 ) throws SQLException {
     try (Statement statement = connection.createStatement()) {
-        // Đồng hồ Báo Thức cho Kẹt Xe reo thật sớm (100ms)
+        // Cấu hình phát hiện deadlock nhanh cho môi trường test (100ms)
         statement.execute("set local deadlock_timeout = '100ms'");
         statement.execute("set local lock_timeout = '2s'");
         statement.execute("set local statement_timeout = '4s'");
@@ -322,11 +319,11 @@ private static String executeAndReturnSqlState(
 }
 ```
 
-Chiếc đồng hồ Đợi Bạc Đầu (`lock_timeout`) đang bự hơn hẳn Giám Thị Chờ Kẹt Xe (`deadlock_timeout`). Nhờ Vậy Thằng Giám Thị Kẹt Xe Mới Có Cửa Dành Vé Phóng Cái Lỗi Kẹo Đồng `40P01` Vào Mặt Thằng Code Trước Lúc Bị Hủy Vì Hết Giờ. Còn Cục Chặn Ngoài Cùng `Future.get(8, TimeUnit.SECONDS)` Chỉ Làm Trò Thằng Chó Giữ Nhà Ngoại Cảnh Đứng Phá Hư Nếu Dây Trói Vượt Ngưỡng.
+Việc thiết lập giá trị `lock_timeout` lớn hơn `deadlock_timeout` nhằm đảm bảo hệ thống có đủ thời gian ưu tiên ghi nhận lỗi deadlock (`40P01`) trước khi hết hạn thời gian chờ khóa. Các giới hạn timeout ở cấp luồng Java `Future.get(8, TimeUnit.SECONDS)` đóng vai trò giám sát tổng thể quá trình thực thi.
 
-## 5. Cuộc Thí Nghiệm 2 — Cho Code Đàng Hoàng Xếp Hàng Theo Chuẩn Lên Chạy (Thí nghiệm 2)
+## 5. Thực nghiệm 2 — Đánh giá Trật tự khóa chuẩn (Canonical Order)
 
-Nhét Bộ Chữa Cháy Thật Sự (Chạy Qua Bùa Spring Chứ Đéo Làm Bằng Tay Nữa):
+Kiểm chứng hành vi hệ thống sau khi áp dụng mô hình chuẩn:
 
 ```java
 @SpringBootTest
@@ -361,12 +358,12 @@ class OrderedTransferIT {
             return attempts.execute(bToA);
         });
 
-        // Hô Lên: Cả Hai Đứa Đồng Loạt Phi Ra!
+        // Kích hoạt thực thi đồng thời
         start.countDown();
         first.get(8, TimeUnit.SECONDS);
         second.get(8, TimeUnit.SECONDS);
 
-        // KẾT QUẢ ĐẸP NHƯ TRANH VẼ!
+        // Đảm bảo số dư được cập nhật và tổng tiền được bảo toàn
         assertThat(balance(101)).isEqualByComparingTo("970.00");
         assertThat(balance(202)).isEqualByComparingTo("1030.00");
         assertThat(totalBalance()).isEqualByComparingTo("2000.00");
@@ -374,11 +371,11 @@ class OrderedTransferIT {
 }
 ```
 
-Set Gắn Vô Đầu Giao Dịch Vài Cục Khóa Mốc Giờ Chờ Đợi trong File Test Profile Nhé. Test này Nã Khẩu Lệnh Gần Như Hệt Cái Cách Khách Nhấn Nút Trên Sân Thật.
+Kiểm thử này cung cấp một mô phỏng sát với thực tế, áp dụng chiến lược khóa đã đề xuất để đảm bảo độ tin cậy của ứng dụng khi gặp tranh chấp.
 
-## 6. Cuộc Thí Nghiệm 3 — Thử Thằng Tính Toán Xếp Hàng Chuẩn Nhỏ Gọn Nhất (Thí nghiệm 3)
+## 6. Thực nghiệm 3 — Đánh giá Logic Sắp xếp ID (ID Sorting)
 
-Tách riêng Hạt Nhân Não Bộ Sắp Xếp Trật Tự Vào 1 Cục Object Nhỏ Xíu:
+Tách biệt logic xác định trật tự tài nguyên:
 
 ```java
 record AccountLockOrder(long firstId, long secondId) {
@@ -387,7 +384,6 @@ record AccountLockOrder(long firstId, long secondId) {
         if (leftId == rightId) {
             throw new IllegalArgumentException("duplicate account");
         }
-        // BAO ĐẸP: Bé đứng trước, Lớn Đứng Sau, Éo Quan Tâm Thằng Nào Chuyển
         return leftId < rightId
                 ? new AccountLockOrder(leftId, rightId)
                 : new AccountLockOrder(rightId, leftId);
@@ -403,13 +399,11 @@ void directionDoesNotChangeLockOrder() {
 }
 ```
 
-Thằng Lính Service Phải Nhắm Mắt Cầm Đúng Cái Vật Phẩm Này Lên Xài (không được tự ý hì hục ngồi code lại lệnh lặt vặt như trò `min/max`).
+Cấu trúc trên thiết lập quy tắc bắt buộc để lấy ID tài nguyên cần khóa trước, bất kể đó là tài khoản chuyển (source) hay tài khoản nhận (destination).
 
-## 7. Cuộc Thí Nghiệm 4 — Người Chết Đội Mồ Sống Dậy Với Giao Dịch Tươi Mới (Thí nghiệm 4)
+## 7. Thực nghiệm 4 — Khởi tạo Giao dịch Mới khi Thử Lại (Retry Transaction)
 
-Test Thử Một Quả Làm Lại (Retry). Sếp xài Kỹ Thuật Đâm Code Ngoại Lai (test-only hook) Hệt Như Thằng Số 1 Ở Chỗ Chắn Vạch Khóa Đứa Thứ 1 Xong Mới Cho Lên Để Gây Án Ngay Lần Dạo Đầu (first attempts). Xong Rút Chốt Đó Đi Liền Tức Thì Để Thằng Đội Mồ Sống Lại (victim retry) Chạy Vượt Về Đích Êm Thấm.
-
-Thò Vào 1 Đoạn Ăn Cắp Xem Giao Dịch Số Mấy:
+Mô phỏng trường hợp lỗi trong lần chạy đầu tiên và đánh giá giao dịch thử lại:
 
 ```java
 long transactionId = jdbc.queryForObject(
@@ -419,7 +413,7 @@ long transactionId = jdbc.queryForObject(
 attemptProbe.record(command.commandId(), attemptNumber, transactionId);
 ```
 
-Và Ta Ngó Lại Sự Kiện:
+Kiểm thử hành vi xử lý:
 
 ```java
 start.countDown();
@@ -428,10 +422,10 @@ TransferReceipt secondReceipt = second.get(10, TimeUnit.SECONDS);
 
 assertThat(firstReceipt).isNotNull();
 assertThat(secondReceipt).isNotNull();
-assertThat(attemptProbe.totalAttempts()).isEqualTo(3); // Hai Đứa Đi Cùng -> Chết 1 Đứa -> Nó Đội Mồ 1 Phát Thành 3
+assertThat(attemptProbe.totalAttempts()).isEqualTo(3); 
 assertThat(attemptProbe.deadlockVictims()).isEqualTo(1);
 assertThat(attemptProbe.transactionIds())
-        .hasSize(3) // Tuyệt Đối Không Thằng Nào Trùng Mã Vạch Thằng Nào
+        .hasSize(3) 
         .doesNotHaveDuplicates(); 
 
 assertThat(totalBalance()).isEqualByComparingTo("2000.00");
@@ -439,12 +433,11 @@ assertThat(balance(101)).isEqualByComparingTo("970.00");
 assertThat(balance(202)).isEqualByComparingTo("1030.00");
 ```
 
-3 Cục Mã Giao Dịch Kia Là Tên Của: Thằng Sinh Ra Ở Vạch Đích Ở Phát Gọi Số 1, Kẻ Chết Thay Ở Phát Số 1, Và Tấm Thân Mới Tinh Tươm Của Đứa Chết Thay Đội Mồ Bật Lên Lần Sau. Chấm Hết!
+Quá trình này xác nhận hệ thống tạo ba giao dịch (Transaction ID) độc lập: giao dịch thành công đầu tiên, giao dịch nạn nhân và giao dịch mới khi thực hiện thử lại.
 
-## 8. Cuộc Thí Nghiệm 5 — Rụng Răng Chờ Lâu Đéo Phải Bị Kẹt Xe! (Thí nghiệm 5)
+## 8. Thực nghiệm 5 — Phân biệt Lỗi Quá hạn Chờ Khóa (Lock Timeout)
 
-Thằng Đại Ca Đứng Ngậm Cục Khóa Ví A; Một Thằng Culi Đứng Há Mỏ Đợi Cục Ví A Mà Chẳng Ôm Một Cục Rác Nào Trong Người MÀ Đại Ca Thèm Cả. Vòng Tròn Kẹt Xe ĐÉO HỀ CÓ (Graph không có cycle).
-Bắt Buộc Thằng Culi Phải Nhận Về Bãi Rác Báo Mã `55P03` Tức Lên Hết Hạn Giờ Chờ Khóa (`lock_timeout` hết hạn):
+Kiểm thử tình huống một chiều: một luồng giữ khóa A và một luồng khác chờ khóa A mà không gây tranh chấp chéo (circular wait). Do không có vòng lặp phụ thuộc, lỗi nhận được sẽ là `55P03` (lock timeout):
 
 ```java
 @Test
@@ -456,7 +449,7 @@ void oneWayWaitReturnsLockTimeoutNotDeadlock() throws Exception {
         try (Connection connection = open()) {
             connection.setAutoCommit(false);
             lockRow(connection, 101);
-            holderLocked.countDown(); // La Lên: LÃO ĐẠI ĐÃ NẮM VÍ A!
+            holderLocked.countDown(); 
             await(releaseHolder, "release lock holder");
             connection.commit();
         }
@@ -468,55 +461,53 @@ void oneWayWaitReturnsLockTimeoutNotDeadlock() throws Exception {
         try (Connection connection = open()) {
             connection.setAutoCommit(false);
             try (Statement statement = connection.createStatement()) {
-                // Nhỏ giọt đồng hồ lại để test cho lẹ nè
                 statement.execute("set local lock_timeout = '150ms'");
                 statement.execute("set local statement_timeout = '2s'");
             }
             try {
-                lockRow(connection, 101); // NHÀO VÔ XIN MÀ ĐÉO ĐƯỢC ĐÂU CON!
+                lockRow(connection, 101); 
                 connection.commit();
                 return "00000";
             } catch (SQLException failure) {
                 connection.rollback();
-                return failure.getSQLState(); // TAO TRẢ LẠI TỜ GIẤY TỬ THẦN ĐÂY!
+                return failure.getSQLState(); 
             }
         }
     });
 
-    // BAO ĐẸP: Kết quả thằng há mỏ ăn nguyên mã ĐỢI BẠC ĐẦU HẾT GIỜ 55P03
+    // Xác nhận lỗi là lock timeout (55P03), không phải deadlock (40P01)
     assertThat(waiter.get(5, TimeUnit.SECONDS)).isEqualTo("55P03");
     releaseHolder.countDown();
     holder.get(5, TimeUnit.SECONDS);
 }
 ```
 
-Nhân viên Kiểm Thẩm Định Bắt Lỗi Retry (Retry classifier) CẤM TUYỆT ĐỐI Gọi Nhầm Cái Đống 55P03 Thành `40P01` Nha! Luật Của Em Vẫn Có Thể Khoan Hồng Cho Chạy Lại Khi Lỗi Chờ Lâu (Retry lock timeout), Nhớ Là Chờ Lâu Vẫn Chỉ Là Dấu Hiệu Lười Động Não; Nên Lấy Chìa Khóa Kiểm Mã (idempotency/deadline) Ra Dùng.
+Ứng dụng không được nhầm lẫn mã `55P03` với `40P01`. Quá hạn khóa phản ánh sự chậm trễ hoặc khối lượng công việc tồn đọng (latency/contention), thay vì kiến trúc khóa đối kháng chéo. 
 
-## 9. Cuộc Thí Nghiệm 6 — Đứt Cáp Đột Ngột Tự Nhả Khóa Cho Đứa Sau Hút Máu (Thí nghiệm 6)
+## 9. Thực nghiệm 6 — Mất Kết Nối Đột Ngột Giải Phóng Khóa
 
-Lão Đại Ôm Khóa A. Cho Đệ Vào Há Mỏ Hút Máu Ngay Lập Tức Xin Lấy Khóa. Lấy Khẩu Súng Lục Lên, Lãnh Tụ Cắt Dây Mạng Bóp Mất Xác Lão Đại TRƯỚC Khi Chốt Sổ:
+Mô phỏng ngắt kết nối (simulate crash) của giao dịch đang giữ khóa để kiểm tra cơ chế giải phóng tài nguyên của PostgreSQL:
 
 ```text
-Cắt Dây Ống Thở Lão Đại (holder connection close)
-→ Thằng PostgreSQL Thấy Lão Đại Tử Ếo Xong Tuyên Án Quăng Rác Giao Dịch
-→ Vứt Bỏ Đi Cái Ổ Khóa Ví A (row A lock được release)
-→ Đứa Đệ Vớ Lấy Vàng Cắn Răng Hô Khóa A Và Kịp Chốt Sổ Ở Phút 89
+Tiến trình 1 bị đóng đột ngột (connection close).
+PostgreSQL tự động rollback giao dịch chưa được commit.
+Khóa bản ghi (row lock) được giải phóng.
+Tiến trình 2 nhận được khóa và hoàn thành giao dịch.
 ```
 
-Quá Tuyệt Vời Cục Diện:
+Kiểm tra kết quả:
 
 ```java
 assertThat(waiter.get(5, TimeUnit.SECONDS)).isEqualTo("ACQUIRED");
 assertThat(totalBalance()).isEqualByComparingTo("2000.00");
-// Trống vắng bóng người giao dịch, sạch sành sanh
 assertThat(countOpenTransactionsForTestUsers()).isZero();
 ```
 
-Trò Thử Này CHỈ KHẲNG ĐỊNH Việc DB Rất Mẫn Cán Rửa Tay Sạch Đẹp Vết Máu, CHỨ ĐÉO CHỨNG MINH ĐƯỢC cái Việc Cầm Code Dò Hỏi Kết Quả Nếu Đứt Mạng Lúc Cuối Trận Mập Mờ Nó Như Nào Nhé! (Vụ ambiguous outcome này đem test bên case nghiệp vụ riêng nha con trai).
+Trường hợp này chứng minh khả năng tự làm sạch (self-recovery) của CSDL. Tuy nhiên, nó cũng nhắc nhở về tầm quan trọng của việc kiểm tra trạng thái cập nhật (idempotency key/status) trong môi trường phân tán nếu có sự gián đoạn mạng bất ngờ.
 
-## 10. Cuộc Thí Nghiệm Cuối: Sờ Tận Tay Sơ Đồ Bị Chặn (Thí nghiệm 7)
+## 10. Thực nghiệm 7 — Truy xuất Thông tin Chặn Khóa từ PostgreSQL
 
-Kéo Đứng Thằng Chờ Trong Cái Mô Hình 1 Đứa Há Mỏ (one-way wait). Quét Lấy Số Phù Hiệu Người Háo Đợi `select pg_backend_pid()` RỒI SÚT CÂU HỎI TRỰC TIẾP TỪ THẰNG THEO DÕI:
+Thiết lập mô phỏng chặn một chiều (one-way wait), thu thập PID của tiến trình chờ thông qua `select pg_backend_pid()` và truy vấn trạng thái khóa hiện hành của PostgreSQL:
 
 ```sql
 select a.pid,
@@ -529,7 +520,7 @@ from pg_stat_activity a
 where a.pid = :waiter_pid;
 ```
 
-Em sẽ Dùng Công Cụ Quét Lặp Giới Hạn Giờ (bounded polling helper) Chứ ĐÉO ĐƯỢC Nhét Cục Đợi Mù Quáng Xuyên Thủng Vô Test:
+Cơ chế quét thông tin (polling) được sử dụng để truy vấn trạng thái:
 
 ```java
 static void awaitCondition(
@@ -545,17 +536,16 @@ static void awaitCondition(
                 Duration.ofMillis(10).toNanos()
         );
         if (Thread.currentThread().isInterrupted()) {
-            throw new AssertionError("Đang soi mà bị dứt cáp");
+            throw new AssertionError("Tiến trình kiểm tra bị gián đoạn");
         }
     }
-    throw new AssertionError("Không thấy bóng hình Kẻ Thù Trước Khi Đồng Hồ Đánh " + timeout);
+    throw new AssertionError("Yêu cầu không được thỏa mãn trong thời hạn " + timeout);
 }
 ```
 
-Nắm Tóc Cho Chắc: `wait_event_type = 'Lock'` VÀ TRONG BẢNG `blocking_pids` Hiện Rõ Rành Rành Số PID Của Lão Đại! Chờ Tụi Nó Đốt Xác Xong, Mọi Dấu Hiệu Phải Tiêu Tan Nhé (assert PID không còn chờ).
-Cái Bảng Dò Ráp Này Tranh Tối Tranh Sáng Đảo Liên Tục; Nên Nhớ NÓ CHỈ LÀ BẰNG CHỨNG HÌNH SỰ Cho Dev Ngồi Sửa Lỗi, KHÔNG PHẢI LÀ CÔNG TẮC ĐỂ THẰNG CODE NHẢY NHÓT SỬA LỖI ỨNG DỤNG BÊN TRONG!
+Kết quả mong đợi: `wait_event_type = 'Lock'` và mảng `blocking_pids` chứa PID của tiến trình giữ khóa. 
 
-## 11. Các Mẹo Vặt Móc Thông Tin (Helper đọc trạng thái)
+## 11. Các hàm hỗ trợ đọc dữ liệu (Helper methods)
 
 ```java
 private static BigDecimal totalBalance() throws SQLException {
@@ -590,32 +580,31 @@ private static List<String> readBalances() throws SQLException {
 }
 ```
 
-## 12. Bảng Tổng Hợp Chiến Trận Bao Phủ (Ma trận bao phủ)
+## 12. Ma trận các kịch bản kiểm thử (Test coverage matrix)
 
-| Màn Chơi Test | Máy Móc Sử Dụng | Câu Khẳng Định Lớn Nhất (Assertion) |
+| Thực nghiệm | Tình huống kỹ thuật | Xác nhận kết quả (Assertion) |
 | --- | --- | --- |
-| Màn 1 | Ngược Chiều Băng Qua 1 Cửa Chặn (Opposite row order + barrier) | Bắn Lỗi Chết Chùm `40P01`, Xác Nằm Đống `25P02`, Tiền Còn Nguyên `2000` |
-| Màn 2 | Lính Tráng Ngoan Ngoãn Đi Có Hàng Lối Qua Spring | Ghi Sổ Hoàn Đẹp Mắt A=`970`, B=`1030`, Tổng Không Thất Thoát `2000` |
-| Màn 3 | Não Nhỏ Cục Khóa Thuần Xếp Chuẩn | Bố Đảo Ngược Hướng Nó Vẫn Ói Ra Thứ Tự Cứng Như Đá `[101, 202]` |
-| Màn 4 | Đội Cứu Thương Retry Vác Ống Dò Tx Mới Vào Mồm | Hiện Rõ 3 Cái Đầu Giao Dịch, 1 Cái Xác Chết Thay, Chạy Đủ Cả 2 Thằng Vào Cửa Đích Cuối |
-| Màn 5 | Há Mỏ Chờ Tiếng Khóc Ở Bụi Cây (One-way row wait) | Văng Đúng Lỗi `55P03`, Cấm Gán Tội Cho Tụi Nó Đánh Nhau (deadlock) |
-| Màn 6 | Bóp Cổ Lão Đại Cắt Cáp Giữa Đường | Đệ Vượt Lên Chốt Hàng Mượt Mà, Không Có Xác Giao Dịch Rơi Vãi |
-| Màn 7 | Quét Sóng Rada Rình Sờ Cục Nghẽn Live | Ráp Nối Nắm Đuôi Áo Thằng Thằng Đợi Và Thằng Chặn Lên Nhãn `pg_blocking_pids` Thành Công Rực Rỡ |
+| 1 | Khóa chéo ngược chiều với điều phối | Ngoại lệ `40P01`, trạng thái aborted `25P02`, dữ liệu không thất thoát. |
+| 2 | Sắp xếp trình tự chuẩn thông qua Spring | Giao dịch hoàn thành không xung đột, số dư được cập nhật. |
+| 3 | Thuật toán sắp xếp khóa | Tính ổn định của Object lưu trữ trật tự. |
+| 4 | Chạy thử lại (Retry) với giao dịch mới | Giao dịch mới được tạo, không trùng Transaction ID. |
+| 5 | Chờ khóa lâu một chiều (Lock timeout) | Ngoại lệ `55P03`, không bị nhầm lẫn với deadlock. |
+| 6 | Đứt kết nối đột ngột của tiến trình giữ khóa | Giao dịch chờ tiếp tục thực thi và thành công, không để lại rác dữ liệu. |
+| 7 | Truy vấn giám sát tắc nghẽn PostgreSQL | Truy vết thành công qua hệ thống `pg_blocking_pids`. |
 
-## 13. Thuốc Lú Giúp Bộ Test Luôn Chắc Như Đá (Chống flaky)
+## 13. Khuyến nghị chống Flaky Test (Anti-flaky practices)
 
-- Ổ Khóa Rào Chắn bắt buộc Đặt Cắm Ngay Sau Phát Cắn Ổ Khóa Dòng Lần Đầu! Ngu Nghĩ Mà Đặt Bậy Ở Đầu Hàm Vào Giao Dịch.
-- Phải Đảm Bảo Cục Này Đúng Chuẩn Theo Trật Tự Lớn Lên: `deadlock_timeout` Nhỏ Hơn `lock_timeout` Và Dễ Dãi Hơn `statement_timeout` Nằm Cũi Nhỏ Hơn Cục Quản Trò `Future watchdog`!
-- ĐÉO BAO GIỜ Đi Cá Cược Chỉ Ra Số Má Cụ Thể "Thằng Này Chắc Chắn Mới Là Nạn Nhân Nhé".
-- Reset Tiền Rác Giữa Các Lượt Đánh Khác Nhau; Cấm Cái Tội Bật Chạy Tứ Tung Song Song Nhiều Thằng Chung 1 Quần Đảo DB Schema Dễ Nát Xác!
-- Hễ Nghe Chết Đứng Báo Lỗi Error Thì Phải Nhặt Xác Cắt Ống Trả Ổ Bằng Đồ Chơi Gói Gọn Dọn Dẹp try-with-resources.
-- Bắn Bỏ Toàn Bộ Thằng Kéo Luồng `executor` Chắc Ăn Ở Vòng Shutdown Rửa Sạch (`finally`/lifecycle) Bằng Chốt Hẹn Giờ Bắt Buộc Hủy.
-- Khi Cái Bộ Hẹn Giờ Quản Trò Ảo Tưởng Náo Loạn Kêu Oai Oái Vì Lỗi Không Mong (watchdog fail): NHỚ Dội Nguyên Đống Rác Thống Kê Dữ Liệu `pg_stat_activity`, `pg_locks` và Bảng Tội Phạm `pg_blocking_pids` TRƯỚC KHI BẤM NÚT QUÉT DỌN LÀM SẠCH VẾT TÍCH!
-- Kéo 1 Nghìn Thằng Kêu Khẩu Hiệu Ngược Chiều Băng Đường Test Liên Tục Nhìn Chơi Cũng Lòi Hạn Số (Stress test), Nhưng TUYỆT ĐỐI NÓ KHÔNG ĐỦ TUỔI MÀ THAY THẾ CHO CÁI TEST CHỈ RA TOÀN CHÂN TƯỚNG KẾT ÁN CHU TRÌNH RÕ RÀNG 100% Này Đâu Nhen Cưng!
+- Sử dụng cơ chế điều phối (Barrier) như Latch thay vì `Thread.sleep` để kiểm soát thứ tự thực thi.
+- Cài đặt giá trị `deadlock_timeout` nhỏ hơn `lock_timeout`, và cả hai đều phải nhỏ hơn `statement_timeout` và timeout của `Future`.
+- Làm sạch (reset) dữ liệu ở giữa các lần kiểm thử (test run) để ngăn chặn các tác động từ dữ liệu dư thừa.
+- Không gắn cứng định danh về giao dịch nào sẽ trở thành nạn nhân (victim).
+- Dọn dẹp an toàn các kết nối và lệnh thông qua cấu trúc `try-with-resources`.
+- Quản lý quá trình kết thúc luồng (shutdown executor) có kiểm soát để tránh tài nguyên tồn đọng.
+- Kiểm thử hành vi hệ quản trị cơ sở dữ liệu (RDBMS) không nên dùng in-memory databases (như H2).
 
-## 14. Vác Đi Đoán Lỗi Ở Chiến Trường Băng Giá (Xác minh trong production)
+## 14. Giám sát hệ thống thực tế (Production verification metrics)
 
-Ngồi Trực Soi Bảng:
+Truy vấn nhanh cơ sở dữ liệu:
 
 ```sql
 select datname, deadlocks
@@ -623,12 +612,12 @@ from pg_stat_database
 where datname = current_database();
 ```
 
-Và Mix Nó Cùng Bữa Tiệc Này Nhé:
+Các chỉ số phân tích bổ sung:
 
-- Các Máy Đo Nhịp Tim Code Xoay Quanh Cái Đầu Lệnh Này Thôi: Đánh Nhau Rớt Đầu (deadlock), La Kêu Cấp Cứu Mới (retry), Mòn Cổ Mất Sức (exhaustion) và Độ Lết Bộ Bánh Xe Chậm Nhịp Trễ Xíu Tí Tẹo Thôi Đâu (latency);
-- Chú Ý Mấy Cục Cuộn Log Hỏa Tốc Của PostgreSQL Quăng Graph Báo Lỗi Và Khung Hỏi Vặn Gây Án Ngay Cùng Chỗ Đó (query context);
-- Cột Chờ Khát Máu Rụng Răng Khi Giành Kẹo Chỗ Xin Connection Ở Hồ Nước Code App Lỗi (pool active/pending/acquisition timeout);
-- Đo Cục Tuổi Đời Thời Gian Treo Chờ Lác Mắt Và Dòng Cố Chạy Làm Bộ Ngủ Gật Trong Lệnh Code `idle in transaction`;
-- Kiểm Nhãn Gắn Phiên Bản App Kéo Lên Thùng Để Còn Soi Được Mặt Thằng Mới Nhét Cái Code Chưa Xếp Hàng Theo Chuẩn Đẩy Lên Trên Này.
+- Lỗi timeout chờ kết nối (connection pool pending/active).
+- Lỗi khóa quá thời hạn (`lock_timeout`).
+- Các giao dịch ở trạng thái treo (`idle in transaction`).
+- Chỉ báo về việc sử dụng retry cho mã lỗi `40P01` với số lượng giới hạn và backoff phù hợp.
+- Ghi nhận `deadlock_detected_total` theo các tác vụ định danh để cảnh báo tần suất vượt kiểm soát. 
 
-Cái Nút Bấm Đèn Còi Báo Động KHÔNG BAO GIỜ Bật Khùng Đính Chung Với Từng Số Thẻ Của Khách Bất Bất Ổn Lung Tung Đâu (high cardinality). Bật Lên Vì Phát Hiện Tần Xuất Đột Biến Giữa Trần Gian Tới Báo Cáo Thiệt Hại Thôi (rate/baseline và user impact). Khi Đã Tuyên Bố Bưng Code Đổ Bộ Ra Sản Phẩm Thực Dụng Rộng Rồi Đâu Mọi Vòng Đợi Quỷ Ám Luẩn Quẩn Đã Bị Vạch Mặt SẼ BIẾN MẤT VĨNH VIỄN KHÔNG ĐỂ LẠI DẤU VẾT GÌ VÀ NHỮNG VỤ ÉP PHẢI HY SINH CŨNG CHỈ CÒN ĐƯỢC TAY KHÔNG CHỚP MẮT TRONG MỘT NHỊP KIỂM SOÁT BẬT GỌI TỰ ĐỘNG THU DỌN SẠCH THU XẾP ỔN THỎA TRÒN RÕ TỊNH TIẾN QUY TẮC NHỮNG BẢO ĐẢM NỀN TẢNG TIỀN BẠC (invariant)!
+Triển khai quy tắc sắp xếp tài nguyên (Canonical ordering) một cách nhất quán sẽ ngăn chặn tận gốc hiện tượng chờ chéo vòng tròn này.

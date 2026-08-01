@@ -1,133 +1,52 @@
-# Kiểm thử đồng thời và xác minh trong môi trường thực tế
+# Môi Trường Thực Nghiệm: Phân Tích Và Đo Lường Cấu Trúc Khóa Đồng Thời
 
-## Chiến lược kiểm thử
+## 1. Chiến Lược Kiểm Thử Cốt Lõi (Core Strategy)
 
-Case phải trả lời riêng bốn câu hỏi:
+Quá trình thẩm định bắt buộc trả lời tường tận 4 khía cạnh:
+1. Xác minh Hai Khóa (Lock objects) Phân Biệt có Cự Tuyệt Hai Tác Nhân (Actors) cùng đột nhập hay không.
+2. Thẩm Định Hai Khóa Logic (Logical Keys) Bằng Trị Số nhưng Lệch Tham Chiếu có bị ép bám chung Một Ổ Khóa (Monitor) hay không.
+3. Khảo Sát Tính Năng Khóa Phân Dải (Striped Lock) bảo Vệ Mã Khóa Nội Bộ (Service Instance).
+4. Vạch Trần Giới Hạn của Khóa Nội Bộ khi Đa Nút Máy Chủ (Service Instances) chạm trán Kho Lưu Trữ Chung.
 
-1. hai lock object khác nhau có cho hai actor cùng vào không;
-2. hai logical key bằng nhau nhưng khác reference có dùng cùng monitor không;
-3. một stable striped lock có bảo vệ cùng key trong một service instance không;
-4. hai service instance có phá giả định local lock khi dùng chung store không.
+Triển khai Rào chắn Giả lập (Fake Store Latch) ngay sau lệnh `exists` nhằm ép 100% Actors vào thế Quan Sát Báo Cáo "Tài Khoản Rỗng" (Chưa Tồn Tại). Loại bỏ hoàn toàn Dấu Vết của `Thread.sleep`; Đóng Mọi Rào Chắn Latch/Future Bằng Bộ Giờ Đếm Ngược Timeout.
 
-Fake store dùng latch ngay sau `exists` để ép hai actor cùng quan sát “chưa có”.
-Mọi latch/future có timeout; không dùng `Thread.sleep`. Hướng dẫn nền nằm tại
-[Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
-
-## Experiment 1: lock mới mỗi call không serialize
+## 2. Thí Nghiệm 1: Trình Diễn Bế Tắc Khóa Lỗi Nhịp Mỗi Lần Gọi (Per-Call Locks)
 
 ```java
-package com.example.settlement;
+@Test
+void perCallLocksAllowDuplicateGeneration() throws Exception {
+    BarrierStore store = new BarrierStore(2); // Dựng Rào 2 Lớp
+    AtomicInteger renders = new AtomicInteger();
+    SettlementRenderer renderer = key -> {
+        renders.incrementAndGet();
+        return key.getBytes(StandardCharsets.UTF_8);
+    };
+    BrokenSettlementArtifactService service =
+            new BrokenSettlementArtifactService(store, renderer);
 
-import org.junit.jupiter.api.Test;
+    try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+        Future<ArtifactResult> first = executor.submit(() ->
+                service.generate("settlement/day-1.csv", Duration.ofSeconds(5)));
+        Future<ArtifactResult> second = executor.submit(() ->
+                service.generate("settlement/day-1.csv", Duration.ofSeconds(5)));
 
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-
-class BrokenSettlementArtifactServiceTest {
-
-    @Test
-    void perCallLocksAllowDuplicateGeneration() throws Exception {
-        BarrierStore store = new BarrierStore(2);
-        AtomicInteger renders = new AtomicInteger();
-        SettlementRenderer renderer = key -> {
-            renders.incrementAndGet();
-            return key.getBytes(StandardCharsets.UTF_8);
-        };
-        BrokenSettlementArtifactService service =
-                new BrokenSettlementArtifactService(store, renderer);
-
-        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
-            Future<ArtifactResult> first = executor.submit(() ->
-                    service.generate("settlement/day-1.csv", Duration.ofSeconds(5)));
-            Future<ArtifactResult> second = executor.submit(() ->
-                    service.generate("settlement/day-1.csv", Duration.ofSeconds(5)));
-
-            first.get(5, TimeUnit.SECONDS);
-            second.get(5, TimeUnit.SECONDS);
-        }
-
-        assertEquals(2, renders.get());
-        assertEquals(2, store.putCount());
+        first.get(5, TimeUnit.SECONDS);
+        second.get(5, TimeUnit.SECONDS);
     }
 
-    private static final class BarrierStore implements ArtifactStore {
-        private final CountDownLatch allExistsCalls;
-        private final AtomicInteger puts = new AtomicInteger();
-
-        private BarrierStore(int expectedCallers) {
-            this.allExistsCalls = new CountDownLatch(expectedCallers);
-        }
-
-        @Override
-        public boolean exists(String artifactKey) {
-            allExistsCalls.countDown();
-            awaitOrFail(allExistsCalls);
-            return false;
-        }
-
-        @Override
-        public void put(String artifactKey, byte[] content) {
-            puts.incrementAndGet();
-        }
-
-        int putCount() {
-            return puts.get();
-        }
-    }
-
-    private static void awaitOrFail(CountDownLatch latch) {
-        try {
-            if (!latch.await(5, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("latch timed out");
-            }
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted while waiting", exception);
-        }
-    }
+    // CHỨNG MINH RỦI RO: Dữ liệu Đã Bị Cày Nát Nhân Bản
+    assertEquals(2, renders.get()); 
+    assertEquals(2, store.putCount());
 }
 ```
 
-Barrier chỉ về 0 khi cả hai actor đã chạy `exists`. Nếu hai call thật sự dùng
-cùng lock, test sẽ timeout ở barrier; với lock-per-call, cả hai đi qua và tạo hai
-write một cách deterministic.
+Rào Chắn (Barrier) Cố Đinh: Chỉ vỡ khi Cả 2 Actors Chạm Mốc `exists`. NẾU hệ thống Tuân Thủ Một Khóa Chuẩn Mực, Bài Test Bắt Buộc Đứt Gãy Timeout Do Nghẽn Cổ Chai. Trái Lại, Với Khóa Sinh-Mới-Mỗi-Lần, Cả 2 Lướt Qua Rào và Sinh Ra Hành Vi Nhân Bản (Duplicate Writes).
 
-> **Nói ngắn gọn:** test không tìm lock object bằng reflection; nó kiểm tra hành
-> vi mà lock phải bảo vệ—chỉ một generation workflow cho cùng key.
+> **Nguyên tắc kỹ thuật:** Phép Thử không chọc ngoáy bóc tách Bản Thể Khóa (Lock Object) qua Reflection; Nó Tra Khảo Hành Vi Nghiệp Vụ Sinh Tử — Bắt Buộc Chỉ Có Thể Kích Hoạt Một Chặng Sinh Khóa (Generation Workflow) Cho Một Mã Độc Nhất.
 
-## Experiment 2: equal key không đồng nghĩa cùng monitor
+## 3. Thí Nghiệm 2: Trị Số Chuỗi Khớp (Equal) KHÔNG Bằng Đồng Nhất Tham Chiếu Khóa (Monitor)
 
-Test harness nhỏ cho wrong-monitor variant:
-
-```java
-final class KeyMonitorGenerator {
-    private final ArtifactStore store;
-    private final SettlementRenderer renderer;
-
-    KeyMonitorGenerator(ArtifactStore store, SettlementRenderer renderer) {
-        this.store = store;
-        this.renderer = renderer;
-    }
-
-    ArtifactResult generate(String key) {
-        synchronized (key) {
-            if (store.exists(key)) {
-                return ArtifactResult.alreadyExists(key);
-            }
-            store.put(key, renderer.render(key));
-            return ArtifactResult.created(key);
-        }
-    }
-}
-```
+Mô Phỏng Trực Quan Ảo Giác Khóa:
 
 ```java
 @Test
@@ -142,6 +61,7 @@ void equalStringsWithDifferentIdentityUseDifferentMonitors() throws Exception {
             }
     );
 
+    // CHỨNG MINH LỖ HỔNG: Tham Chiếu Tách Rời Bất Chấp Cùng Giá Trị
     String firstKey = new String("settlement/day-1.csv");
     String secondKey = new String("settlement/day-1.csv");
     assertEquals(firstKey, secondKey);
@@ -154,18 +74,15 @@ void equalStringsWithDifferentIdentityUseDifferentMonitors() throws Exception {
         second.get(5, TimeUnit.SECONDS);
     }
 
+    // HỆ QUẢ: Cấu Trúc Khóa Không Cầm Chân Nhau
     assertEquals(2, renders.get());
     assertEquals(2, store.putCount());
 }
 ```
 
-Snippet dùng lại `BarrierStore`/imports từ Experiment 1 và static import
-`assertNotSame`.
+## 4. Thí Nghiệm 3: Năng Lực Trấn Thủ Của Khóa Phân Dải (Striped Lock)
 
-## Experiment 3: striped lock bảo vệ cùng key trong một instance
-
-Renderer đầu tiên bị dừng để request thứ hai chắc chắn overlap. Request thứ hai
-phải chờ stripe; sau khi request đầu publish, nó quan sát artifact đã tồn tại.
+Lệnh Triệu Tập Thứ 2 (Second Request) Bị Ép Nghẽn Trên Dải Khóa. Sau khi Quân Chủ Lực (Request 1) Kéo Quân Xuất Bản, Kẻ Tới Sau Phải Nuốt Phản Hồi "Đã Tồn Tại" Thay Vì Tự Tiện Rẽ Hướng Cày Đè.
 
 ```java
 @Test
@@ -179,7 +96,7 @@ void stableStripeAllowsOnlyOneRenderForTheSameKey() throws Exception {
     SettlementRenderer renderer = key -> {
         if (renders.incrementAndGet() == 1) {
             firstRenderEntered.countDown();
-            awaitOrFail(allowFirstRender);
+            awaitOrFail(allowFirstRender); // Ép Đọng Chờ
         }
         return key.getBytes(StandardCharsets.UTF_8);
     };
@@ -199,8 +116,9 @@ void stableStripeAllowsOnlyOneRenderForTheSameKey() throws Exception {
             );
         });
         assertTrue(secondTaskStarted.await(5, TimeUnit.SECONDS));
-        allowFirstRender.countDown();
+        allowFirstRender.countDown(); // Buông Tay Khối 1
 
+        // QUY TẮC BẤT BIẾN LÊN NGÔI
         assertEquals(ArtifactResult.Status.CREATED,
                 first.get(5, TimeUnit.SECONDS).status());
         assertEquals(ArtifactResult.Status.ALREADY_EXISTS,
@@ -212,37 +130,11 @@ void stableStripeAllowsOnlyOneRenderForTheSameKey() throws Exception {
 }
 ```
 
-Fake store không cần barrier:
+Xác thực Quả Ngọt Nghiệp Vụ (Business Outcome), từ chối lệ thuộc Phương thức `lock.isLocked()`. Vỏ Bọc Khóa Có Thể Sửa Đổi Mà Hệ Quả Cấu Trúc Không Rạn Nứt.
 
-```java
-final class InMemoryStore implements ArtifactStore {
-    private final ConcurrentMap<String, byte[]> data = new ConcurrentHashMap<>();
-    private final AtomicInteger puts = new AtomicInteger();
+## 5. Thí Nghiệm 4: Hai Bản Thể Máy Chủ Phơi Bày Giới Hạn Khóa Nội Bộ
 
-    @Override
-    public boolean exists(String key) {
-        return data.containsKey(key);
-    }
-
-    @Override
-    public void put(String key, byte[] content) {
-        puts.incrementAndGet();
-        data.put(key, content);
-    }
-
-    int putCount() {
-        return puts.get();
-    }
-}
-```
-
-Test assert business outcome, không chỉ `lock.isLocked()`. Lock implementation có
-thể thay đổi mà invariant test vẫn giữ giá trị.
-
-## Experiment 4: hai service instance chứng minh local-lock limitation
-
-Mô phỏng hai node bằng hai service object, mỗi object có `StripedKeyLocks` riêng,
-nhưng cùng dùng một barrier store:
+Giả lập Kiến Trúc Hai Nút Máy Chủ (Two Nodes). Mỗi Máy Sở Hữu Kho Khóa Độc Lập `StripedKeyLocks`, nhưng Tranh Cướp Chung Kho Dữ Liệu `BarrierStore`.
 
 ```java
 @Test
@@ -273,17 +165,17 @@ void twoInstancesStillGenerateTheSameArtifactTwice() throws Exception {
         second.get(5, TimeUnit.SECONDS);
     }
 
+    // SỰ THẬT: Khóa Nội Bộ Không Cản Nổi Làn Sóng Ghi Chèn Xuyên Máy Chủ
     assertEquals(2, renders.get());
     assertEquals(2, sharedStore.putCount());
 }
 ```
 
-Test này bắt buộc khi team định dùng local keyed lock trước shared resource. Một
-service instance test pass không phải proof cho deployment nhiều replica.
+Đây là Thử Thách Tử Thần Buộc Phải Chạy Trước Khi Ảo Mộng Khóa Nội Bộ Được Đặt Phía Trước Ranh Giới Lưu Trữ Chung.
 
-## Experiment 5: conditional create chọn đúng một winner
+## 6. Thí Nghiệm 5: Lệnh Cập Nhật Kho Khởi Tạo Có Điều Kiện Định Hình Vương Quyền Độc Tôn (Conditional Create)
 
-Fake authoritative store dùng atomic `putIfAbsent`:
+Bức Tường Kho Lưu Trữ Phán Quyết Vận Mệnh bằng Vũ Khí `putIfAbsent` Của Atomic:
 
 ```java
 final class ConditionalInMemoryStore {
@@ -294,88 +186,40 @@ final class ConditionalInMemoryStore {
                 ? PutIfAbsentResult.CREATED
                 : PutIfAbsentResult.ALREADY_EXISTS;
     }
-
-    int size() {
-        return data.size();
-    }
+//...
 }
 ```
 
-```java
-@Test
-void conditionalCreateAllowsExactlyOneWinnerAcrossInstances() throws Exception {
-    ConditionalInMemoryStore store = new ConditionalInMemoryStore();
-    CountDownLatch start = new CountDownLatch(1);
+Thử Thách Ép Bộ Lọc Lỗi. Dẫu Hai Máy Cùng Nhấn Lệnh Render (Nướng CPU), Bắt Buộc Kho Lưu Trữ Dập Tắt Một Yêu Cầu (Trả vể Tồn Tại). Lộ Trình Triển Khai Thực Chiến Yêu Cầu Gắn Bó Sâu Hơn Chức Năng Cực Đoan Từ DB Store API Thực Tế.
 
-    Callable<PutIfAbsentResult> attempt = () -> {
-        awaitOrFail(start);
-        return store.putIfAbsent("settlement/day-1.csv", new byte[] {1});
-    };
+## 7. Khung Kiểm Định Quản Trị Khóa Mở Rộng: Timeout, Interruption, Tình Trạng Lỗi
 
-    try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
-        Future<PutIfAbsentResult> first = executor.submit(attempt);
-        Future<PutIfAbsentResult> second = executor.submit(attempt);
-        start.countDown();
+Mở Rộng Quản Trị Rủi Ro Cấu Trúc Khóa:
+- T2 Rớt Đài Sớm Nhận Lỗi `ArtifactBusyException` Dưới Áp Lực Timeout Trong Khi T1 Giam Dải Khóa.
+- Đánh Phá Ngắt Interrupt Luồng T2 Giữa Tâm Bảo `tryLock`; Kiểm Toán Lại Cờ Khôi Phục Ngắt.
+- Bộ Render Sập Bẫy Ngoại Lệ; Khóa Có Buông Tay Nhường Cơ Hội Sau Cùng Lại Cho Luồng Đuôi (Tail request).
+- Phán Quyết Mù Dưới Áp Lực Store Timeout; Đòi Hỏi Phương Pháp Khắc Phục Đối Soát (Reconcile).
+- Khung Dải Băm Góp Mặt Chung 2 Mã Artifact; Áp Lực Tuần Tự (Serialize) Không Đánh Sập Quy Tắc Bất Biến (Correctness).
+- Khóa Có Dám Sống Sót Giữa Giao Quyền Giải Phóng Cho Luồng Cấu Trúc Thứ Cấp (Callback thread)? KHÔNG!
 
-        List<PutIfAbsentResult> outcomes = List.of(
-                first.get(5, TimeUnit.SECONDS),
-                second.get(5, TimeUnit.SECONDS)
-        );
+## 8. Khung Giám Sát Khai Thác Môi Trường (Production Blueprint)
 
-        assertEquals(1, outcomes.stream()
-                .filter(result -> result == PutIfAbsentResult.CREATED)
-                .count());
-        assertEquals(1, outcomes.stream()
-                .filter(result -> result == PutIfAbsentResult.ALREADY_EXISTS)
-                .count());
-    }
+Đặc Tả Vận Hành (Metric):
+- Chỉ số Hao Mòn: Lock Wait Duration, Acquisition Timeout, Lượng In-flight Hiện Hành.
+- Trục Cân Bằng: Render Count So Sánh Lệnh Created Artifact Count.
+- Thống Kê Giao Chiến Khóa Liên Máy Chủ: Conditional Conflict / Lệnh `ALREADY_EXISTS`.
+- Biến Động Hàng Đợi (Queue Length Diagnostic) và Định Danh Điểm Nóng (Hot spot) Dải Khóa (Stripe contention).
 
-    assertEquals(1, store.size());
-}
-```
+Nghiêm Cấm Suy Đoán Quyết Định Core (Correctness signal) Dựa Lên Tham Số Dò Dẫm (Heuristic) Như Lệnh Đo Kích Cỡ Wait Queue Của ReentrantLock.
 
-Snippet cần imports `Callable`, `List`, concurrent map và static assertions đã
-xuất hiện ở các experiment trước. Test fake chỉ mô hình atomic store primitive;
-integration test production phải chạy với API conditional-create thật của store.
+## 9. Khung Tiêu Chuẩn Thực Nghiệm (Quality Checklist)
 
-## Kiểm tra timeout, interruption và failure
-
-Bổ sung tests:
-
-- giữ stripe ở T1; T2 dùng timeout ngắn và nhận `ArtifactBusyException`;
-- interrupt T2 đang `tryLock`, xác nhận interrupt status được restore;
-- renderer ném exception, request sau vẫn acquire được stripe;
-- store `put` ném timeout với outcome unknown, workflow chuyển sang reconcile;
-- hai key map cùng stripe có thể serialize nhưng không vi phạm correctness;
-- service không unlock từ callback thread khác.
-
-Dùng future timeout như outer watchdog cho mọi test lock. Nếu test fail, thu thread
-dump để phân biệt assertion failure với deadlock.
-
-## Xác minh trong môi trường thực tế
-
-Theo dõi theo node và key hash/stripe:
-
-- lock wait duration, acquisition timeout và current in-flight;
-- render count so với created artifact count;
-- conditional conflict/`ALREADY_EXISTS` count;
-- duplicate publish event;
-- store timeout có outcome không rõ và reconciliation result;
-- stripe hot spot, queue length (diagnostic) và render duration;
-- node ID của winner/loser.
-
-Không dùng `ReentrantLock.getQueueLength()` như correctness signal; đây chỉ là
-ước lượng phục vụ chẩn đoán.
-
-## Checklist chất lượng của case
-
-- [ ] Lock-per-call race được ép bằng barrier.
-- [ ] Equal-but-not-identical key test dùng hai object reference khác nhau.
-- [ ] Local fixed test assert một render và một write.
-- [ ] Hai service instance test chứng minh local lock limitation.
-- [ ] Conditional-create test assert đúng một winner.
-- [ ] Không dùng `Thread.sleep`.
-- [ ] Mọi latch/future có timeout.
-- [ ] Interrupt status và unlock-on-exception được kiểm tra.
-- [ ] Executor được đóng sau test.
-- [ ] Production verification phân biệt node-local và authoritative outcome.
+- [ ] Phơi Trần Cấu Trúc Khóa Theo Chặng Nhờ Barrier.
+- [ ] Vạch Trần Lỗi Khóa Bằng Tham Chiếu Độc Lập Chứ Không Dùng Nội Dung.
+- [ ] Khảo Khảo Sát Một Ghi Mới Vận Hành Nhờ Lệnh Render Trấn Áp.
+- [ ] Hiện Thực Thử Đo Đạc Khóa Nội Bộ Quá Hẹp (Two-node setup).
+- [ ] Truy Bắt Ranh Giới Giao Thức Khởi Tạo Kho Có Điều Kiện.
+- [ ] Trục Xuất `Thread.sleep` Khỏi Hệ Thống Logic Phán Quyết.
+- [ ] Bó Cứng 100% Khung Latch Bằng Hạn Mức Timeout.
+- [ ] Phơi Trần Sức Trụ Vững `try-finally` Trước Gián Đoạn (Interrupt) và Vỡ Ngoại Lệ (Exception).
+- [ ] Buộc Đóng Chốt Toàn Bộ Pool (Executor) Trước Hồi Kết.

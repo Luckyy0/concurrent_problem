@@ -1,238 +1,93 @@
-# Kiểm thử đồng thời và xác minh trong môi trường thực tế
+# Môi Trường Thực Nghiệm: Cấu Trúc Kiểm Định Rủi Ro & Đánh Giá Khai Thác
 
-## Chiến lược kiểm thử
+## 1. Chiến Lược Kiểm Thử Cốt Lõi (Core Strategy)
 
-Case cần tách ba câu hỏi:
+Ma trận kiểm định tập trung bóc tách 3 luồng rủi ro:
+1. Đánh giá Cấu trúc Suy thoái (Broken code) phơi bày mảnh vỡ Dữ liệu Đang làm mới.
+2. Chứng minh Cấu trúc Bản Chụp Bất Biến (Immutable snapshot) bảo vệ Tính Toàn Vẹn và buộc Thế hệ (Generation) tăng đơn điệu.
+3. Rà soát chuẩn Ngữ nghĩa Duyệt (Iteration semantics) của Khung Tập Hợp (Collection) tương thích Khách hàng (Caller).
 
-1. broken implementation có để lộ state đang refresh dở không;
-2. immutable snapshot có bảo vệ tính đầy đủ và generation tăng đơn điệu không;
-3. collection được chọn có đúng iteration semantics mà caller mong đợi không.
+Mỏ neo `Latch` điều phối luồng vào chính xác Tọa độ Tranh chấp (Conflict window). Tuyệt đối cấm khai thác `Thread.sleep` làm mốc Phán Quyết vì tính bấp bênh của Bộ lập lịch (Scheduler). Thiết lập Timeout cưỡng chế cho 100% lệnh chốt chặn.
 
-Dùng latch để đặt thread đúng vào cửa sổ tranh chấp. Không dùng `Thread.sleep`
-làm điều kiện correctness vì scheduler và tốc độ máy có thể thay đổi. Mọi
-`await()` và `Future.get()` đều có timeout để test không treo vô hạn.
+## 2. Thí Nghiệm 1: Trình Diễn Bóc Tách Bản Chụp Phân Mảnh (Partial Snapshot)
 
-Chiến lược chung được mô tả tại
-[Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
-
-## Experiment 1: tái hiện partial snapshot một cách deterministic
-
-Test harness dưới đây giữ writer lại ngay sau entry đầu tiên của generation mới.
-Reader chạy khi writer đang dừng, vì vậy lỗi không phụ thuộc may mắn của
-scheduler.
+Luồng Kiểm Thử hãm phanh Tuyến Ghi (Writer) ngay sau khi Nhập liệu Khóa (Entry) đầu tiên của Thế hệ mới. Tuyến Đọc (Reader) xông vào lúc Tuyến Ghi tạm dừng, tạo tiền đề Lỗi Xác Định (Deterministic) hoàn toàn không dựa vào xác suất.
 
 ```java
-package com.example.routing;
+@Test
+void readerCanObserveOnlyPartOfTheNewGeneration() throws Exception {
+    HookedBrokenRegistry registry = new HookedBrokenRegistry();
+    registry.replaceForSetup(routes(41)); // Nạp Thế hệ cũ
 
-import org.junit.jupiter.api.Test;
+    CountDownLatch firstEntryPublished = new CountDownLatch(1);
+    CountDownLatch allowRefreshToFinish = new CountDownLatch(1);
 
-import java.time.Duration;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
-class BrokenRoutingRegistryTest {
-
-    @Test
-    void readerCanObserveOnlyPartOfTheNewGeneration() throws Exception {
-        HookedBrokenRegistry registry = new HookedBrokenRegistry();
-        registry.replaceForSetup(routes(41));
-
-        CountDownLatch firstEntryPublished = new CountDownLatch(1);
-        CountDownLatch allowRefreshToFinish = new CountDownLatch(1);
-
-        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
-            Future<?> refresh = executor.submit(() -> registry.refresh(
-                    routes(42),
-                    () -> {
-                        firstEntryPublished.countDown();
-                        awaitOrFail(allowRefreshToFinish, Duration.ofSeconds(5));
-                    }
-            ));
-
-            assertTrue(firstEntryPublished.await(5, TimeUnit.SECONDS));
-
-            Map<String, PaymentRoute> observed = registry.copyForDiagnostic();
-            assertEquals(1, observed.size());
-            assertTrue(observed.values().stream()
-                    .allMatch(route -> route.generation() == 42));
-
-            allowRefreshToFinish.countDown();
-            refresh.get(5, TimeUnit.SECONDS);
-
-            assertEquals(2, registry.copyForDiagnostic().size());
-        }
-    }
-
-    private static Map<String, PaymentRoute> routes(long generation) {
-        return Map.of(
-                "merchant-a", new PaymentRoute("provider-a", true, generation),
-                "merchant-b", new PaymentRoute("provider-b", true, generation)
-        );
-    }
-
-    private static void awaitOrFail(CountDownLatch latch, Duration timeout) {
-        try {
-            if (!latch.await(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                throw new IllegalStateException("latch timed out");
-            }
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted while waiting", exception);
-        }
-    }
-
-    private static final class HookedBrokenRegistry {
-        private final Map<String, PaymentRoute> routes = new HashMap<>();
-
-        void replaceForSetup(Map<String, PaymentRoute> loaded) {
-            routes.clear();
-            routes.putAll(loaded);
-        }
-
-        void refresh(Map<String, PaymentRoute> loaded, Runnable afterFirstPut) {
-            routes.clear();
-            Iterator<Map.Entry<String, PaymentRoute>> iterator =
-                    loaded.entrySet().iterator();
-
-            Map.Entry<String, PaymentRoute> first = iterator.next();
-            routes.put(first.getKey(), first.getValue());
-            afterFirstPut.run();
-
-            iterator.forEachRemaining(entry ->
-                    routes.put(entry.getKey(), entry.getValue()));
-        }
-
-        Map<String, PaymentRoute> copyForDiagnostic() {
-            return new HashMap<>(routes);
-        }
-    }
-}
-```
-
-Test không cố ép `ConcurrentModificationException`. Exception của fail-fast
-iterator chỉ là best-effort; invariant quan trọng hơn là reader đã thấy một map
-chỉ có một entry dù mọi generation hợp lệ đều có hai.
-
-> **Nói ngắn gọn:** test khóa đúng “khung hình” state đang dở, thay vì chạy thật
-> nhiều lần rồi hy vọng bắt gặp lỗi.
-
-## Experiment 2: xác minh atomic snapshot và chặn stale writer
-
-Test sau cho hai refresh writer cạnh tranh. Writer giữ generation 42 bị dừng;
-generation 43 được publish trước. Khi writer cũ tiếp tục, compare-and-set logic
-phải từ chối nó.
-
-```java
-package com.example.routing;
-
-import org.junit.jupiter.api.Test;
-
-import java.time.Duration;
-import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
-class PaymentRoutingRegistryTest {
-
-    @Test
-    void snapshotIsCompleteAndOlderWriterCannotOverwriteNewerGeneration()
-            throws Exception {
-        PaymentRoutingRegistry registry = registryWithoutRemoteCalls();
-        assertTrue(registry.publishIfNewer(snapshot(41)));
-
-        CountDownLatch olderWriterReady = new CountDownLatch(1);
-        CountDownLatch releaseOlderWriter = new CountDownLatch(1);
-
-        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
-            Future<Boolean> olderResult = executor.submit(() -> {
-                RoutingSnapshot older = snapshot(42);
-                olderWriterReady.countDown();
-                awaitOrFail(releaseOlderWriter, Duration.ofSeconds(5));
-                return registry.publishIfNewer(older);
-            });
-
-            assertTrue(olderWriterReady.await(5, TimeUnit.SECONDS));
-            assertTrue(registry.publishIfNewer(snapshot(43)));
-
-            RoutingSnapshot whileOlderWriterIsBlocked = registry.snapshot();
-            assertCompleteGeneration(whileOlderWriterIsBlocked, 43);
-
-            releaseOlderWriter.countDown();
-            assertFalse(olderResult.get(5, TimeUnit.SECONDS));
-            assertCompleteGeneration(registry.snapshot(), 43);
-        }
-    }
-
-    private static void assertCompleteGeneration(
-            RoutingSnapshot snapshot,
-            long expectedGeneration
-    ) {
-        assertEquals(expectedGeneration, snapshot.generation());
-        assertEquals(2, snapshot.routes().size());
-        assertTrue(snapshot.routes().values().stream()
-                .allMatch(route -> route.generation() == expectedGeneration));
-    }
-
-    private static RoutingSnapshot snapshot(long generation) {
-        return new RoutingSnapshot(generation, Map.of(
-                "merchant-a", new PaymentRoute("provider-a", true, generation),
-                "merchant-b", new PaymentRoute("provider-b", true, generation)
+    try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+        Future<?> refresh = executor.submit(() -> registry.refresh(
+                routes(42),
+                () -> {
+                    firstEntryPublished.countDown(); // Tín hiệu: Đã nạp 1 phần
+                    awaitOrFail(allowRefreshToFinish, Duration.ofSeconds(5));
+                }
         ));
-    }
 
-    private static PaymentRoutingRegistry registryWithoutRemoteCalls() {
-        RoutingConfigClient unusedClient = () -> {
-            throw new AssertionError("remote client must not be called");
-        };
-        return new PaymentRoutingRegistry(unusedClient);
-    }
+        assertTrue(firstEntryPublished.await(5, TimeUnit.SECONDS));
 
-    private static void awaitOrFail(CountDownLatch latch, Duration timeout) {
-        try {
-            if (!latch.await(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                throw new IllegalStateException("latch timed out");
-            }
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted while waiting", exception);
-        }
+        // CHỨNG MINH RỦI RO: Đọc cấu trúc, phơi bày dữ liệu dở dang
+        Map<String, PaymentRoute> observed = registry.copyForDiagnostic();
+        assertEquals(1, observed.size()); // Sập Invariant (Mọi Thế hệ có 2)
+        assertTrue(observed.values().stream()
+                .allMatch(route -> route.generation() == 42));
+
+        allowRefreshToFinish.countDown(); // Nhả khóa cho Tuyến Ghi chạy tiếp
+        refresh.get(5, TimeUnit.SECONDS);
+
+        assertEquals(2, registry.copyForDiagnostic().size());
     }
 }
 ```
 
-Để lambda `RoutingConfigClient` trong test khớp code solution, interface có thể
-được khai báo như sau:
+Mục tiêu không phải là ép phát sinh `ConcurrentModificationException`. Hệ thống ưu tiên đánh phá Quy tắc Bất Biến (Invariant): Tuyến Đọc phải chứng kiến bằng được cái khung Bản Đồ chỉ chứa 1 mảnh vụn dữ liệu dẫu cả 2 Thế hệ Gốc đều có Khối lượng là 2.
+
+## 3. Thí Nghiệm 2: Tôn Tôn Trọng Bản Chụp Nguyên Tử & Chặn Đứng Tuyến Ghi Chậm Trễ (Stale Writer)
+
+Cuộc đụng độ của 2 Tuyến Làm Mới (Writer). Kịch bản: Tuyến Ghi Thế hệ 42 bị phong tỏa; Thế hệ 43 lướt qua xuất bản trước. Sau khi nhả Khóa, Khối Logic So-Sánh-Và-Gán (Compare-and-set) phải cự tuyệt tàn nhẫn Tuyến Ghi 42 Lỗi thời.
 
 ```java
-public interface RoutingConfigClient {
-    RoutingSnapshot loadSnapshot();
+@Test
+void snapshotIsCompleteAndOlderWriterCannotOverwriteNewerGeneration() throws Exception {
+    PaymentRoutingRegistry registry = registryWithoutRemoteCalls();
+    assertTrue(registry.publishIfNewer(snapshot(41)));
+
+    CountDownLatch olderWriterReady = new CountDownLatch(1);
+    CountDownLatch releaseOlderWriter = new CountDownLatch(1);
+
+    try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+        Future<Boolean> olderResult = executor.submit(() -> {
+            RoutingSnapshot older = snapshot(42); // Chuẩn bị Thế hệ 42
+            olderWriterReady.countDown();
+            awaitOrFail(releaseOlderWriter, Duration.ofSeconds(5)); // Bị Đóng Băng
+            return registry.publishIfNewer(older); // Nỗ lực Xuất bản (Sẽ thất bại)
+        });
+
+        assertTrue(olderWriterReady.await(5, TimeUnit.SECONDS));
+        assertTrue(registry.publishIfNewer(snapshot(43))); // Thế hệ 43 Vượt lên trước
+
+        RoutingSnapshot whileOlderWriterIsBlocked = registry.snapshot();
+        assertCompleteGeneration(whileOlderWriterIsBlocked, 43); // 43 Đã thống trị
+
+        releaseOlderWriter.countDown();
+        assertFalse(olderResult.get(5, TimeUnit.SECONDS)); // Bị Từ Chối Thẳng Thừng
+        assertCompleteGeneration(registry.snapshot(), 43); // 43 Bất Khả Xâm Phạm
+    }
 }
 ```
 
-Assertion kiểm tra business invariant: snapshot có đủ hai route và mọi value có
-cùng generation. Chỉ kiểm tra exception hoặc kích thước map là chưa đủ.
+Kiểm định Quy tắc: Bản chụp vinh danh 2 Khóa trọn vẹn và 100% Giá trị chia sẻ Chung 1 Dấu mộc Thế hệ. Cấm lạm dụng Phép đo Kích thước (Size) hoặc Cờ Ngoại Lệ để thay thế Xác thực Invariant.
 
-## Experiment 3: kiểm tra refresh failure giữ nguyên last-known-good snapshot
+## 4. Thí Nghiệm 3: Thẩm Định Năng Lực Trụ Vững Khi Cập Nhật Vỡ Lở (Failure Keeps Last-Known-Good)
 
-Không cần concurrency để xác minh nhánh failure, nhưng đây là regression test
-quan trọng cho thiết kế build-before-publish. Fake client trả snapshot hợp lệ ở
-lần đầu và snapshot rỗng ở lần sau:
+Phép thử Hồi quy (Regression test) cốt lõi chứng minh Nền tảng "Dựng Khung Trước Xuất Bản Sau" (Build-before-publish):
 
 ```java
 @Test
@@ -241,39 +96,34 @@ void invalidRefreshDoesNotDestroyCurrentSnapshot() {
             new java.util.concurrent.atomic.AtomicInteger();
 
     RoutingConfigClient client = () -> {
-        if (calls.getAndIncrement() == 0) {
-            return snapshot(41);
-        }
-        return new RoutingSnapshot(42, Map.of());
+        if (calls.getAndIncrement() == 0) return snapshot(41);
+        return new RoutingSnapshot(42, Map.of()); // Tung Rác Dữ Liệu
     };
     PaymentRoutingRegistry registry = new PaymentRoutingRegistry(client);
 
     registry.refresh();
     assertCompleteGeneration(registry.snapshot(), 41);
 
+    // Kích hoạt Cơ chế Lọc Rác - Hệ thống Văng Lỗi Validation
     assertThrows(IllegalArgumentException.class, registry::refresh);
 
-    assertCompleteGeneration(registry.snapshot(), 41);
+    // Bằng chứng Thép: Cấu trúc Gốc Nguyên vẹn
+    assertCompleteGeneration(registry.snapshot(), 41); 
 }
 ```
 
-Snippet dùng lại `snapshot`, `assertCompleteGeneration` và static assertion từ
-Experiment 2. Assertion cuối xác nhận refresh thất bại không phá hủy generation
-đang phục vụ request.
+Chứng minh một Đợt làm mới Đổ nát không kéo theo sự Diệt vong của Thế hệ Đang Phục Vụ.
 
-## Experiment 4: unsafe publication là stress test, không phải unit test ổn định
+## 5. Thí Nghiệm 4: Khảo Sát Bức Tranh Lỗ Hổng Công Bố Dữ Liệu (Unsafe Publication Stress)
 
-Không nên viết JUnit yêu cầu “reader phải thấy stale value”, vì scheduler không
-tạo được bằng chứng happens-before và test có thể pass trên một CPU nhưng fail ở
-CPU khác. Dùng [OpenJDK jcstress](https://openjdk.org/projects/code-tools/jcstress/)
-để khảo sát các outcome được Java Memory Model cho phép:
+Tuyệt đối cấm khai báo JUnit bắt buộc "Reader must observe stale value", vì Bộ Lập Lịch không hỗ trợ Ký Hợp Đồng Hệ Quả (Happens-before). Ứng dụng OpenJDK JCStress để vạch trần thảm họa cho phép theo định nghĩa JMM:
 
 ```java
 @JCStressTest
 @Outcome(id = "0", expect = Expect.ACCEPTABLE_INTERESTING,
-        desc = "Reader observed the old snapshot")
+        desc = "Reader đã va vào Bản Chụp Lỗi Thời")
 @Outcome(id = "1", expect = Expect.ACCEPTABLE,
-        desc = "Reader observed the new snapshot")
+        desc = "Reader quan sát Bản Chụp Mới")
 @State
 public class UnsafeSnapshotPublicationStress {
 
@@ -289,50 +139,37 @@ public class UnsafeSnapshotPublicationStress {
 
     @Actor
     public void reader(I_Result result) {
-        result.r1 = routes.size();
+        result.r1 = routes.size(); // Bóc trần Data Race
     }
 }
 ```
 
-Outcome `0` không tự nó chứng minh structural corruption; nó cho thấy code không
-có contract buộc reader quan sát write cạnh tranh. Sau khi đổi field thành
-`volatile` hoặc `AtomicReference`, vẫn phải thiết kế outcome theo ordering mà ứng
-dụng thực sự yêu cầu, không diễn giải scheduling order thành memory order.
+Kết quả `0` phơi bày việc Thiếu Hợp Đồng Khả Kiến. Dẫu cho đã bọc `volatile` hay `AtomicReference`, Thiết kế Chuẩn Mực Outcome buộc phải phản ánh Trật Tự (Ordering) Nghiệp Vụ, Khước từ quy chụp Đặc tính Lập Lịch (Scheduling) làm Trật Tự Bộ Nhớ (Memory).
 
-## Kiểm tra semantics của ConcurrentHashMap
+## 6. Tiêu Chuẩn Ngữ Nghĩa ConcurrentHashMap
 
-Nếu chọn `ConcurrentHashMap`, test không được assert iterator trả snapshot chính
-xác. Contract hợp lệ nên kiểm tra:
+Nếu đánh đổi kiến trúc Bản Chụp Bất Biến lấy tốc độ của `ConcurrentHashMap`, bài Kiểm Định Bắt Buộc chứng minh:
+- Không xuất hiện Đứt gãy Cấu trúc và Vắng bóng `ConcurrentModificationException`.
+- Định vị Dữ liệu Bất khả Xâm phạm Nguyên Tử (Atomic) cho Từng Đơn vị Khóa.
+- Báo cáo Toàn Bảng chỉ được phép định danh là "Ước Tán" (Approximate).
+*Cảnh báo: Phế truất ngay Lựa chọn này nếu Nghiệp vụ ép buộc Chuẩn Toàn Bảng Chung Thế Hệ.*
 
-- không có structural corruption hoặc `ConcurrentModificationException`;
-- mỗi entry quan sát được là một key/value hợp lệ;
-- operation trên một key có kết quả atomic theo API đã dùng;
-- report toàn bảng được đánh dấu approximate nếu concurrent update được phép.
+## 7. Khung Giám Sát Khai Thác (Production Blueprint)
 
-Nếu nghiệp vụ yêu cầu mọi entry cùng generation, test phải fail phương án
-`ConcurrentHashMap` per-key và chuyển sang immutable snapshot hoặc locking.
+Đặc tả Vận hành:
+- Tuổi thọ Bản Chụp và Định danh Thế Hệ (Generation ID).
+- Số khối lượng (Entry Count) và Chứng Chỉ Tính Toàn Vẹn (Checksum).
+- Thống kê tỷ lệ Từ Chối Bản Chụp Trễ Hạn (Stale publish rejected).
+- Đo lường Yêu cầu Hụt Tuyến (Fallback).
+- Bản đồ Phân Phối Thế Hệ giữa Liên Nút (Node).
 
-## Xác minh trong môi trường thực tế
+## 8. Khung Tiêu Chuẩn Thực Nghiệm (Quality Checklist)
 
-Theo dõi theo từng application instance:
-
-- generation hiện tại và tuổi của snapshot;
-- số entry và checksum của snapshot;
-- refresh success, failure, timeout và stale publish bị từ chối;
-- số request phải fallback vì không tìm thấy route;
-- distribution generation giữa các node sau mỗi lần rollout cấu hình.
-
-Log một event tại điểm publish gồm `oldGeneration`, `newGeneration`, `entryCount`
-và duration load/validate. Không log toàn bộ routing data nhạy cảm.
-
-## Checklist chất lượng của case
-
-- [ ] Broken test điều phối đúng partial-update window bằng latch.
-- [ ] Không dùng `Thread.sleep` để quyết định test pass/fail.
-- [ ] Mọi latch và future đều có timeout.
-- [ ] Regression test kiểm tra đầy đủ entry và cùng generation.
-- [ ] Test có case nhiều writer và stale generation.
-- [ ] Refresh failure giữ nguyên last-known-good snapshot.
-- [ ] Iterator semantics khớp với lựa chọn collection.
-- [ ] Executor được đóng sau test và interrupt status được khôi phục.
-- [ ] Production dashboard hiển thị generation theo từng node.
+- [ ] Bài thử Broken Test giam luồng Đọc trong Khe hở Cập nhật bằng Latch.
+- [ ] Xóa bỏ Phép Đo Lường Vận Mệnh bằng `Thread.sleep`.
+- [ ] 100% Khối Chặn Latch/Future bọc vỏ Timeout.
+- [ ] Kiểm định Hồi Quy bao phủ Tổng Số Lượng và Tính Đồng Nhất Thế Hệ.
+- [ ] Bài Test Phơi bày Áp Lực Đa Tuyến Ghi và Khước từ Thế Hệ Lỗi Thời.
+- [ ] Xác nhận Sập Cập Nhật luôn được Neo Giữ bởi Bản Chụp Tốt Nhất Cuối Cùng.
+- [ ] Ngữ Nghĩa Vòng Lặp phản chiếu chính xác Lựa chọn Hạch Tâm Collection.
+- [ ] Hậu Kiểm Thử: Đóng Executor và Khôi Phục Cờ Tín Hiệu Ngắt (Interrupt).

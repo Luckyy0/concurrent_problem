@@ -4,16 +4,16 @@
 
 Case dùng hai tầng kiểm thử:
 
-1. test có kiểm soát dùng `CyclicBarrier` để buộc hai actor cùng đọc một state
+1. kiểm thử có kiểm soát dùng `CyclicBarrier` để buộc hai tác nhân cùng đọc một trạng thái
    trước khi được phép ghi;
-2. test nhiều luồng dùng `CountDownLatch` trên code đã sửa để kiểm tra ID không
+2. kiểm thử nhiều luồng dùng `CountDownLatch` trên code đã sửa để kiểm tra ID không
    trùng và dữ liệu của từng request không bị lẫn.
 
 Không cần Testcontainers vì case không phụ thuộc vào hành vi của database.
 
 ## Tái hiện lỗi có kiểm soát
 
-Service có điểm điều phối dưới đây chỉ được dùng trong test. Barrier dừng hai
+Service có điểm điều phối dưới đây chỉ được dùng trong kiểm thử. Barrier dừng hai
 luồng sau bước đọc, nhờ đó tái hiện ổn định chuỗi đọc–sửa–ghi bị lỗi:
 
 ```java
@@ -54,7 +54,7 @@ class BrokenReceiptDraftServiceConcurrencyTest {
                     (aliceResult.customerId().equals("alice") ? 1 : 0)
                     + (bobResult.customerId().equals("bob") ? 1 : 0);
 
-            // Cả hai result đọc cùng lastCustomerId; đúng tối đa một request.
+            // Cả hai kết quả đọc cùng lastCustomerId; đúng tối đa một request.
             assertEquals(1, correctlyIsolatedResults);
         } finally {
             executor.shutdownNow();
@@ -102,16 +102,16 @@ class BrokenReceiptDraftServiceConcurrencyTest {
 ```
 
 `CyclicBarrier` tạo quan hệ xảy ra-trước giữa các thao tác trước và sau
-`await()`. Nhờ vậy, test kiểm soát thứ tự bằng cơ chế đồng bộ thay vì đoán thời
+`await()`. Nhờ vậy, kiểm thử kiểm soát thứ tự bằng cơ chế đồng bộ thay vì đoán thời
 điểm bằng `Thread.sleep`.
 
-> **Nói ngắn gọn:** test chủ động đặt hai luồng đúng vào cửa sổ gây lỗi, nên kết
-> quả không phụ thuộc vào may rủi của scheduler.
+> **Nói ngắn gọn:** kiểm thử chủ động đặt hai luồng đúng vào cửa sổ gây lỗi, nên kết
+> quả không phụ thuộc vào may rủi của bộ lập lịch.
 
 ## Kiểm thử hồi quy cho code đã sửa
 
-Test này cho 100 lời gọi bắt đầu cùng thời điểm, sau đó kiểm tra các quy tắc bắt
-buộc: đủ kết quả, ID không trùng và customer không bị lẫn giữa các request.
+Kiểm thử này cho 100 lời gọi bắt đầu cùng thời điểm, sau đó kiểm tra các quy tắc bắt
+buộc: đủ kết quả, ID không trùng và dữ liệu khách hàng không bị lẫn giữa các request.
 
 ```java
 package com.example.checkout;
@@ -197,48 +197,48 @@ class ReceiptDraftServiceConcurrencyTest {
 }
 ```
 
-`ReceiptDraftService` và `DraftIdGenerator` ở test dùng đúng fixed code trong
+`ReceiptDraftService` và `DraftIdGenerator` ở kiểm thử dùng đúng mã đã sửa trong
 [solutions](solutions.md).
 
 ## Kiểm thử tải đồng thời bổ sung
 
-Có thể chạy broken implementation thật với nhiều actor và nhiều vòng lặp rồi
+Có thể chạy cách triển khai lỗi với nhiều tác nhân và nhiều vòng lặp rồi
 so sánh:
 
 ```text
-total calls
-distinct sequences
+tổng số lời gọi
+số lượng sequence khác biệt
 result.customerId == input customerId
 ```
 
 Kiểm thử tải đồng thời có thể không phát hiện lỗi ở mọi máy hoặc mọi lần chạy.
-Nó chỉ là bằng chứng bổ sung và không thay thế test có thứ tự được kiểm soát.
+Nó chỉ là bằng chứng bổ sung và không thay thế kiểm thử có thứ tự được kiểm soát.
 
 ## Kiểm tra lỗi và khả năng tiến triển
 
 - Mọi latch/barrier wait phải có timeout.
 - Dùng `Future.get(timeout)` nếu task có thể bị deadlock.
 - Luôn đóng executor trong `finally`.
-- Test phải thất bại khi thiếu kết quả, không chỉ khi phát hiện ID trùng.
-- Phải khôi phục interrupt status khi bắt `InterruptedException`.
+- Kiểm thử phải thất bại khi thiếu kết quả, không chỉ khi phát hiện ID trùng.
+- Phải khôi phục trạng thái ngắt (interrupt status) khi bắt `InterruptedException`.
 
 ## Xác minh trong môi trường thực tế
 
 Theo dõi các tín hiệu sau:
 
-- duplicate business/correlation ID bị database constraint reject;
-- mismatch giữa authenticated customer và result owner;
-- số retry cùng request/idempotency key;
-- thread pool queueing và request latency;
-- restart/deployment có làm local sequence tái sử dụng hay không.
+- định danh nghiệp vụ hoặc định danh tương quan bị trùng bị ràng buộc database từ chối;
+- sự không khớp giữa khách hàng đã xác thực và chủ sở hữu kết quả;
+- số lần thử lại cùng request/khóa idempotency;
+- hàng đợi của thread pool và độ trễ của request;
+- khởi động lại hoặc triển khai có làm sequence cục bộ tái sử dụng hay không.
 
-Không ghi trực tiếp dữ liệu customer nhạy cảm vào log chỉ để chẩn đoán tranh
-chấp. Dùng request ID và trường audit có cấu trúc phù hợp.
+Không ghi trực tiếp dữ liệu khách hàng nhạy cảm vào log chỉ để chẩn đoán tranh
+chấp. Dùng ID của request và trường kiểm toán có cấu trúc phù hợp.
 
 ## Checklist chất lượng của case
 
-- [x] Deterministic interleaving không dùng sleep.
-- [x] Fixed implementation được chạy với nhiều actor.
-- [x] Assert uniqueness và request isolation.
-- [x] Timeout/cleanup được khai báo.
-- [x] Không dùng H2/Testcontainers vì không có database behavior.
+- [x] Xen kẽ tất định (deterministic interleaving) không dùng sleep.
+- [x] Mã đã sửa được chạy với nhiều luồng.
+- [x] Khẳng định tính duy nhất và tính độc lập của request.
+- [x] Timeout/dọn tiết được khai báo.
+- [x] Không dùng H2/Testcontainers vì không có hành vi database.

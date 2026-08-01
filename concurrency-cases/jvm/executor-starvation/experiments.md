@@ -1,8 +1,8 @@
-# Deterministic experiments và production verification
+# Môi Trường Thực Nghiệm: Cấu Trúc Kiểm Định Rủi Ro & Đánh Giá Khai Thác
 
-## Experiment 1: tái hiện self-starvation
+## 1. Thí Nghiệm 1: Trình Diễn Bế Tắc Khép Kín (Self-Starvation)
 
-Hai parent dùng latch để chắc chắn cùng chiếm worker trước khi submit child:
+Sử dụng chốt điều hướng (Latch) để đảm bảo hai Tác vụ Cha cùng đoạt quyền kiểm soát Luồng Công Nhân trước khi phóng Tác vụ Con ra tiền tuyến:
 
 ```java
 @Test
@@ -16,20 +16,22 @@ void parentsStarveChildrenOnTheSamePool() throws Exception {
     Callable<String> parent = () -> {
         bothParentsRunning.countDown();
         if (!bothParentsRunning.await(5, TimeUnit.SECONDS)) {
-            throw new IllegalStateException("parents did not overlap");
+            throw new IllegalStateException("Quy trình giả lập đan chéo đổ vỡ");
         }
+        // Cha đẩy Con vào Hàng đợi và chôn chân chờ đợi
         Future<String> child = pool.submit(() -> "child-done");
-        return child.get(30, TimeUnit.SECONDS);
+        return child.get(30, TimeUnit.SECONDS); 
     };
 
     Future<String> first = pool.submit(parent);
     Future<String> second = pool.submit(parent);
     try {
+        // Tái xác nhận hệ thống đã đóng băng và văng lỗi Quá hạn
         assertThrows(TimeoutException.class,
                 () -> first.get(300, TimeUnit.MILLISECONDS));
-        assertEquals(2, pool.getActiveCount());
-        assertEquals(2, pool.getQueue().size());
-        assertEquals(0, pool.getCompletedTaskCount());
+        assertEquals(2, pool.getActiveCount()); // 100% Công Nhân đang kẹt
+        assertEquals(2, pool.getQueue().size()); // 100% Con bị nhốt
+        assertEquals(0, pool.getCompletedTaskCount()); // Không một ai hoàn thành
     } finally {
         first.cancel(true);
         second.cancel(true);
@@ -39,13 +41,11 @@ void parentsStarveChildrenOnTheSamePool() throws Exception {
 }
 ```
 
-Timeout là watchdog/assertion, còn latch tạo topology deterministic. Test cleanup
-parent; interruption làm `child.get()` thoát.
+Hệ thống Timeout chỉ mang ý nghĩa làm Người gác cổng (Watchdog/Assertion), trong khi cấu trúc Latch mới là kiến trúc sư định hình Hình thái Cố định (Deterministic topology). Quy trình Hủy thử nghiệm (Test cleanup) tác động lên Cha; Cơ chế Ngắt (Interruption) sẽ ép hàm `child.get()` buông tay.
 
-> **Nói ngắn gọn:** assertion kết hợp “worker đều active, child đều queued,
->completed bằng 0” mô tả starvation rõ hơn một timeout đơn lẻ.
+> **Nguyên tắc kỹ thuật:** Bằng chứng pháp lý "Công nhân chạy toàn bộ, Trẻ em kẹt trong hàng đợi, Hoàn thành bằng Không" khắc họa chân dung Nạn đói Tài nguyên một cách đanh thép hơn hàng vạn lần so với một tín hiệu Timeout đơn lẻ.
 
-## Experiment 2: direct call giữ progress
+## 2. Thí Nghiệm 2: Truy Vấn Trực Tiếp Giải Tỏa Tiến Trình (Direct Call)
 
 ```java
 @Test
@@ -54,7 +54,7 @@ void directDependencyCallCompletesAtPoolCapacity() throws Exception {
     CountDownLatch start = new CountDownLatch(1);
     Callable<String> task = () -> {
         if (!start.await(5, TimeUnit.SECONDS)) throw new IllegalStateException();
-        return loadPriceDirectly();
+        return loadPriceDirectly(); // Truy xuất trực tiếp, không qua Hàng đợi
     };
     Future<String> first = pool.submit(task);
     Future<String> second = pool.submit(task);
@@ -69,38 +69,41 @@ void directDependencyCallCompletesAtPoolCapacity() throws Exception {
 }
 ```
 
-Fake dependency phải bounded/deterministic; không dùng sleep.
+Kiến tạo Giả lập (Fake dependency) bắt buộc tuân thủ tính Định Lượng (Bounded/Deterministic); Khước từ vĩnh viễn cấu trúc Ngủ (Sleep).
 
-## Experiment 3: rejection và cancellation
+## 3. Thí Nghiệm 3: Cơ Chế Khước Từ Và Hủy Bỏ (Rejection & Cancellation)
 
-Với pool 1 + queue 1, giữ worker bằng latch, enqueue một task rồi submit task thứ
-ba. Assert `RejectedExecutionException` ngay tại admission boundary. Sau đó
-release latch và xác nhận hai accepted tasks hoàn tất. Test timeout path phải
-assert child future nhận `cancel(true)` và worker interrupt status được xử lý.
+Kiến trúc thử nghiệm: Pool 1 + Queue 1. Phong tỏa Luồng Công Nhân qua Latch, tống khứ một Tác vụ vào Hàng đợi, tiếp tục nhồi Tác vụ thứ 3. Kích hoạt xác thực `RejectedExecutionException` ngay tại Cổng kiểm soát (Admission boundary).
+Kế tiếp, phá khóa Latch và nghiệm thu hai Tác vụ lọt lưới đã hoàn tất quy trình. 
+Luồng Kiểm định Timeout (Timeout path) bắt buộc xác nhận các Tác vụ Con phải hứng chịu tín hiệu `cancel(true)` và cờ Trạng Thái Ngắt (Interrupt status) của Luồng Công Nhân đã được khôi phục.
 
-## Load/stress checks
+## 4. Xác Minh Sức Chịu Tải (Load/Stress Checks)
 
-Tăng request rate qua admission capacity và assert: queue không vượt bound,
-rejection xuất hiện trước memory growth, completed count tiếp tục tăng, p99 queue
-age nằm trong deadline, retry không quay ngay vào cùng node. Stress không thay
-thế deterministic nested-blocking test.
+Kích thích Cường độ Yêu cầu (Request rate) vượt ngưỡng Cổng kiểm soát và chứng thực:
+- Dung lượng Hàng đợi không bùng nổ vượt giới hạn.
+- Sự kiện Từ chối (Rejection) xuất hiện trước khi Dung lượng Bộ nhớ (Memory growth) phình to.
+- Chỉ số Hoàn Tất (Completed count) vận hành bền bỉ.
+- Độ tuổi P99 của Hàng đợi (P99 queue age) nằm gọn trong Hạn mức cho phép.
+- Cơ chế Thử lại (Retry) không tự lao đầu vào lại chính Nút (Node) đang tử nạn.
+Lưu ý: Bộ Stress Test tuyệt đối không thay thế đặc tính chứng minh logic của bài Test Chờ Lồng Nhau.
 
-## Production verification
+## 5. Giám Sát Môi Trường Khai Thác (Production Blueprint)
 
-- active/max worker, queue size/capacity và oldest task age;
-- submitted/started/completed/rejected/cancelled delta;
-- queue wait, execution, dependency latency và end-to-end deadline;
-- thread dump worker stack ở `Future.get`/remote I/O;
-- downstream connection/quota utilization;
-- graceful shutdown elapsed và unfinished task count.
+Đặc tả vận hành:
+- Giám sát Luồng Active/Max, Thông lượng Hàng đợi/Sức chứa, Tuổi đời Tác vụ tồn đọng (Oldest task age);
+- Biên độ biến động Tác vụ Đệ trình/Bắt đầu/Hoàn Tất/Từ Chối/Hủy (Delta);
+- Khảo sát Thời gian Chờ (Queue wait), Thời lượng Thi Hành (Execution), Độ trễ Cấu trúc phụ thuộc (Dependency latency) và Hạn mức Cuối (End-to-end deadline);
+- Trích xuất Thread Dump vạch trần Ngăn Xếp Luồng Công Nhân (Worker stack) mắc kẹt tại `Future.get` / Nhập Xuất Viễn Trình (Remote I/O);
+- Đánh giá khả năng Tiêu thụ Tài nguyên Ngoại vi / Hạn Mức Tải (Downstream connection/Quota utilization);
+- Theo dõi Độ trễ Tắt Hệ Thống (Graceful shutdown elapsed) và Khối lượng Tác vụ Chết yếu (Unfinished task count).
 
-## Checklist
+## 6. Khung Tiêu Chuẩn Thực Nghiệm (Quality Checklist)
 
-- [ ] Latch chứng minh cả parent giữ worker trước child submit.
-- [ ] Mọi await/get có timeout.
-- [ ] Không dùng `Thread.sleep`.
-- [ ] Starvation assertion kiểm tra active, queued và completed.
-- [ ] Cleanup cancel task và await executor termination.
-- [ ] Fixed test chứng minh progress tại cùng pool size.
-- [ ] Rejection policy được test tại overload boundary.
-- [ ] Production metric phân biệt queue wait và execution time.
+- [ ] Latch chứng minh hai Tác vụ Cha đã độc chiếm Luồng Công Nhân trước thềm Tác vụ Con ra đời.
+- [ ] 100% Mỏ neo `await`/`get` được gắn Timeout.
+- [ ] Xóa bỏ hoàn toàn định dạng `Thread.sleep`.
+- [ ] Chứng thực Nạn đói Tài nguyên bao hàm cả chuỗi số liệu: Active, Queued, Completed.
+- [ ] Tái lập quy trình Cleanup: Hủy Tác vụ và Neo hệ thống chờ Executor Shutdown.
+- [ ] Fixed test chứng minh Mạch Tiến Trình thông suốt trên cùng cấu trúc Pool.
+- [ ] Chính sách Khước từ (Rejection policy) đụng độ Bài kiểm định Cửa ngõ Quá tải (Overload boundary).
+- [ ] Metric Production phân định rạch ròi Độ Trễ Hàng Đợi (Queue wait) và Thời lượng Thi Hành.

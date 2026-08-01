@@ -11,7 +11,7 @@ Case này bảo vệ hai **quy tắc luôn phải đúng** (`business invariant`
 
 ```text
 Mỗi draft ID phải là duy nhất trong phạm vi đã cam kết.
-result.customerId phải thuộc đúng request đã tạo result.
+result.customerId phải thuộc đúng request đã tạo kết quả.
 ```
 
 Phạm vi case chỉ là các luồng trong **một JVM**. Trường hợp entity JPA bị mất cập
@@ -36,14 +36,14 @@ nhật và cách database transaction xử lý xung đột thuộc `DB-001`.
 
 API tạo một `ReceiptDraft` trước khi checkout:
 
-- request A thuộc customer `alice`;
-- request B thuộc customer `bob`;
+- request A thuộc khách hàng `alice`;
+- request B thuộc khách hàng `bob`;
 - Tomcat hoặc Jetty xử lý hai request đồng thời;
-- `ReceiptDraftService` lưu sequence và customer gần nhất trong field của
+- `ReceiptDraftService` lưu sequence và khách hàng gần nhất trong field của
   service.
 
 Draft ID bị trùng có thể làm log, file tạm hoặc mã liên kết với hệ thống phía sau
-bị gộp sai. Nghiêm trọng hơn, dữ liệu customer của request này có thể xuất hiện
+bị gộp sai. Nghiêm trọng hơn, dữ liệu khách hàng của request này có thể xuất hiện
 trong kết quả của request khác.
 
 ## Trạng thái dùng chung và điểm tranh chấp
@@ -82,25 +82,25 @@ cập field của singleton.
 - sequence bị trùng do mất cập nhật;
 - dữ liệu bị lẫn giữa các request;
 - log và mã liên kết không còn đáng tin cậy;
-- test tuần tự vẫn pass nhưng hệ thống lỗi dưới tải đồng thời.
+- kiểm thử tuần tự vẫn vượt qua nhưng hệ thống lỗi khi chịu tải đồng thời.
 
 ### Hậu quả nghiệp vụ
 
-- draft của customer A có thể chứa identifier của customer B;
-- lệnh gửi xuống hệ thống sau có thể tham chiếu nhầm draft;
-- audit trail khó dùng để điều tra sự cố;
-- nếu field chứa dữ liệu nhạy cảm, lỗi trở thành data leakage.
+- bản nháp của khách hàng A có thể chứa định danh của khách hàng B;
+- lệnh gửi xuống hệ thống sau có thể tham chiếu sai bản nháp;
+- dữ liệu kiểm toán khó dùng để điều tra sự cố;
+- nếu field chứa dữ liệu nhạy cảm, lỗi trở thành rò rỉ dữ liệu.
 
 ## Hướng sửa được khuyến nghị
 
 Thiết kế service theo hướng **không giữ trạng thái của request** (`stateless`):
 
-- dữ liệu request chỉ nằm trong parameter hoặc local variable;
-- kết quả là immutable object;
+- dữ liệu request chỉ nằm trong tham số hoặc biến cục bộ;
+- kết quả là đối tượng bất biến (immutable object);
 - ID được tạo bởi generator an toàn cho nhiều luồng và phù hợp với phạm vi cần
-  bảo đảm uniqueness;
-- nếu ID là business identity dùng chung giữa nhiều node, database hoặc
-  authoritative store phải bảo vệ uniqueness bằng constraint phù hợp.
+  bảo đảm tính duy nhất;
+- nếu ID là định danh nghiệp vụ dùng chung giữa nhiều node, database hoặc
+  kho lưu trữ chính phải bảo vệ tính duy nhất bằng ràng buộc phù hợp.
 
 ## Khi nào nên dùng từng giải pháp
 
@@ -112,5 +112,5 @@ Thiết kế service theo hướng **không giữ trạng thái của request** 
   bỏ trạng thái thay đổi và mức tranh chấp thấp.
 - Dùng database sequence cùng unique constraint khi ID là định danh nghiệp vụ
   bền vững và dùng chung giữa nhiều node.
-- Không dùng `ThreadLocal` để che giấu dữ liệu request nếu parameter hoặc local
-  variable đã diễn tả data flow rõ ràng hơn.
+- Không dùng `ThreadLocal` để che giấu dữ liệu request nếu tham số hoặc biến cục bộ
+  đã diễn tả luồng dữ liệu rõ ràng hơn.

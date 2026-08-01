@@ -1,21 +1,21 @@
-# Bí Kíp Hóa Giải: Snapshot, Validation và Cầm Khóa (Giải pháp)
+# Giải Pháp: Sử Dụng Snapshot, Validation và Khóa (Solutions)
 
-## 1. Mục tiêu thiết kế (Mục tiêu cốt lõi)
+## 1. Mục tiêu cốt lõi (Design objectives)
 
-Trước khi gõ phím, phải trả lời bằng được câu hỏi cốt tử về nghiệp vụ (business) này:
+Trước khi tiến hành thiết kế, hệ thống cần làm rõ yêu cầu nghiệp vụ về tính đồng nhất của quyết định xét duyệt:
 
 ```text
-Cái Quyết Định xét duyệt phải ĐÚNG LÝ theo:
-  - Cái Luật nằm ở lúc tui đọc nó ra?
-  - Hay Cái Luật nằm ở khoảnh khắc tui Ghi Quyết Định xuống?
-  - Hay Cái Luật bị ép Đứng Yên Không Đổi cho đến khi Giao Dịch này chốt sổ?
+Yêu cầu hợp lệ của quyết định:
+  - Dựa trên chính sách ở thời điểm hệ thống ĐỌC để đánh giá?
+  - Dựa trên chính sách mới nhất tại thời điểm hệ thống GHI quyết định?
+  - Hay chính sách phải ĐƯỢC GIỮ NGUYÊN không đổi từ lúc đọc cho đến khi kết thúc giao dịch?
 ```
 
-Dù sếp chọn đường nào, hệ thống cũng PHẢI LƯU lại Phiên Bản Luật (coherent policy revision) duy nhất, CẤM TIỆT chuyện vay mượn râu ông nọ (snapshot 1) cắm cằm bà kia (snapshot 2).
+Bất kể tùy chọn nào được đưa ra, hệ thống PHẢI đảm bảo việc ghi nhận duy nhất một Phiên bản chính sách đồng nhất (coherent policy revision), ngăn chặn tuyệt đối tình trạng kết hợp kết quả đánh giá ở snapshot 1 với phiên bản audit ở snapshot 2.
 
-## 2. Giải pháp 1 — Chụp Một Tấm Ảnh Đóng Băng Dùng Tới Bến (Đọc một immutable policy snapshot)
+## 2. Giải pháp 1 — Đọc một Immutable Policy Snapshot
 
-Nếu Luật Công ty cho phép: "Lúc Đọc ra thấy đúng là duyệt luôn, mặc kệ ai sửa sau đó", thì hãy Đọc ĐÚNG MỘT LẦN rồi nhét vào một Object Kín Cổng Cao Tường (value object) truyền đi khắp nơi:
+Nếu quy định kinh doanh cho phép đánh giá dựa trên trạng thái chính sách tại thời điểm đọc, và không yêu cầu phải là dữ liệu mới nhất khi chốt, thì ứng dụng nên đọc dữ liệu MỘT LẦN DUY NHẤT. Dữ liệu này được đóng gói thành một Value Object không thể thay đổi (immutable):
 
 ```java
 public record RefundPolicySnapshot(
@@ -30,7 +30,7 @@ public record RefundPolicySnapshot(
 }
 ```
 
-Tầng Kho Chứa (Repository) trả về đối tượng và nhét thẳng vào Record:
+Tầng Repository đóng gói kết quả truy vấn thành đối tượng trên:
 
 ```java
 @Repository
@@ -63,7 +63,7 @@ public class RefundPolicyReader {
 }
 ```
 
-Tầng Dịch Vụ CẤM KHÔNG ĐƯỢC Gọi Query lần 2:
+Tầng Dịch Vụ sẽ chỉ sử dụng duy nhất object này trong suốt quá trình xử lý:
 
 ```java
 @Transactional(isolation = Isolation.READ_COMMITTED)
@@ -72,16 +72,16 @@ public RefundResult decide(
     UUID merchantId,
     BigDecimal amount
 ) {
-    // ĐỌC 1 LẦN DUY NHẤT!
+    // Chỉ đọc thông tin chính sách MỘT LẦN duy nhất
     RefundPolicySnapshot policy = policyReader.read(merchantId);
 
     if (!policy.allows(amount)) {
         return RefundResult.manualReview();
     }
 
-    localRules.validate(amount); // Có ngâm vài giây cũng chả sao
+    localRules.validate(amount); // Quá trình tính toán kéo dài
 
-    // GHI SỔ CÙNG DỮ LIỆU ĐÓ
+    // Ghi nhận quyết định dựa trên chính thông tin vừa đọc
     RefundDecision saved = decisions.save(
         RefundDecision.approved(
             commandId,
@@ -95,16 +95,16 @@ public RefundResult decide(
 }
 ```
 
-Bằng chứng duyệt khớp 100% với Phiên bản Luật đã đọc. Bất quá có ai đó (Concurrent update) sửa Luật thành Bản mới sau lưng thì kệ họ; Cách này đéo hứa hẹn chuyện "Luật phải mới nhất lúc tui chốt sổ" (latest at decision commit).
+Hệ thống ghi nhận bằng chứng xét duyệt khớp hoàn toàn với phiên bản chính sách đã truy xuất. Mọi cập nhật đồng thời diễn ra sau lệnh đọc sẽ không tác động đến giao dịch này.
 
-> **Nói ngắn gọn:** Đọc 1 lần là dẹp tan nạn Trộn Ảnh. Nhưng phải có Kho Lịch Sử Luật Bất Khả Xâm Phạm (immutable policy history) thì cái Phán Quyết Cũ mèm mới có chỗ mà bấu víu (audit) lâu dài.
+> **Ghi chú:** Đọc dữ liệu một lần giải quyết được triệt để vấn đề trộn lẫn snapshot. Tuy nhiên, nó đòi hỏi hệ thống phải lưu trữ lịch sử chính sách (immutable policy history) để đối soát quyết định dựa trên các phiên bản cũ trong tương lai.
 
-## 3. Giải pháp 2 — Biến Lịch Sử Thành Bất Tử (Versioned policy history)
+## 3. Giải pháp 2 — Lưu trữ Lịch Sử Chính Sách Bất Biến (Versioned policy history)
 
-Lưu có đúng 1 Dòng Mới Nhất (Mutable current row) là Tội Ác, vì đéo thể nào lật lại Phiên bản cũ. Phải tách Bảng ra cho chúng Bất Tử (immutable):
+Việc duy trì một bản ghi cập nhật trạng thái mới nhất là chưa đủ, hệ thống cần bảo tồn lịch sử qua từng phiên bản:
 
 ```sql
--- KHO LƯU BẤT TỬ
+-- BẢNG LƯU TRỮ LỊCH SỬ BẤT BIẾN
 create table merchant_refund_policy_version (
     merchant_id uuid not null,
     revision bigint not null,
@@ -115,7 +115,7 @@ create table merchant_refund_policy_version (
     check (auto_refund_limit >= 0)
 );
 
--- CÂY KIM CHỈ NAM (Trỏ Tới Bản Mới Nhất)
+-- BẢNG CON TRỎ (Chỉ định phiên bản hiện hành)
 create table merchant_refund_policy_current (
     merchant_id uuid primary key,
     revision bigint not null,
@@ -123,14 +123,14 @@ create table merchant_refund_policy_current (
         references merchant_refund_policy_version(merchant_id, revision)
 );
 
--- ÉP RÀNG BUỘC KHI GHI SỔ
+-- RÀNG BUỘC KHÓA NGOẠI KHI GHI QUYẾT ĐỊNH
 alter table refund_decision
     add constraint fk_refund_decision_policy_version
     foreign key (merchant_id, policy_revision)
     references merchant_refund_policy_version(merchant_id, revision);
 ```
 
-Sếp Admin khi Update Luật mới sẽ Ghi Thêm 1 dòng Lịch Sử rồi Bẻ Kim Chỉ Nam:
+Thao tác cập nhật chính sách bao gồm thêm phiên bản mới và chuyển con trỏ:
 
 ```sql
 begin;
@@ -149,11 +149,11 @@ update merchant_refund_policy_current
  where merchant_id = :merchantId
    and revision = :expectedRevision;
 
--- Cập nhật thành công phải lòi ra affected row = 1
+-- Tiến trình hợp lệ khi số dòng ảnh hưởng của UPDATE là 1
 commit;
 ```
 
-Còn App đọc Luật thì xài lệnh Tích Hợp (Join):
+Lệnh truy vấn của ứng dụng khi sử dụng Join:
 
 ```sql
 select v.merchant_id,
@@ -167,12 +167,11 @@ join merchant_refund_policy_version v
 where c.merchant_id = :merchantId;
 ```
 
-Cái Khóa Ngoại (Foreign key) trói cứng không cho ai Ghi Quyết Định xài Số Phiên Bản Bậy Bạ. Luật Cũ đéo bị Ghi Đè, nên 10 năm sau Audit dò lại Phiên Bản `7` vẫn nguyên vẹn hình hài dù Mũi Kim hiện tại đang là Phiên Bản `8`.
-Nếu thao tác Dời Kim trả về `affected-row = 0`, Sếp Admin mất cờ (thua optimistic conflict) và phải tự làm lại giao dịch (retry toàn transaction) với revision mới.
+Cấu trúc khóa ngoại (Foreign key) đảm bảo tính toàn vẹn của audit log. Nếu thao tác dời con trỏ (cập nhật) không ảnh hưởng tới bản ghi nào (bị tranh chấp optimistic locking), quản trị viên cần khởi tạo lại giao dịch với thông tin cập nhật nhất.
 
-## 4. Giải pháp 3 — Móc Chốt Lệnh Cửa Cuối (Conditional final validation)
+## 4. Giải pháp 3 — Xác Thực Có Điều Kiện Ở Bước Cuối (Conditional final validation)
 
-Nếu Hợp đồng yêu cầu "Lúc cắm bút Ghi Sổ, Luật ĐÓ phải chưa Bị Ai Đụng", hãy nhét cái điều kiện Đuôi (predicate) vào thẳng Lệnh GHI (`INSERT ... SELECT`):
+Nếu nghiệp vụ yêu cầu kiểm soát chính sách không thay đổi ngay tại thời điểm ghi quyết định, hệ thống nên nhúng điều kiện kiểm tra (predicate) trực tiếp vào lệnh lưu (sử dụng `INSERT ... SELECT`):
 
 ```sql
 insert into refund_decision(
@@ -193,12 +192,12 @@ select :decisionId,
        p.revision
 from merchant_refund_policy p
 where p.merchant_id = :merchantId
-  and p.revision = :expectedRevision -- CÒN ĐÚNG PHIÊN BẢN CŨ THÌ MỚI INSERT
+  and p.revision = :expectedRevision -- KIỂM TRA PHIÊN BẢN KHÔNG THAY ĐỔI
   and p.active
   and :amount <= p.auto_refund_limit;
 ```
 
-Nhét vô Spring Repository:
+Tích hợp vào Spring Repository:
 
 ```java
 public interface RefundDecisionCommands {
@@ -230,7 +229,7 @@ public interface RefundDecisionCommands {
 }
 ```
 
-Tại Tầng Dịch Vụ:
+Tầng Dịch Vụ:
 
 ```java
 @Transactional
@@ -244,11 +243,11 @@ public RefundResult decideValidated(
         return RefundResult.manualReview();
     }
 
-    localRules.validate(amount); // Tốn cả thanh xuân
+    localRules.validate(amount); // Tính toán bổ sung
 
     UUID decisionId = UUID.randomUUID();
 
-    // Vừa CHÈN vừa THẨM ĐỊNH LẠI
+    // Kết hợp Ghi dữ liệu và Kiểm tra xác thực (Validation)
     int inserted = commands.insertIfPolicyStillAllows(
         decisionId,
         commandId,
@@ -256,22 +255,20 @@ public RefundResult decideValidated(
         amount,
         policy.revision()
     );
-    if (inserted == 0) { // NẾU HỤT CHÂN THÌ DỪNG LẠI NGAY!
+    if (inserted == 0) { // Hủy giao dịch nếu bản ghi đã thay đổi
         throw new PolicyChangedException(merchantId, policy.revision());
     }
     return RefundResult.approved(decisionId);
 }
 ```
 
-Ra `affected-row = 1` là êm xuôi (Luật vẫn nguyên vẹn ngay lúc Lệnh thực thi). Ra `0` tức là Luật bị tắt, Số tiền quá lố, hoặc Đứa Nào Vừa Nâng Phiên Bản xong; Lúc này Giao Dịch bị đá Rollback, báo văng Exception để bên ngoài bắt Đầu Transaction mới mà làm lại (retry).
+Kết quả `affected-row = 1` chứng tỏ chính sách ổn định trong thời gian lệnh ghi thực thi. Nếu `affected-row = 0`, nguyên nhân có thể do hạn mức, trạng thái active thay đổi hoặc phiên bản đã được nâng lên. Trường hợp này, ứng dụng ném ngoại lệ và giao dịch sẽ bị rollback, sau đó tiến hành thủ tục retry.
 
-Cái `command_id` Unique chỉ để ngăn chặn bấm Submit liên tục (duplicate delivery). Văng lỗi Unique phải phân biệt rõ ràng với Lỗi Hụt Chân Phiên Bản và xử lý theo idempotency contract.
+Lưu ý: Lệnh `INSERT ... SELECT` phản ánh trạng thái statement snapshot. Khả năng giao dịch quản trị thực hiện commit ngay sau lệnh này nhưng trước khi giao dịch xét duyệt hoàn tất (commit) vẫn tồn tại (tuy cực kỳ thấp). Để loại bỏ hoàn toàn khoảng trống hẹp này, hệ thống cần áp dụng cơ chế Khóa cấp dòng (Row Lock).
 
-Hạt sạn nhỏ: Lệnh `INSERT ... SELECT` này xác nhận trạng thái lúc câu Lệnh Chạy (statement snapshot). Kẻ xấu vẫn CÓ THỂ chốt đè (commit) Ngay Sau Câu Lệnh Đó Nhưng TRƯỚC KHI Bọc Giao Dịch Này Kịp Chốt Sổ. Nếu Hợp đồng cấm tiệt luôn khe hở nhỏ xíu này -> Đi lấy Ổ Khóa Dòng (Row Lock) mà xài.
+## 5. Giải pháp 4 — Khóa Chia Sẻ (Pessimistic Read / `FOR SHARE`)
 
-## 5. Giải pháp 4 — Nắm Đầu Ổ Khóa Đọc `FOR SHARE`
-
-Ổ Khóa đọc `FOR SHARE` của PostgreSQL siết chặt cái Dòng Dữ Liệu đó (row-level lock) tới tận lúc Giao dịch Chốt Sổ hay Rollback, khiến thằng B Cập Nhật Luật (UPDATE/DELETE) vỡ mồm rụng răng Đứng Nhìn:
+Sử dụng khóa `FOR SHARE` để đảm bảo bản ghi chính sách bị khóa đối với các hành động chỉnh sửa (UPDATE/DELETE) cho đến khi giao dịch hiện tại hoàn tất:
 
 ```sql
 select merchant_id, auto_refund_limit, active, revision
@@ -280,7 +277,7 @@ where merchant_id = :merchantId
 for share;
 ```
 
-Dùng tuyệt chiêu khóa Bi Quan (Pessimistic read) của Spring Data:
+Cấu hình khóa bi quan trong Spring Data:
 
 ```java
 public interface LockedPolicyRepository
@@ -296,7 +293,7 @@ public interface LockedPolicyRepository
 }
 ```
 
-Với PostgreSQL, nhớ căng mắt xem Code nó sinh ra SQL có Dính Cụm `FOR SHARE` chưa; xài mẹ nó lệnh `nativeQuery = true` (hoặc test) cho chắc cú ăn ngủ khỏi lo.
+Tầng Dịch Vụ:
 
 ```java
 @Transactional
@@ -305,7 +302,7 @@ public RefundResult decideWhilePolicyLocked(
     UUID merchantId,
     BigDecimal amount
 ) {
-    // KHÓA ĐẦU NÓ LẠI!
+    // KHÓA BẢN GHI
     MerchantRefundPolicy policy = lockedPolicies
         .findForDecision(merchantId)
         .orElseThrow(PolicyNotFoundException::new);
@@ -314,7 +311,7 @@ public RefundResult decideWhilePolicyLocked(
         return RefundResult.manualReview();
     }
 
-    // YÊN TÂM CHƠI CÁC TRÒ Ở ĐÂY VÌ LUẬT KHÔNG THỂ BỊ ĐỔI
+    // Đảm bảo chính sách không thể bị thay đổi đồng thời trong đoạn mã này
 
     RefundDecision saved = decisions.save(
         RefundDecision.approved(
@@ -329,18 +326,18 @@ public RefundResult decideWhilePolicyLocked(
 }
 ```
 
-Cách cuộc chơi diễn ra:
+Cơ chế khóa:
 
-1. Lính A ẵm Cục Khóa Share Row.
-2. Sếp B xách dao nhào vô đòi UPDATE -> Đứng Xếp Hàng!
-3. Lính A chậm rãi nhét Quyết Định (INSERT) rồi Chốt (commit) hoặc Bỏ (rollback).
-4. Khóa của A rơi xuống; Sếp B mới được lao vô làm tiếp (nếu chưa quá giờ - timeout/fail).
+1. Luồng xét duyệt thu được khóa cấp dòng `FOR SHARE`.
+2. Luồng quản trị rủi ro bị block nếu cố gắng UPDATE cùng bản ghi đó.
+3. Luồng xét duyệt chèn kết quả và commit.
+4. Luồng quản trị mới tiếp tục (nếu chưa vượt quá `lock_timeout`).
 
-Luật thép: KHÔNG ĐƯỢC NHÉT các lệnh ngâm (Gọi HTTP, Gọi API I/O) vào cái Giao Dịch Đang Móc Khóa này. Có Khóa là phải Set thời gian chết (`lock_timeout`) rõ ràng và chuẩn bị Tinh thần Báo Lỗi để Tự Làm Lại. Nếu phải Khóa Nhiều Dòng, Nhớ Xếp Hàng Khóa theo ĐÚNG 1 TRÌNH TỰ (để giảm thiểu Bóp Cổ Nhau - Deadlock).
+Nguyên tắc bắt buộc: Không thực hiện các tác vụ I/O chậm (như gọi HTTP API) trong khi đang giữ khóa cơ sở dữ liệu. Bắt buộc thiết lập `lock_timeout` rõ ràng và có chiến lược dự phòng khi chờ khóa thất bại.
 
-## 6. Giải pháp 5 — Nâng Khiên `REPEATABLE READ`
+## 6. Giải pháp 5 — Mức Cô Lập `REPEATABLE READ`
 
-Nếu Hợp đồng nài nỉ xin Bức Ảnh Xuyên Suốt (stable transaction view):
+Sử dụng mức cô lập cấp độ giao dịch (stable transaction view):
 
 ```java
 @Transactional(isolation = Isolation.REPEATABLE_READ)
@@ -350,25 +347,23 @@ public RefundResult decideWithStableSnapshot(...) {
     RefundPolicySnapshot second = policyReader.read(merchantId);
 
     if (first.revision() != second.revision()) {
-        throw new IllegalStateException("Hợp đồng Tấm Ảnh Bị Phá Vỡ Rồi!"); // Sẽ chả bao giờ xảy ra!
+        throw new IllegalStateException("Trạng thái bất nhất, lỗi không mong muốn!"); // Điều này sẽ không xảy ra ở mức cô lập này
     }
-    // Ghi Sổ bằng cục Data lấy từ Tấm Ảnh Xuyên Suốt này.
+    // Ghi sổ dựa trên Snapshot ổn định của giao dịch.
 }
 ```
 
-Bảo Chứng: Hai phát SELECT đéo bao giờ khác nhau. Bắt buộc Mở SQL Soi (effective isolation) xem cái Bọc Vật Lý dưới DB có ăn được Mức Cô Lập này Không (Nhiều lúc thằng Giao Dịch lồng `REQUIRED` bên trong nó Bú Liếm cái Mức Cũ Rích của thằng Ngoài Cùng là Toang).
+Ưu điểm và Đánh đổi (Trade-off):
 
-Trúng Đổi Lại (Trade-off):
+- Giải quyết lỗi Đọc Không Lặp Lại mà không cần cấp khóa độc quyền.
+- Snapshot cung cấp có thể không phải dữ liệu mới nhất nếu luồng quản trị đã commit bản ghi sau khi snapshot này được cấp.
+- Giao dịch kéo dài có thể làm chậm quá trình dọn dẹp các phiên bản ghi đã cũ trong PostgreSQL (Vacuum process).
+- Bắt buộc xử lý lỗi do tranh chấp ghi (write conflict) bằng cơ chế Retry nếu cần thực thi trên cùng bản ghi.
+- Giải pháp này vẫn đòi hỏi có hệ thống lịch sử lưu trữ để đáp ứng yêu cầu Audit.
 
-- Bịt được Lỗi Đọc Không Lặp Lại MÀ ĐÉO CẦN ÔM KHÓA DÒNG (read row lock).
-- NHƯNG Tấm Ảnh có thể Bị Ố Vàng Hôi Thiu (stale) so với Thằng Chốt mới.
-- Giao dịch rề rà sẽ Giam Cầm mấy cái Cục Xóa Rác/Tài Nguyên ngâm giấm dưới DB lâu hơn.
-- Viết Luồng Đa Luồng (Flow phức tạp) đụng độ (write conflicts/serialization failures) thì vẫn Bắt buộc Code Lệnh Làm Lại (retry).
-- NÓ KHÔNG CHỮA ĐƯỢC CÁI TỘI LƯU LẠI VẾT NHƠ AUDIT KÉM (vẫn phải có Lịch sử Bất tử).
+## 7. Giải pháp 6 — Áp dụng Cơ chế Bounded Retry
 
-## 7. Giải pháp 6 — Làm Lại Đàng Hoàng Kẻo Hỏng (Bounded retry ở transaction mới)
-
-Toàn bộ Cỗ Máy Cố Đấm Ăn Xôi (Retry) PHẢI LÔI RA KHỎI LỚP GIAO DỊCH (transactional worker):
+Các tác vụ thử lại (Retry) cần được tách biệt hoàn toàn khỏi ngữ cảnh transaction hiện hữu:
 
 ```java
 @Service
@@ -391,9 +386,9 @@ public class RefundDecisionRetrier {
                 return attempt.runInNewTransaction(command);
             } catch (PolicyChangedException | CannotSerializeTransactionException ex) {
                 if (number == maxAttempts) {
-                    throw ex; // Hết vé, cho văng thật
+                    throw ex; // Hết số lượt thử lại, ném lỗi ra ngoài
                 }
-                backoff.pauseWithJitter(number); // Nghỉ mệt 1 chút hẵng làm
+                backoff.pauseWithJitter(number); // Nghỉ một chút và thêm ngẫu nhiên thời gian
             }
         }
         throw new IllegalStateException("unreachable");
@@ -402,76 +397,76 @@ public class RefundDecisionRetrier {
 
 @Service
 public class RefundDecisionAttempt {
-    // ĐẺ GIAO DỊCH MỚI TINH!
+    // KHỞI TẠO GIAO DỊCH MỚI
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public RefundResult runInNewTransaction(RefundCommand command) {
-        // Mở Luật Mới, Tính Lại Hết, Rồi Mới Nhét Có Điều Kiện.
+        // Đọc lại toàn bộ quy tắc, tính toán lại và chèn có điều kiện.
     }
 }
 ```
 
-Trò Nghỉ mệt (`Backoff`) phải CÓ ĐIỂM DỪNG (bounded) và có tai nghe Ngắt Điện (interrupt-aware). Tuyệt Đối cấm ôm Xác Cũ (old entity/decision) qua Kiếp Mới (retry). Lạm dụng trò Thử Lại (retry amplification) ở mấy Cửa Hàng Đông Khách (hot merchant) là Dễ Đứt Cáp DB, nhớ gắn Đo Đạc (metric) và Cổng Trám (admission control).
+Giới hạn số lần thử lại để tránh lãng phí tài nguyên và tạo ra hiện tượng "cộng hưởng lỗi" (retry amplification).
 
-## 8. Ảo Giác `SERIALIZABLE` - Đừng Tưởng Cứ Nâng Mức Là Đòi Chơi Đồ Tươi (Vì sao `SERIALIZABLE` không có nghĩa “latest”)
+## 8. Tại sao `SERIALIZABLE` không đảm bảo "Dữ liệu mới nhất"
 
-Cái mác `SERIALIZABLE` vĩ đại nó hứa hẹn là "Tụi bay chạy sao thì chạy, kết quả cuối cùng Tao sẽ sắp xếp y chang như việc tụi bây Xếp Hàng Từng Đứa chạy (serial order)". NÓ KHÔNG HỀ HỨA "Thằng vô sau Đọc Bắt Buộc phải dòm thấy Cục Dữ Liệu Tươi Nhất Của Thằng Vừa Ghi" (latest).
-Ông A hoàn toàn lọt vào Trật Tự Xếp Hàng Chạy Trước (Serialize trước) Ông B. Dù trên Đồng Hồ Thực Tế B Vừa Chốt Xong, Quyết Định Số 7 Của A Và Update Số 8 Của B Cùng Nắm Tay Nhau Đi Vào Bảng Vàng!
+Mức cô lập `SERIALIZABLE` cung cấp cam kết: Kết quả thực thi song song tương đương với kết quả của quá trình thực thi các giao dịch đó một cách tuần tự.
+Mức này KHÔNG cam kết một lệnh truy vấn luôn đọc được dữ liệu mà giao dịch khác vừa mới commit trong cùng khoảng thời gian đó.
 
-Chỉ mang Đồ Thánh `SERIALIZABLE` ra dùng khi Tương tác Ghi/Đọc (read-write dependencies) Rất Phức Tạp, VÀ BẠN SẴN SÀNG ÓI RA MÁU ÔM FULL-TRANSACTION RETRY KHI GẶP MÃ LỖI `40001`. Đừng có Lười Biếng vác Dao Mổ Trâu Nâng Mức Cô Lập (isolation) Lên Cao Tít Chỉ Vì Nhát Tay Không Dám Ngồi Viết Hợp Đồng Thời Điểm Rành Mạch!
+Nếu một tác vụ Đọc/Ghi (Luồng A) và một tác vụ Cập nhật (Luồng B) hoạt động cùng thời điểm, SSI (Serializable Snapshot Isolation) coi kịch bản "Luồng A chạy trước, sau đó Luồng B chạy" là hoàn toàn hợp lệ, cho phép cả hai luồng commit thành công mà không phát hiện anomaly.
 
-## 9. Cân Đo Đong Đếm (Trade-off comparison)
+Nên sử dụng `SERIALIZABLE` khi cấu trúc tương tác read-write dependency rất phức tạp và phải xử lý mã lỗi `40001` (serialization failure) bằng cách retry.
 
-| Bí Kíp Phương Pháp | Lá Chắn Bảo Vệ | Số Phận Kẻ Chậm Chân (Loser behavior) | Áp Lực Hệ Thống (Contention/latency) | Nhiều Máy Chủ? (Multi-instance) |
+## 9. Đánh giá và Lựa chọn (Trade-off comparison)
+
+| Chiến Lược Giải Quyết | Mức Độ An Toàn | Rủi Ro Đối Với Cập Nhật | Yêu cầu Tài Nguyên / Độ Trễ | Môi trường phân tán |
 | --- | --- | --- | --- | --- |
-| Đọc 1 Ảnh Duy Nhất | Tính toàn vẹn lúc Đọc (Evaluation) | Không Ai Bị Giết | Nhẹ nhàng | Chơi tuốt (Nếu Audit Lưu Bất Tử) |
-| Tách Lịch Sử + FK | Revision Phải Tồn Tại, Dễ Dò Dấu (Audit) | Dời Kim Hụt là Văng (no-op) | Tốn Thêm Ổ Cứng + Bảng | Chơi tốt |
-| Gắn Điều Kiện Đuôi | Luật Y Nguyên lúc Ghi Chốt | Trả về Số `0`, Phải làm lại | Nhẹ đến Vừa Phải | Chơi tuốt |
-| Trói `FOR SHARE` | Kẻ Đổi Luật Không Thể Chọt Vào | Thằng Cập Nhật Đứng Đợi/Đứt Cáp | Căng Tay Nếu Luật Này Đang Nóng! | Vô tư luôn |
-| `REPEATABLE READ` | Cái Bọc Giao Dịch Không Đứt Gãy | Dễ Chết Ở Các Đấu Trường Khác | Tốn Tài Nguyên Máy Chụp/Làm Lại | Ngon lành |
-| Khóa Java `JVM` | Chặn Đám Nhau Trong Cùng 1 RAM | Luồng Nội Bộ Bị Ngậm Miệng | Lủng Lỗ Chỗ! Vô Dụng với DB! | **BÓ TAY** |
+| Đọc Một Lần (Immutable Snapshot) | Bảo đảm toàn vẹn khi đọc | Không block, không xung đột | Nhẹ | Khả thi (cần lưu audit) |
+| Lịch sử và Con trỏ FK | Toàn vẹn lịch sử, dễ dàng Audit | Lỗi tranh chấp khi dịch con trỏ | Cần lưu trữ bảng bổ sung | Khả thi cao |
+| Truy vấn Cập Nhật Có Điều Kiện | Xác thực chính xác thời điểm Ghi | Giao dịch xét duyệt có thể phải Retry | Nhẹ nhàng | Khả thi |
+| Khóa Pessimistic (`FOR SHARE`) | Tuyệt đối chặn thay đổi đồng thời | Cập nhật bị chờ hoặc timeout | Nguy cơ nghẽn cục bộ | Khả thi |
+| `REPEATABLE READ` | Cung cấp View ổn định | Đòi hỏi xử lý write conflict riêng | Khá tốn kém (do Vacuum) | Khả thi |
+| Khóa nội bộ (`synchronized`) | An toàn cấp luồng bộ nhớ JVM | Không đồng bộ giữa nhiều máy chủ | Không quản lý DB | **Không Khả Thi** |
 
-## 10. Cách Xử Lý Hậu Sự Khi Vỡ Trận (Failure behavior)
+## 10. Chiến lược Phục hồi sau Sự cố (Failure behavior)
 
-- Lính A xé kèo (Rollback): Tờ Giấy Duyệt Tan Biến; Khóa Bị Tháo, Thế giới bình yên.
-- Sếp B xé kèo: Luật Phiên Bản Mới Tiêu Tán; Lính A cứ vô tư nhâm nhi Tấm Ảnh Cũ mà Xét.
-- Chặn Điều Kiện Báo Số 0 (Mismatch): Đá văng Giao Dịch! Dẹp! Tải Lại Ảnh Mới Ở Giao Dịch Khác.
-- Khóa Hết Giờ (Timeout/Deadlock): Toàn bộ Giao dịch hiện tại Lãnh Án Tử (fail)! Quăng mẹ cái Bộ đệm Rác (persistence context) đi, đừng xài lại!
-- Tắt Nguồn Bất Tử giữa chừng (Crash sau chốt, Trước Báo Khách): Lôi cái ID Cũ (`command_id`) ra mà gửi lại (replay)! CẤM CHẠY LẠI KHÂU TRỪ TIỀN (refund side effect)!
-- Cập Nhật Lịch Sử Chết Giữa Đường (Write fail): Rollback Đẩy Toàn Bộ Cả Cây Kim Lẫn Lịch Sử Xuống Mồ.
+- Hủy giao dịch (Rollback) bên Xét duyệt: Bản ghi quyết định bị xóa, khóa bị giải phóng.
+- Hủy giao dịch bên Quản trị: Phiên bản chính sách không được áp dụng, luồng đọc tiếp tục sử dụng bản hiện tại một cách an toàn.
+- Cập nhật có điều kiện trả về `0` (Mismatch): Hủy giao dịch xét duyệt và tự động xử lý Retry với dữ liệu mới.
+- Hết hạn khóa (Lock Timeout / Deadlock): Ném ngoại lệ, tiến hành thu hồi dữ liệu. Yêu cầu tránh sử dụng lại context Hibernate cũ.
+- Crash giữa chừng (Sau commit DB, chưa trả về Client): Client có thể gửi lại cùng một ID, hệ thống sử dụng cơ chế idempotency để chặn các side-effect dư thừa.
+- Lỗi ghi Audit: Toàn bộ thao tác cập nhật phiên bản chính sách và quyết định sẽ cùng bị rollback.
 
-## 11. Đúc Kết Chọn Bài Chữa Bệnh (Recommendation cho case này)
+## 11. Khuyến nghị Giải pháp (Recommendation)
 
-Combo Chuẩn Mực Bắt Buộc (Default):
+Cấu trúc tiếp cận chuẩn mực:
 
-1. Rinh Mẹ Nó cái Đối Tượng `RefundPolicySnapshot` (Đóng đinh 1 lần) làm thước đo (evaluation);
-2. Dán nhãn Chép Sổ gồm Phiên Bản, Mức Đã Xét, Kết Quả vào Tờ Phán Quyết (decision);
-3. Dựng Bàn Thờ Khóa Ngoại (foreign key) Bảo Vệ Cái Kho Lịch Sử Luật.
-4. Gắn Thêm Phanh Phụ (conditional final validation) Nếu Sếp Bắt Trạng Thái Phải Tươi Mới ngay tại Phút Cuối (statement).
-5. Chỉ Chơi Bùa Trói `FOR SHARE` Khi Sếp Dí Dao Vào Cổ Ép Rằng Luật Không Được Sai Lệch Một Ly nào Cho Tới Khi Chốt (commit).
+1. Đóng gói kết quả đọc đầu tiên vào đối tượng `RefundPolicySnapshot` duy nhất để sử dụng.
+2. Gắn kèm phiên bản chính sách, hạn mức và kết quả vào bản ghi quyết định khi lưu trữ.
+3. Thiết lập Khóa ngoại (Foreign key constraint) để tham chiếu đến bảng lưu trữ lịch sử chính sách độc lập.
+4. Tích hợp validation (cập nhật có điều kiện) ở bước insert nếu cần xác thực tính cập nhật của chính sách lúc chốt.
+5. Chỉ sử dụng khóa bi quan (`FOR SHARE`) cho những trường hợp hệ thống đòi hỏi độ chính xác tuyệt đối mà độ trễ hay tắc nghẽn cục bộ được đánh giá là chấp nhận được.
 
-Bùa `REPEATABLE READ` cực Hay Nếu Ông Lười Muốn Một Tấm Ảnh Xuyên Suốt Cái Giao Dịch Dài Thòng, NHƯNG NÓ KHÔNG CỨU ĐƯỢC CHUYỆN ÔNG PHẢI VIẾT ĐỀU ĐIỀU KHOẢN VÀ LƯU BẰNG CHỨNG KIỂM TOÁN!
+## 12. Danh sách rà soát triển khai (Production checklist)
 
-## 12. Danh Sách Kiểm Tra Trước Khi Trình Làng (Production checklist)
+### Yêu cầu Nghiệp vụ (Semantics)
 
-### Luật Lệ & Đạo Đức (Semantics)
+- [ ] Quy định cụ thể về thời điểm áp dụng chính sách: Đầu giao dịch hay trước lúc commit?
+- [ ] Bản ghi quyết định có liên kết (Foreign key) nhất quán với bảng lịch sử hay không?
+- [ ] Kiểm soát việc không sử dụng nhiều thuộc tính từ các nguồn đọc khác nhau cho một thực thể (No view mixing).
+- [ ] Quy trình bảo vệ Idempotency đã bao gồm chức năng ngăn chặn thao tác cập nhật trùng lặp?
 
-- [ ] Đã thống nhất với Sếp là Luật Bắt Đầu Đọc, Luật Phút Cuối, hay Luật Lúc Chốt (Commit)?
-- [ ] Cái Giấy Duyệt đã chốt có Chỉ Thẳng (Join) vào đúng cái Lịch Sử Bất Tử Không?
-- [ ] KHÔNG BỐC GHÉP Râu Ông Nọ Cằm Bà Kia (trộn fields từ nhiều `PolicyView`).
-- [ ] Chống Spam Nút Bấm (Duplicate command) và Tính vẹn Toàn Phiên Bản (Policy mutation) Có Được Xử Lý Riêng Biệt Chưa?
+### Quản lý Giao Dịch (Transactions)
 
-### Nghi Thức Chốt Sổ (Transactions)
+- [ ] Lệnh kiểm tra cấp độ cô lập có xác nhận chính xác các lệnh thực thi ở môi trường Production chưa?
+- [ ] Các lệnh Cập nhật Có điều kiện đã có code bắt trường hợp trả về 0 dòng ảnh hưởng (affected-row) chưa?
+- [ ] Cơ chế Retry có gọi lại giao dịch vật lý hoàn toàn mới (REQUIRES_NEW) không?
+- [ ] KHÔNG xử lý các phương thức HTTP, I/O chậm khi bản ghi đang bị khóa (`FOR SHARE`).
+- [ ] Cấu hình thiết lập `lock_timeout` rõ ràng và đảm bảo không xảy ra Deadlock chéo.
 
-- [ ] Lệnh Kiểm Tra Mức Cô Lập Đã Soi Thẳng Vào Giao Dịch Vật Lý Chạy Thật Không?
-- [ ] Lệnh Gắn Đuôi (Conditional) khi Cập nhật Trả `0` Có Bắn Lỗi Rõ Ràng Chưa?
-- [ ] Việc Thử Lại (Retry) Có chịu Nhét Vào Giao Dịch Mới Tinh và Tính Toán Lại Toàn Bộ Chưa?
-- [ ] CẤM Lệnh HTTP Gọi Web Ở Trong Vòng Cấm Địa Ôm Khóa (Row lock)!
-- [ ] Đã Vẽ Rõ Trật Tự Khóa (Lock order), Đặt `lock_timeout` Và Dọn Rác Deadlock Chưa?
+### Vận hành và Giám sát (Operations)
 
-### Đồ Nghề Cấp Cứu (Operations)
-
-- [ ] Có Gắn Máy Đo (Metric) Nhảy Mất Phiên Bản (mismatch), Thử Lại, Nghẽn Khóa và Quá Giờ Chưa?
-- [ ] Có Sẵn Lệnh Dò Sổ Kế Toán (Query reconciliation) để Truy Tìm Giấy Duyệt So Với Phiên Bản Luật Chốt Chưa?
-- [ ] Lịch Trình Gọi (Trace) Có Lưu Cái Bản Đọc Vào Đầu Và Phiên Bản Chốt Xuống Đít Không?
-- [ ] Bài Test Đang Chạy Thật Trên Cơ Thể Của PostgreSQL, KHÔNG PHẢI MẤY TRÒ ẢO MA TỪ CÁI DB ĐỒ CHƠI H2.
-- [ ] Cửa Hàng Bị Treo Nóng (Hot merchant contention) Và Áp Lực Bể Kết Nối CSDL Có Đang Bị Theo Dõi Chặt Chẽ Không?
+- [ ] Xây dựng bảng biểu đo lường tần suất Lệch Phiên Bản (mismatch), Timeout và Retry.
+- [ ] Phát triển các truy vấn đối soát (Reconciliation) để xác thực quyết định dựa trên các phiên bản lịch sử.
+- [ ] Cung cấp Trace Span đầy đủ từ bước Đọc đầu tiên đến bước Commit cuối cùng.
+- [ ] Đảm bảo các bài kiểm thử tương tranh (Concurrency tests) được chạy trên PostgreSQL chứ không phải trên cơ sở dữ liệu in-memory (H2).
+- [ ] Liên tục đo lường áp lực Connection Pool và xử lý độ trễ trong các bảng chịu truy cập cao.

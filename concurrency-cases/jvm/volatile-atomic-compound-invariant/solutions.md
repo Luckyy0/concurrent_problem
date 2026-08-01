@@ -1,6 +1,6 @@
 # Giải pháp, code đã sửa và các đánh đổi
 
-## Giải pháp 1: CAS trên một immutable BudgetState
+## Giải pháp 1: CAS trên một BudgetState bất biến (immutable)
 
 Gom hai counter vào một object bất biến và chỉ công bố state bằng CAS trên một
 `AtomicReference`.
@@ -123,31 +123,31 @@ public class ProviderConnectionBudget {
 
 ### Vì sao invariant được bảo vệ
 
-- `BudgetState` chứa snapshot nhất quán của cả hai counter.
-- Check limit và reserve dùng cùng state; CAS success là linearization point.
-- Pending-to-active được công bố bằng một reference swap và bảo toàn `used`.
-- CAS loser đọc lại state mới nhất trước khi quyết định.
-- `view()` đọc reference một lần, không ghép counter từ hai thời điểm.
-- Underflow bị từ chối thay vì âm thầm tạo capacity giả.
+- `BudgetState` chứa một snapshot nhất quán của cả hai counter.
+- Bước kiểm tra limit và quá trình reserve dùng chung một state; quá trình CAS thành công là linearization point.
+- Transition pending-to-active được công bố bằng một quá trình hoán đổi tham chiếu (reference swap) và bảo toàn `used`.
+- Thread thua cuộc (loser) trong CAS sẽ đọc lại state mới nhất trước khi đưa ra quyết định.
+- `view()` đọc reference một lần, không ghép các counter từ hai thời điểm khác nhau.
+- Tình trạng underflow bị từ chối thay vì âm thầm tạo ra capacity giả.
 
-> **Nói ngắn gọn:** muốn atomicity cho một quy tắc nhiều field, hãy CAS một state
-> chứa đủ các field đó, không CAS từng mảnh riêng.
+> **Nói ngắn gọn:** muốn atomicity cho một quy tắc gồm nhiều field, hãy thực hiện CAS một state
+> chứa đủ các field đó, không CAS từng mảnh riêng lẻ.
 
 ### Điều kiện của CAS loop
 
-`operation.apply(current)` có thể chạy lại nếu CAS fail, nên lambda phải
-side-effect-free. Log “connection activated”, publish event hoặc gọi remote API
-chỉ được thực hiện sau khi transition thành công, ngoài retryable function.
+`operation.apply(current)` có thể chạy lại nhiều lần nếu CAS thất bại, nên lambda phải
+không có side-effect. Việc log “connection activated”, phát hành sự kiện (publish event) hoặc gọi remote API
+chỉ được thực hiện sau khi transition thành công, ở bên ngoài hàm có khả năng retry (retryable function).
 
-CAS bảo vệ aggregate invariant nhưng không xác nhận identity của callback. Nếu
-một reservation fail callback chạy hai lần trong khi reservation khác vẫn
-pending, lần thứ hai có thể lấy nhầm slot của reservation khác. Khi callback có
-thể duplicate/out-of-order, cần permit handle hoặc reservation state machine.
+CAS bảo vệ invariant tổng hợp (aggregate invariant) nhưng không xác nhận định danh (identity) của callback. Nếu
+một callback xử lý trường hợp reservation thất bại chạy hai lần trong khi một reservation khác vẫn đang
+pending, lần chạy thứ hai có thể lấy nhầm slot của reservation kia. Khi callback có
+thể duplicate/out-of-order, cần một permit handle hoặc state machine cho reservation.
 
 ## Giải pháp 2: một ReentrantLock bảo vệ toàn bộ state
 
-Lock là lựa chọn rõ ràng khi transition phức tạp hoặc cần fairness. Dùng plain
-`int`; không cần AtomicInteger bên trong cùng lock.
+Lock là lựa chọn rõ ràng khi quá trình transition phức tạp hoặc cần tính công bằng (fairness). Dùng plain
+`int`; không cần AtomicInteger ở bên trong cùng một lock.
 
 ```java
 @Component
@@ -214,17 +214,17 @@ public class LockedProviderConnectionBudget {
 }
 ```
 
-`connectionClosed()` phải dùng cùng lock và kiểm tra `active > 0`; đoạn method đó
-được lược vì giống `creationFailed()`. Remote handshake luôn chạy ngoài lock.
-Không giữ lock trong network I/O.
+`connectionClosed()` phải dùng chung một lock và kiểm tra `active > 0`; đoạn method đó
+được lược đi vì giống `creationFailed()`. Remote handshake luôn chạy ở bên ngoài lock.
+Không giữ lock trong quá trình xử lý network I/O.
 
-Nếu cần bounded wait, dùng `tryLock(timeout, unit)`, xử lý
-`InterruptedException`, khôi phục interrupt status và định nghĩa rõ lock timeout
-là rejection hay technical failure.
+Nếu cần thời gian chờ có giới hạn (bounded wait), hãy dùng `tryLock(timeout, unit)`, xử lý
+`InterruptedException`, khôi phục trạng thái ngắt (interrupt status) và định nghĩa rõ việc lock timeout
+là một sự từ chối hay là lỗi kỹ thuật.
 
-## Giải pháp 3: một AtomicInteger cho tổng used slots
+## Giải pháp 3: một AtomicInteger cho tổng số used slots
 
-Nếu correctness chỉ phụ thuộc tổng slot, giảm state cần synchronize:
+Nếu tính đúng đắn (correctness) chỉ phụ thuộc vào tổng số lượng slot, hãy giảm bớt phần state cần synchronize:
 
 ```java
 public final class AtomicSlotBudget {
@@ -265,14 +265,14 @@ public final class AtomicSlotBudget {
 }
 ```
 
-Connection creation giữ slot từ lúc pending đến lúc active; transition không
-đụng counter. Active/pending metrics có thể được theo dõi riêng như observability
-xấp xỉ, nhưng không được đưa ngược vào capacity decision.
+Quá trình tạo connection giữ lại slot từ lúc pending đến lúc active; việc transition không
+đụng chạm tới counter. Các số liệu (metric) Active/pending có thể được theo dõi riêng như một khả năng quan sát (observability)
+xấp xỉ, nhưng không được đưa ngược vào để quyết định việc phân bổ capacity.
 
 ## Giải pháp 4: Semaphore và permit handle
 
-`Semaphore` mô hình hóa capacity trực tiếp. Permit được giữ xuyên suốt pending và
-active, rồi release đúng một lần bằng handle:
+`Semaphore` mô hình hóa capacity một cách trực tiếp. Một permit được giữ xuyên suốt quá trình pending và
+active, rồi được release đúng một lần thông qua một handle:
 
 ```java
 public final class ConnectionPermit implements AutoCloseable {
@@ -314,55 +314,54 @@ public final class SemaphoreConnectionBudget {
 }
 ```
 
-Creation failure gọi `permit.close()`. Khi creation thành công, connection object
-sở hữu permit và đóng nó trong lifecycle `close()`. `AtomicBoolean` làm duplicate
-close thành no-op và ngăn over-release.
+Quá trình tạo connection thất bại sẽ gọi `permit.close()`. Khi quá trình tạo thành công, connection object
+sở hữu permit đó và tự đóng nó lại trong vòng đời (lifecycle) `close()`. `AtomicBoolean` làm cho quá trình duplicate
+close trở thành no-op và ngăn chặn việc over-release.
 
-Semaphore giải quyết tổng capacity, không tự cung cấp snapshot active/pending.
-Fair semaphore có thể giảm starvation nhưng thường giảm throughput; chỉ bật khi
-fairness là requirement đã được đo.
+Semaphore giải quyết bài toán về tổng capacity, không tự cung cấp snapshot phân tách active/pending.
+Một fair semaphore có thể giảm tình trạng đói tài nguyên (starvation) nhưng thường làm giảm thông lượng (throughput); chỉ nên bật khi
+tính công bằng (fairness) là một yêu cầu (requirement) đã được đo lường cẩn thận.
 
 ## So sánh các đánh đổi
 
-| Phương án | Invariant | Loser | Contention/fairness | Observability | Multi-instance |
+| Phương án | Invariant | Thread thua cuộc (Loser) | Contention/fairness | Khả năng quan sát (Observability) | Multi-instance |
 | --- | --- | --- | --- | --- | --- |
-| `AtomicReference<BudgetState>` | Chính xác nhiều counter | CAS retry rồi reject nếu full | Lock-free, không fairness | Snapshot active/pending chính xác | Chỉ một JVM |
-| `ReentrantLock` | Chính xác nhiều counter/transition | Block hoặc timeout | Có thể cấu hình fairness | Snapshot dưới lock | Chỉ một JVM |
-| Một `AtomicInteger used` | Chính xác tổng slot | CAS retry rồi reject | Đơn giản, không fairness | Breakdown chỉ nên là metric phụ | Chỉ một JVM |
-| `Semaphore` + handle | Chính xác permit lifecycle | `tryAcquire` fail hoặc bounded wait | Fair/non-fair tùy cấu hình | Available permits, không breakdown | Chỉ một JVM |
-| Hai `AtomicInteger` độc lập | Không bảo vệ compound invariant | Có thể nhiều actor cùng thắng | Nhanh nhưng sai | Snapshot không nhất quán | Chỉ một JVM |
+| `AtomicReference<BudgetState>` | Chính xác trên nhiều counter | CAS retry rồi reject nếu đã đầy (full) | Lock-free, không đảm bảo fairness | Snapshot active/pending chính xác | Chỉ một JVM |
+| `ReentrantLock` | Chính xác trên nhiều counter/transition | Bị block hoặc timeout | Có thể cấu hình fairness | Có snapshot nếu lấy dưới lock | Chỉ một JVM |
+| Một `AtomicInteger used` | Chính xác trên tổng lượng slot | CAS retry rồi reject | Đơn giản, không đảm bảo fairness | Việc chia tách chi tiết (breakdown) chỉ nên là metric phụ | Chỉ một JVM |
+| `Semaphore` + handle | Chính xác theo permit lifecycle | `tryAcquire` fail hoặc chờ với một bounded wait | Fair/non-fair tùy theo cấu hình | Chỉ biết lượng permit khả dụng, không có breakdown | Chỉ một JVM |
+| Hai `AtomicInteger` độc lập | Không bảo vệ được compound invariant | Có thể có nhiều actor cùng thắng | Nhanh nhưng sai | Snapshot không có tính nhất quán | Chỉ một JVM |
 
-Không có throughput/latency number chung. Chọn dựa trên contention thực tế,
-transition complexity, fairness và mức quan trọng của exact breakdown.
+Không có thông số cụ thể chung nào cho throughput/latency. Việc lựa chọn nên dựa trên contention thực tế,
+mức độ phức tạp của transition, tính fairness và mức quan trọng của exact breakdown.
 
-## Failure, retry và lifecycle policy
+## Các chính sách về Failure, retry và lifecycle
 
-- Reserve trước handshake; nếu không có slot, fail-fast hoặc queue có giới hạn.
-- Handshake phải có timeout; failure release pending/permit đúng một lần.
-- Success chuyển ownership của reservation sang connection.
-- Close idempotent; callback duplicate không được release slot của lifecycle khác.
-- CAS retry chỉ bao quanh local transition; không đặt remote call trong CAS loop.
-- Nếu update state thành công nhưng publish event thất bại, retry event độc lập;
-  không chạy lại transition mù quáng.
+- Giữ chỗ (reserve) trước khi thực hiện handshake; nếu không còn slot, hãy fail-fast hoặc đưa vào queue có giới hạn.
+- Handshake phải có thời gian timeout; trường hợp thất bại (failure) phải thực hiện release pending/permit đúng một lần.
+- Trường hợp thành công (success) sẽ chuyển quyền sở hữu (ownership) của reservation đó sang cho connection.
+- Quá trình đóng (close) phải idempotent; các callback trùng lặp không được release slot thuộc về vòng đời của reservation khác.
+- Việc CAS retry chỉ được phép bao quanh các quá trình transition cục bộ; tuyệt đối không đặt remote call vào bên trong một vòng lặp CAS loop.
+- Nếu cập nhật state thành công nhưng quá trình phát hành sự kiện (publish event) thất bại, hãy retry event đó một cách độc lập;
+  không được chạy lại transition một cách mù quáng.
 
 ## Khi nào nên dùng
 
-- Chọn `AtomicReference` khi exact active/pending snapshot là requirement.
-- Chọn lock khi code ưu tiên dễ chứng minh, transition nhiều hoặc cần condition.
-- Chọn single counter/semaphore khi capacity permit mới là invariant cốt lõi.
-- Thêm reservation identity khi callback có thể retry/out-of-order.
-- Chuyển sang external coordination nếu quota dùng chung giữa nhiều node.
+- Chọn `AtomicReference` khi yêu cầu cần có exact active/pending snapshot.
+- Chọn lock khi code cần ưu tiên mức độ dễ chứng minh, có nhiều transition phức tạp hoặc cần tính năng condition.
+- Chọn single counter/semaphore khi capacity permit mới chính là invariant cốt lõi.
+- Thêm một định danh cho reservation (reservation identity) khi các callback có thể bị retry hoặc out-of-order.
+- Chuyển sang sự điều phối tập trung bên ngoài (external coordination) nếu quota được dùng chung giữa nhiều node.
 
 ## Lưu ý khi áp dụng thực tế
 
-- Metric: `active`, `pending`, `used`, `limit`, rejection count, CAS retry count,
-  handshake timeout/failure và duplicate close.
-- Alert khi `used > limit` hoặc counter âm; đây là invariant violation, không chỉ
-  là metric bất thường.
-- Log transition failure với lifecycle/reservation ID, không log credential.
-- Health endpoint phải đọc một state snapshot, không gọi nhiều getter độc lập.
-- Giới hạn pending duration; reservation treo phải được timeout và cleanup.
-- Không tự động “sửa” counter bằng cách set về limit; điều tra lifecycle leak và
-  reconcile với connection owner.
-- Khi shutdown, ngừng nhận reservation mới rồi đóng active connection có kiểm
-  soát; local state không cần durable rollback.
+- Số liệu (Metric): `active`, `pending`, `used`, `limit`, số lượng bị từ chối, số lần retry CAS,
+  số lượng timeout/failure trong quá trình handshake và các lần đóng trùng lặp (duplicate close).
+- Tạo cảnh báo (alert) khi `used > limit` hoặc số counter bị âm; đây là những vi phạm invariant, không chỉ
+  đơn giản là metric bất thường.
+- Ghi lại nhật ký (log) các quá trình transition thất bại kèm theo mã định danh vòng đời/reservation, không log các thông tin xác thực (credential).
+- Endpoint health check phải đọc từ một state snapshot, không được gọi liên tiếp nhiều getter độc lập.
+- Giới hạn thời gian (duration) pending; những reservation bị treo quá lâu phải bị timeout và dọn dẹp.
+- Không tự động “sửa” counter bằng cách set lại về mức limit; cần phải điều tra vấn đề về rò rỉ vòng đời (lifecycle leak) và
+  đối soát lại với connection owner.
+- Khi diễn ra shutdown, ngừng nhận các reservation mới rồi tiến hành đóng có kiểm soát các active connection; state cục bộ không cần tính bền vững để rollback (durable rollback).

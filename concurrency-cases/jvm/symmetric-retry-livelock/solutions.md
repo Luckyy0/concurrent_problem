@@ -1,4 +1,4 @@
-# Giải pháp ordering, bounded retry và progress policy
+# Giải pháp ordering, bounded retry và chính sách bảo đảm progress
 
 ## Giải pháp 1: deterministic lock ordering
 
@@ -36,15 +36,13 @@ public final class OrderedChannelSwapService {
 }
 ```
 
-Cả hai call direction dùng cùng order, nên không còn symmetric collision. Đây là
-lựa chọn mặc định khi resource có stable unique key.
+Cả hai hướng gọi (call direction) sử dụng chung một thứ tự (order), do đó không còn xảy ra symmetric collision. Đây là lựa chọn mặc định khi resource có khoá định danh duy nhất ổn định (stable unique key).
 
-> **Nói ngắn gọn:** ordering làm một actor chờ ở cửa đầu tiên, để actor thắng có
->thể lấy cửa thứ hai và hoàn tất.
+> **Nói ngắn gọn:** việc phân định thứ tự (ordering) khiến một actor phải chờ ở cửa đầu tiên, nhường cho actor thắng cuộc lấy cửa thứ hai và hoàn tất công việc.
 
 ## Giải pháp 2: bounded randomized backoff
 
-Khi conflict không thể loại bằng total order, retry phải có terminal budget:
+Khi conflict không thể bị loại bỏ thông qua total order, cơ chế retry phải được cấu hình một terminal budget:
 
 ```java
 public SwapOutcome trySwap(
@@ -94,35 +92,28 @@ public SwapOutcome trySwap(
 }
 ```
 
-`backoffCapNanos` dùng saturating/capped exponential calculation, không shift gây
-overflow. `RandomGenerator` được inject để test deterministic. Nếu interrupt xảy
-ra trong `parkNanos`, vòng sau trả `INTERRUPTED` và không clear interrupt flag.
+`backoffCapNanos` sử dụng thuật toán tính toán theo cấp số mũ có giới hạn (saturating/capped exponential calculation), không sử dụng phép dịch bit (shift) để tránh gây ra lỗi overflow. Đối tượng `RandomGenerator` được inject vào để phục vụ cho các bài kiểm tra mang tính tất định. Nếu một interrupt xảy ra bên trong `parkNanos`, vòng lặp tiếp theo sẽ trả về `INTERRUPTED` và không thực hiện xoá cờ interrupt (clear interrupt flag).
 
-Random backoff giảm xác suất va chạm, còn deadline/attempt cap bảo đảm termination.
-Nó không bảo đảm fairness cho từng actor.
+Random backoff giúp giảm xác suất va chạm, trong khi deadline và giới hạn attempt (attempt cap) sẽ bảo đảm việc dừng vòng lặp (termination). Nó không đảm bảo fairness cho từng actor.
 
 ## Giải pháp 3: single owner hoặc queue
 
-Một coordinator sở hữu cả hai channel và xử lý swap command tuần tự. Không có
-multi-lock retry, nhưng có queueing, owner availability và backpressure policy.
-Phù hợp khi fairness/audit quan trọng hơn parallel mutation.
+Một bộ điều phối (coordinator) sẽ sở hữu cả hai channel và xử lý các lệnh hoán đổi (swap command) một cách tuần tự. Bằng cách này, hệ thống không còn các vòng lặp multi-lock retry, nhưng bù lại sẽ cần quản lý queueing, tính sẵn sàng của owner (owner availability) và các chính sách backpressure. Phương pháp này phù hợp khi các yếu tố như fairness hoặc việc kiểm toán (audit) quan trọng hơn so với parallel mutation.
 
 ## So sánh đánh đổi
 
 | Phương án | Progress | Latency | Fairness | Complexity |
 | --- | --- | --- | --- | --- |
-| Total lock order | Loại symmetric cycle | Chờ contention | Theo lock scheduler | Thấp |
-| Bounded jitter retry | Terminal deadline, probabilistic success | Biến động | Không bảo đảm | Vừa |
-| Fair/coarse lock | Không retry collision | Queue wait | Có thể tốt hơn | Thấp-vừa |
-| Single owner queue | Tuần tự, observable | Queueing | Policy explicit | Cao hơn |
+| Total lock order | Loại bỏ symmetric cycle | Chờ khi có contention | Theo lock scheduler | Thấp |
+| Bounded jitter retry | Có terminal deadline, tỷ lệ success mang tính xác suất | Biến động | Không bảo đảm | Vừa |
+| Fair/coarse lock | Không xảy ra retry collision | Chờ trong queue | Có thể tốt hơn | Thấp-vừa |
+| Single owner queue | Tuần tự, có tính quan sát (observable) | Xếp hàng trong queue | Policy rõ ràng | Cao hơn |
 
-## Retry và production policy
+## Chính sách retry và vận hành trên production
 
-- Ưu tiên structural prevention trước retry tuning.
-- Retry chỉ conflict được phân loại; không retry validation/business failure.
-- Deadline chung, bounded attempt, jitter và admission control.
-- Không giữ lock trong backoff; không side effect trước full acquisition.
-- Metric: attempts/success, exhausted, interrupted, delay, lock conflict và
-  completed state version.
-- Load test symmetric hot keys; alert khi attempt/completion ratio tăng mà
-  throughput không tăng.
+- Ưu tiên các biện pháp ngăn chặn mang tính cấu trúc (structural prevention) trước khi thực hiện điều chỉnh retry (retry tuning).
+- Chỉ thực hiện retry đối với các trường hợp conflict đã được phân loại; không retry với các lỗi validation hoặc business failure.
+- Sử dụng chung một deadline, có bounded attempt, jitter và admission control.
+- Không giữ lock trong thời gian backoff; không thực hiện side effect trước khi quá trình acquire hoàn tất toàn bộ (full acquisition).
+- Các số liệu (metric) cần theo dõi: tỷ lệ attempt trên success, exhausted, interrupted, delay, lock conflict và completed state version.
+- Thực hiện load test đối với các symmetric hot key; phát cảnh báo (alert) khi tỷ lệ attempt trên completion tăng lên trong khi throughput không thay đổi.

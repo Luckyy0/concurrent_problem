@@ -1,16 +1,16 @@
-# PostgreSQL integration experiments và production verification
+# Các thử nghiệm tích hợp PostgreSQL và xác minh trên production
 
 ## Chiến lược kiểm thử
 
-Dùng `@SpringBootTest` + PostgreSQL Testcontainers để quan sát commit thật,
-rollback-only và `UnexpectedRollbackException`. Test method không annotated
-`@Transactional`; reader dùng transaction độc lập. `CheckoutProbe` dừng outer
-thread sau khi inner `REQUIRES_NEW` đã return/commit.
+Dùng `@SpringBootTest` + PostgreSQL Testcontainers để quan sát các commit thực sự,
+rollback-only và `UnexpectedRollbackException`. Phương thức kiểm thử không đánh dấu
+`@Transactional`; tiến trình đọc dùng transaction độc lập. `CheckoutProbe` dừng
+thread ngoài sau khi `REQUIRES_NEW` bên trong đã trả về/commit.
 
-Không dùng `Thread.sleep`; mọi latch/future có timeout. Xem
+Không dùng `Thread.sleep`; mọi chốt (latch)/future đều có thời gian chờ (timeout). Xem
 [Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
 
-## Infrastructure
+## Hạ tầng (Infrastructure)
 
 ```java
 @Testcontainers
@@ -37,11 +37,11 @@ class TransactionPropagationPartialCommitIT {
 }
 ```
 
-Mỗi test setup committed order 42 status `PENDING`, xóa audit/risk rows. Audit
-table dùng unique `(operation_id, event_type)`; test partial semantics không phụ
-thuộc persistence-context cache.
+Mỗi bài kiểm thử thiết lập order 42 đã commit với trạng thái `PENDING`, xóa các dòng audit/risk. Bảng
+audit dùng khóa duy nhất `(operation_id, event_type)`; việc kiểm thử ngữ nghĩa từng phần (partial semantics) không phụ
+thuộc vào bộ đệm persistence-context.
 
-## Bounded probe
+## Probe có giới hạn (Bounded probe)
 
 ```java
 final class CheckoutProbe {
@@ -80,7 +80,7 @@ private static void awaitOrFail(CountDownLatch latch) {
 }
 ```
 
-## Experiment 1: REQUIRES_NEW audit commit trước outer rollback
+## Thử nghiệm 1: REQUIRES_NEW audit commit trước khi rollback ở khối ngoài
 
 ```java
 @Test
@@ -109,17 +109,17 @@ void completedAuditIsVisibleBeforeOuterOutcomeAndSurvivesRollback()
 }
 ```
 
-Probe nằm sau `recordPaymentCompleted` return, nên inner transaction đã commit.
-Reader thấy semantic contradiction deterministic, không phụ thuộc race may mắn.
+Probe nằm sau khi `recordPaymentCompleted` trả về, nên transaction bên trong đã commit.
+Tiến trình đọc thấy được sự mâu thuẫn ngữ nghĩa một cách xác định (deterministic), không phụ thuộc vào may rủi của race condition.
 
-> **Nói ngắn gọn:** test chứng minh partial commit bằng committed business state,
->không chỉ bằng việc hai method báo transaction active.
+> **Nói ngắn gọn:** thử nghiệm chứng minh partial commit bằng trạng thái nghiệp vụ đã commit,
+> không chỉ bằng việc hai phương thức báo rằng transaction đang hoạt động.
 
-## Experiment 2: REQUIRED success record rollback cùng outer
+## Thử nghiệm 2: REQUIRED bản ghi thành công rollback cùng khối ngoài
 
-`AtomicCheckoutService` giống broken outer nhưng gọi audit `REQUIRED`. Sau audit,
-probe giữ outer rồi test reader phải thấy committed state cũ và không audit. Cho
-outer fail, final state vẫn PENDING/no audit:
+`AtomicCheckoutService` giống khối ngoài bị lỗi nhưng gọi audit `REQUIRED`. Sau khi audit,
+probe giữ khối ngoài rồi kiểm tra tiến trình đọc phải thấy trạng thái đã commit cũ và không có bản ghi audit.
+Cho khối ngoài gặp lỗi, trạng thái cuối cùng vẫn là PENDING và không có bản ghi audit:
 
 ```java
 @Test
@@ -146,11 +146,11 @@ void requiredAuditRollsBackWithCheckout() throws Exception {
 }
 ```
 
-Cùng latch `innerReturned` có semantics khác theo propagation: `REQUIRES_NEW`
-return sau inner commit, còn `REQUIRED` return khi physical transaction vẫn mở.
-Database assertion phân biệt hai trường hợp.
+Cùng chốt (latch) `innerReturned` có ngữ nghĩa khác nhau theo propagation: `REQUIRES_NEW`
+trả về sau khi commit bên trong, còn `REQUIRED` trả về khi transaction vật lý vẫn mở.
+Việc kiểm tra (assertion) cơ sở dữ liệu phân biệt hai trường hợp này.
 
-## Experiment 3: REQUIRED exception bị catch vẫn rollback-only
+## Thử nghiệm 3: REQUIRED ngoại lệ bị bắt (catch) vẫn rollback-only
 
 ```java
 @Test
@@ -167,32 +167,32 @@ void caughtInnerRequiredFailureCausesUnexpectedRollback() {
 }
 ```
 
-Test phải gọi Spring proxy bean. Inner service cũng là bean khác/proxy để exception
-đi qua transactional interceptor và mark rollback-only. Không mock transaction
-manager trong test này.
+Kiểm thử phải gọi Spring proxy bean. Service bên trong cũng là một bean/proxy khác để ngoại lệ
+đi qua transactional interceptor và đánh dấu rollback-only. Không làm giả (mock) transaction
+manager trong kiểm thử này.
 
-## Experiment 4: truthful REQUIRES_NEW attempt record
+## Thử nghiệm 4: REQUIRES_NEW ghi nhận bản ghi thử nghiệm (attempt) một cách trung thực
 
-Outer rollback nhưng independent row phải có type `ATTEMPT_STARTED`, không có
-`PAYMENT_COMPLETED`. Retry cùng `operationId` hai lần rồi assert unique constraint/
-`insertIfAbsent` chỉ tạo một attempt. Test này xác nhận intended partial commit
-semantics và idempotency, không chỉ kỹ thuật propagation.
+Khối ngoài rollback nhưng dòng độc lập phải có loại `ATTEMPT_STARTED`, không có
+`PAYMENT_COMPLETED`. Thử lại (retry) cùng `operationId` hai lần rồi kiểm tra (assert) rằng ràng buộc duy nhất (unique constraint) hoặc
+`insertIfAbsent` chỉ tạo một lần thử. Kiểm thử này xác nhận ngữ nghĩa partial commit dự kiến
+và tính lũy đẳng (idempotency), không chỉ là kỹ thuật propagation.
 
-## Experiment 5: inner failure policy
+## Thử nghiệm 5: chính sách xử lý lỗi bên trong
 
-Bổ sung matrix:
+Bổ sung ma trận:
 
-| Inner propagation/outcome | Outer xử lý | Expected |
+| Propagation/kết quả bên trong | Xử lý khối ngoài | Kết quả mong đợi |
 | --- | --- | --- |
-| REQUIRED runtime failure | propagate | toàn bộ rollback, original cause |
-| REQUIRED runtime failure | catch | outer rollback + `UnexpectedRollbackException` |
-| REQUIRED expected rejection value | branch explicit | commit/rollback theo outer decision |
-| REQUIRES_NEW failure | catch | outer có thể commit; inner rollback |
-| REQUIRES_NEW success, outer fail | propagate outer | inner commit sống sót |
+| REQUIRED lỗi runtime | lan truyền | toàn bộ rollback, nguyên nhân gốc |
+| REQUIRED lỗi runtime | bắt lỗi (catch) | khối ngoài rollback + `UnexpectedRollbackException` |
+| REQUIRED giá trị từ chối dự kiến | rẽ nhánh rõ ràng | commit/rollback theo quyết định của khối ngoài |
+| REQUIRES_NEW lỗi | bắt lỗi (catch) | khối ngoài có thể commit; khối trong rollback |
+| REQUIRES_NEW thành công, khối ngoài lỗi | lan truyền lỗi ở khối ngoài | khối trong commit vẫn tồn tại |
 
-Mỗi row cần integration assertion database, không chỉ Mockito verify.
+Mỗi dòng cần kiểm tra (assertion) tích hợp với cơ sở dữ liệu, không chỉ dùng Mockito để xác minh (verify).
 
-## Reader transaction độc lập
+## Transaction độc lập của tiến trình đọc
 
 ```java
 Snapshot readSnapshotInNewTransaction(long orderId) {
@@ -203,36 +203,36 @@ Snapshot readSnapshotInNewTransaction(long orderId) {
 }
 ```
 
-## Pool/lock diagnostic experiment
+## Thử nghiệm chẩn đoán Pool/lock
 
-Với pool test nhỏ, nhiều outer transaction đồng thời giữ connection rồi gọi
-`REQUIRES_NEW` có thể chờ connection thứ hai. Test bounded future timeout và pool
-metrics để minh họa resource amplification, nhưng không biến đây thành sizing
-benchmark. Full connection-pool exhaustion thuộc `SPR-007`.
+Với kiểm thử pool nhỏ, nhiều transaction ngoài đồng thời giữ connection rồi gọi
+`REQUIRES_NEW` có thể phải chờ connection thứ hai. Kiểm thử dùng future timeout có giới hạn và các chỉ số pool
+để minh họa sự gia tăng tiêu thụ tài nguyên (resource amplification), nhưng không biến đây thành bài đánh giá hiệu năng (sizing
+benchmark). Việc cạn kiệt toàn bộ connection-pool thuộc `SPR-007`.
 
-Inner transaction truy cập row outer đã update có thể block. Dùng PostgreSQL
-`lock_timeout` nhỏ trong test diagnostic, assert timeout/rollback và thu blocking
-PID; không dùng sleep.
+Transaction bên trong truy cập dòng (row) mà khối ngoài đã cập nhật có thể bị chặn (block). Dùng thông số
+`lock_timeout` nhỏ của PostgreSQL trong kiểm thử chẩn đoán, kiểm tra (assert) timeout/rollback và thu thập
+PID đang gây block; không dùng sleep.
 
-## Production verification
+## Xác minh trên production
 
-- audit type so với committed order status;
-- `UnexpectedRollbackException`, rollback-only và original inner cause;
-- outer/inner transaction IDs, duration, suspend time;
-- connection active/pending acquisition và pool timeout;
-- inner lock timeout/deadlock;
-- operation ID duplicate/conflict;
-- after-commit/outbox outcome khi success publication được tách.
+- loại audit so với trạng thái order đã commit;
+- `UnexpectedRollbackException`, rollback-only và nguyên nhân gốc bên trong;
+- ID transaction ngoài/trong, thời lượng, thời gian tạm dừng;
+- connection đang hoạt động/chờ cấp phát và pool timeout;
+- timeout của lock bên trong/deadlock;
+- ID thao tác bị trùng lặp/xung đột;
+- kết quả after-commit/outbox khi việc xuất bản thành công được tách riêng.
 
-## Checklist chất lượng
+## Danh sách kiểm tra chất lượng
 
-- [ ] PostgreSQL Testcontainers được dùng.
-- [ ] Test không có outer `@Transactional`.
-- [ ] REQUIRES_NEW inner commit được quan sát khi outer còn mở.
-- [ ] Outer rollback giữ independent audit nhưng rollback order.
-- [ ] REQUIRED audit không visible và rollback cùng outer.
-- [ ] Caught REQUIRED failure ném `UnexpectedRollbackException`.
-- [ ] Reader dùng `REQUIRES_NEW` transaction độc lập.
-- [ ] Mọi latch/future có timeout; không dùng sleep.
-- [ ] Truthful attempt semantics/idempotency được test.
-- [ ] Connection/lock amplification được phân biệt khỏi correctness.
+- [ ] PostgreSQL Testcontainers được sử dụng.
+- [ ] Kiểm thử không dùng `@Transactional` ở khối ngoài.
+- [ ] Việc commit REQUIRES_NEW bên trong được quan sát thấy khi khối ngoài còn mở.
+- [ ] Rollback ở khối ngoài giữ lại bản ghi audit độc lập nhưng rollback order.
+- [ ] Bản ghi audit REQUIRED không thể nhìn thấy và rollback cùng khối ngoài.
+- [ ] Lỗi REQUIRED bị bắt (catch) sẽ ném `UnexpectedRollbackException`.
+- [ ] Tiến trình đọc dùng transaction `REQUIRES_NEW` độc lập.
+- [ ] Mọi latch/future đều có thời gian chờ (timeout); không dùng sleep.
+- [ ] Ngữ nghĩa lần thử trung thực và tính lũy đẳng (idempotency) được kiểm thử.
+- [ ] Sự gia tăng connection/lock được phân biệt rõ với tính đúng đắn của logic.

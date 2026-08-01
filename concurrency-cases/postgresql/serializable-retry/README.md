@@ -1,32 +1,32 @@
-# Cảnh Báo DB-009 — Chơi Hệ Khóa Đỉnh Bảng `SERIALIZABLE` Và Thuốc Giải Dựng Lại Chết Đi Sống Lại (Retry an toàn)
+# DB-009 — Cơ Chế Khóa SERIALIZABLE và Chiến Lược Thử Lại (Serializable and Retry)
 
-## 1. Mạch Chuyện Tóm Lược (Tóm tắt)
+## 1. Tóm tắt (Overview)
 
-Thử vẽ cảnh này nha em: Một tay buôn có mức trần đặt cọc (reservation limit) là `100`. Tổng số tiền đang bị găm (active) là `60`. Rồi bùm, 2 ông thần giao dịch (command) bay vô giành giật, đòi cọc thêm `30` mỗi ông:
+Hãy xem xét kịch bản: Một Khách hàng (Merchant) có hạn mức đặt cọc (reservation limit) là `100`. Tổng số tiền đang được kích hoạt (active) là `60`. Có hai giao dịch (command) diễn ra đồng thời, mỗi giao dịch yêu cầu đặt cọc thêm `30`:
 
 ```text
-Anh T1 móc túi thấy tổng 60 → gật gù DUYỆT (ACCEPTED) → cắm xuống cọc C1.
-Anh T2 cũng thò tay đo được 60 → phán DUYỆT (ACCEPTED) → cắm mốc cọc C2.
+Giao dịch T1 kiểm tra tổng là 60 -> CHẤP NHẬN (ACCEPTED) -> Ghi nhận đặt cọc C1.
+Giao dịch T2 cũng kiểm tra tổng là 60 -> CHẤP NHẬN (ACCEPTED) -> Ghi nhận đặt cọc C2.
 ```
 
-Bỏ mẹ! Nếu cả hai gã đều đóng búa chốt đơn (commit), tổng vọt mịa lên `120`, vỡ trần cháy túi!
-Lúc này, Cảnh Sát Trưởng PostgreSQL bận áo `SERIALIZABLE` xách súng **Serializable Snapshot Isolation** (`SSI`) ra đường tuần tra các nhánh đọc/ghi (read/write). Chừng nào ổng phát hiện cái mớ bòng bong đồng thời này (concurrent history) KHÔNG THỂ vạch ra được một đường chạy nối đuôi nhau ngay ngắn (tuần tự), ổng sẽ bắn vỡ sọ (abort) 1 thằng với mã lỗi khét lẹt: SQLSTATE `40001`.
+Nếu cả hai giao dịch đều được hoàn tất (commit) thành công, tổng số tiền cọc sẽ tăng lên `120`, vượt quá hạn mức cho phép.
+Lúc này, cơ chế `SERIALIZABLE` của PostgreSQL (sử dụng Serializable Snapshot Isolation - `SSI`) sẽ kiểm tra các thao tác đọc và ghi. Nếu hệ thống phát hiện các giao dịch đồng thời (concurrent history) này KHÔNG THỂ thực thi theo một trật tự tuần tự hợp lệ, nó sẽ tự động hủy (abort) một trong các giao dịch và trả về mã lỗi: SQLSTATE `40001`.
 
-Tức là áo giáp `SERIALIZABLE` chỉ bảo chứng cho đám **đã sống sót qua ải commit**, chứ đéo rảnh hứa bao thầu mọi thằng chui vào đều sống nhăn! Nhiệm vụ của em (Application) là phải biết gom xác cuộn băng (rollback), lui bước dưỡng sức (backoff) rồi quăng 1 thằng đệ MỚI TINH ôm luật cũ vào đấm lại (transaction mới)!
+Tức là, mức cô lập `SERIALIZABLE` đảm bảo tính toàn vẹn dữ liệu cho các giao dịch đã hoàn tất (commit), nhưng không đảm bảo mọi giao dịch đều sẽ thành công. Nhiệm vụ của ứng dụng (Application) là phải bắt lỗi, hủy bỏ (rollback) trạng thái hiện tại, tạm nghỉ (backoff) và thực hiện lại (retry) logic trong một giao dịch HOÀN TOÀN MỚI.
 
-> **Sếp chốt lại:** `SERIALIZABLE` là chiêu biến cái lỗ hổng ảo giác (anomaly) thành một cú tát chết có chủ đích (failure có kiểm soát); Chỗ em khoanh vòng Dựng Lại (retry boundary) mới thực sự nặn cú tát đó thành kết quả chốt sổ ngon ơ!
+> **Ghi chú quan trọng:** Mức cô lập `SERIALIZABLE` kiểm soát lỗi bằng cách biến một bất thường dữ liệu (anomaly) thành một lỗi có chủ đích (controlled failure); Thiết lập ranh giới giao dịch và cơ chế thử lại (retry boundary) là cách để ứng dụng biến lỗi đó thành một kết quả thành công cuối cùng.
 
-## 2. Diễn Viên Trực Chiến Và Đồ Bạc Dùng Chung (Actor và trạng thái)
+## 2. Các thực thể và Trạng thái chia sẻ (Actors and shared state)
 
-| Cục Diện Lõi (Thành phần) | Hiện Trạng Đang Cầm (Trạng thái) |
+| Thực thể (Actor/State) | Trạng thái hiện hành |
 | --- | --- |
-| `merchant_limit` | Bác merchant `7`, ôm limit `100` |
-| `credit_reservation` | Đang có sẵn cọc `ACTIVE` kẹt `60` |
-| Bác T1 cắm trên App-1 | Tờ Lệnh C1, đòi cắn `30` |
-| Bác T2 dậm trên App-2 | Tờ Lệnh C2, cũng xin `30` |
-| Ngân Hàng Cha Giữ Sổ (Authoritative store) | Bác Bảo Vệ PostgreSQL |
+| `merchant_limit` | Merchant `7`, hạn mức `100` |
+| `credit_reservation` | Có sẵn cọc `ACTIVE` với tổng `60` |
+| Giao dịch T1 (App-1) | Lệnh C1, yêu cầu `30` |
+| Giao dịch T2 (App-2) | Lệnh C2, yêu cầu `30` |
+| Cơ sở dữ liệu (Authoritative store) | PostgreSQL |
 
-Điểm chém lộn KHÔNG PHẢI là giành xé chung 1 mẩu thịt (row) update đâu nha. Cả 2 lão cùng soi chung 1 cái lỗ kính đo số (predicate):
+Vấn đề tranh chấp ở đây KHÔNG PHẢI là hai giao dịch cập nhật cùng một dòng dữ liệu (same-row update). Cả hai đều đánh giá dựa trên cùng một điều kiện truy vấn (predicate):
 
 ```sql
 select coalesce(sum(amount), 0)
@@ -35,96 +35,90 @@ where merchant_id = 7
   and status = 'ACTIVE';
 ```
 
-Hút mắt xong mỗi lão nặn ra đút xuống 1 tờ cọc HOÀN TOÀN KHÁC NHAU. Nhưng ác nỗi cái tờ mới lọt vào lại chọc mù luôn cái lỗ kính số tổng mà lão kia vừa soi trước đó!
+Sau khi đọc dữ liệu, mỗi giao dịch sẽ tạo ra một bản ghi đặt cọc HOÀN TOÀN KHÁC NHAU. Tuy nhiên, bản ghi mới của giao dịch này lại làm thay đổi kết quả tổng mà giao dịch kia vừa đọc.
 
-## 3. Khung Sườn Chống Đạn Bất Di Bất Dịch (Invariant)
-
-```text
-Tổng số tiền ôm cọc ACTIVE cho một nhà buôn tuyệt đối KHÔNG ĐƯỢC trào qua vạch limit đã chốt sổ.
-
-Mỗi tờ lệnh ID chỉ mang ĐÚNG 1 mạng chốt kiên định (durable decision): ĐƯỢC CẤP (ACCEPTED) hoặc CÚT (REJECTED).
-
-Bất cứ ván đấm lại (retry) nào bắt buộc phải chạy vắt lại trọn luồng Đọc → Chốt → Ghi trong bọc Giao Dịch MỚI TINH; KHÔNG để lọt rác rưởi của kiếp trước đã đổ bể làm dấy mùi!
-```
-
-Giả sử thằng T1 nó chốt trót lọt (commit) trước. Cú tái sinh MỚI NGON của T2 lúc này hít số đo thấy vọt lên `90`, nó tự cắn rứt nhận ra `90 + 30 > 100` rồi phán đinh ghim `REJECTED`. Kết cuộc bàn cờ sạch đẹp: mốc `90`, C1/C2 mỗi thằng an vị đúng 1 cái phán xét kiên định. Vỗ tay!
-
-## 4. Ranh Giới Kép Vòng Đấu Trụ (Ranh giới transaction)
-
-Thằng Dẫn Đuổi Đấm (Retry coordinator) ở trên TẦNG NGOÀI đéo có áo khoác Giao dịch gì đâu nhen. Mỗi vòng thét gọi rớt xuống trạm Proxy `SerializableAttemptService` mới là 1 bọc kén thực địa chém nhau đàng hoàng:
+## 3. Nguyên tắc thiết kế cốt lõi (Invariant)
 
 ```text
-Mạng số N
-  BẮT ĐẦU VỚI GIÁP SERIALIZABLE
-  xem tờ lệnh ID này đã sống chưa
-  ngó trần tiền limit và đong tổng active
-  chốt sổ (decide)
-  nhét lệnh reservation nếu được gật
-  khắc thẻ decision cho command
-  dội bùn hất (flush)
-  THẮNG (COMMIT) hoặc ĂN BẠN 40001 CHẾT CUỘN LẠI (ROLLBACK)
+Tổng số tiền cọc ACTIVE cho một merchant tuyệt đối KHÔNG ĐƯỢC vượt quá hạn mức (limit).
+
+Mỗi mã lệnh (Command ID) chỉ được phép có ĐÚNG 1 kết quả (durable decision): CHẤP NHẬN (ACCEPTED) hoặc TỪ CHỐI (REJECTED).
+
+Bất kỳ lần thử lại (retry) nào cũng bắt buộc phải thực hiện toàn bộ quy trình Đọc -> Quyết định -> Ghi trong một giao dịch MỚI; KHÔNG sử dụng lại trạng thái của lần thử trước đó.
 ```
 
-Chuyện đụng độ có thể bật lửa ở lúc ném lệnh câu (statement), lúc trào bùn Hibernate flush hay ngay phút chót đập búa commit. Thằng Dẫn Đuổi ở ngoài chỉ bắt hứng xác SAU KHI Lò Proxy kia cuộn sạch sẽ ván dập (rollback). Nó KHÔNG chơi trò ném vá vài câu SQL mót nhặt hay xài lại cái Máng Trộn Chết `EntityManager`, không xài xác rác entities vương vãi của kiếp trước!
+Giả sử giao dịch T1 commit thành công. Lần thử lại của T2 lúc này sẽ tính được tổng là `90`, dẫn đến quyết định `90 + 30 > 100` và trả về kết quả `REJECTED`. Kết quả cuối cùng: tổng cọc là `90`, C1 và C2 đều có kết quả xác định.
 
-## 5. Mộng Mơ Và Ác Mộng Cắt Dây (Kết quả mong đợi và thực tế lỗi)
+## 4. Ranh giới giao dịch (Transaction boundaries)
 
-| Khúc Đo (Khía cạnh) | Sếp Phán Nhẹ Nè (Mong đợi đúng) | Trẻ Trâu Tưởng Bở (Cách hiểu sai) |
+Thành phần điều phối thử lại (Retry coordinator) nằm ở TẦNG NGOÀI và không chứa giao dịch cơ sở dữ liệu. Mỗi lần thử lại sẽ gọi đến một Proxy Service (`SerializableAttemptService`) đóng vai trò là một giao dịch vật lý hoàn chỉnh:
+
+```text
+Lần thử N:
+  BẮT ĐẦU GIAO DỊCH SERIALIZABLE
+  kiểm tra xem lệnh đã được xử lý chưa
+  đọc hạn mức (limit) và tổng active hiện tại
+  ra quyết định (decide)
+  lưu bản ghi reservation nếu được chấp nhận
+  lưu kết quả decision của command
+  đẩy dữ liệu (flush)
+  THÀNH CÔNG (COMMIT) hoặc GẶP LỖI 40001 VÀ HỦY (ROLLBACK)
+```
+
+Xung đột có thể xảy ra khi gửi lệnh SQL (statement), khi Hibernate gọi flush, hoặc tại thời điểm commit. Thành phần điều phối chỉ nhận kết quả SAU KHI lớp Proxy đã hoàn tất rollback (nếu có lỗi). Hệ thống KHÔNG ĐƯỢC tái sử dụng `EntityManager` hoặc các Entities từ lần thử đã thất bại.
+
+## 5. Mong đợi và Thực tế lỗi (Expected vs actual outcomes)
+
+| Khía cạnh | Hoạt động đúng (Expected) | Sai lầm phổ biến (Broken assumptions) |
 | --- | --- | --- |
-| Lưới Bọc `SERIALIZABLE` | Mớ Bòng Bong Lọt Lưới Bằng Đúng Nghĩa Bước Tuần Tự (Commit history tương đương chạy tuần tự) | Đứa Nào Cũng Chờ Nhau Ngáp Rồi Chốt (Mọi transaction tự block rồi commit) |
-| Chết Phọt Huyết `40001` | Lỗi Bắt Bài Chôn Ngay, Trải Mới Luôn Mạng (Known rollback, có thể whole-transaction retry) | Trận Database Sập Nhảm, Ịm Cho Qua Tịt (Lỗi database bất ngờ hoặc có thể nuốt) |
-| Ván Tái Đấu (Retry) | Xé Nháp Dựng Transaction/Snapshot Mới Rờ Xét Phép MỚI LẠI TOÀN BỘ (Transaction/snapshot mới) | Chơi Vòng Tròn Luẩn Quẩn Trong Cùng 1 Hàm Khoác `@Transactional` |
-| Luật Bám Dính Nhẹ (Idempotency) | Giữ Đít Thẻ Áo Command ID Dũa Dáng Durable Trọng Lại | Tung Đấm Lại Ném Phọt Command ID Khác Nhé! |
-| Sứt Dây Dẹp Tuổi (Exhaustion) | Ép Thất Bại Rõ Ngắn Hẹn Kẹp Gấp (Trả explicit temporary failure) | Rặn Ục Ịt Vô Hạn Giết Nhau Chờ Oái (Retry vô hạn tới khi success) |
+| Cơ chế `SERIALIZABLE` | Kết quả lịch sử giao dịch tương đương với việc chạy tuần tự (Serializable history) | Tất cả các giao dịch sẽ tự động khóa, chờ nhau và đều thành công. |
+| Xử lý lỗi `40001` | Lỗi được nhận diện, rollback hoàn toàn và tạo giao dịch mới để retry | Xem đây là lỗi kết nối ngẫu nhiên hoặc bỏ qua (nuốt lỗi). |
+| Chu trình thử lại (Retry) | Tạo Transaction và Snapshot mới hoàn toàn, tính toán lại logic | Lặp lại thao tác trong cùng một phương thức có `@Transactional` ban đầu. |
+| Tính lũy đẳng (Idempotency) | Giữ nguyên Command ID để đảm bảo tính nhất quán của kết quả (Durable decision) | Tạo Command ID mới cho mỗi lần retry. |
+| Giới hạn thử lại (Exhaustion) | Dừng thử lại sau một số lần nhất định và trả về lỗi rõ ràng (Explicit failure) | Thử lại vô hạn gây treo hệ thống. |
 
-## 6. Lổ Tai Nghe Thuật Ngữ (Thuật ngữ cần biết)
+## 6. Thuật ngữ quan trọng (Terminology)
 
-| Chữ Đúc (Thuật ngữ) | Giải Mã Trận Tranh Này (Ý nghĩa trong case) |
+| Thuật ngữ | Ý nghĩa |
 | --- | --- |
-| Súng Kẹp SSI | Trọng Nhịp Serializable Snapshot Isolation; Bóng Ma Snapshot Xịn Ốp Lưới Đo Tranh Chéo (dependency checks) |
-| Phá Lưới Đứt Cuộn (serialization failure) | PostgreSQL bắn rớt do mớ lộn xộn đéo thể xếp hàng trật tự (history không thể serialize) |
-| Lỗi Tụ Huyết SQLSTATE `40001` | Mã Thẻ Chết Khét `serialization_failure` |
-| Lưới Bắt Bọng (predicate lock) | `SIReadLock` quăng trói canh chừng mảng số đếm/chữ lọc; KHÔNG phải sợi xích row đứng nghẽn cứng ngắc! |
-| Lấn Cửa Nhau (rw-conflict) | Mày Dòm Xoi Tờ Kính Mà Đứa Sau Nó Viết Quẹt Bôi Bẩn Điểm Dòm Của Mày Nhé |
-| Vòng Nguy Hiểm Rẽ Bọn (dangerous structure) | Đội Hình Đẩy Căng Chằng Dây Dễ Lật Cụ Đâm Mâm Xéo Nhau (serialization cycle) |
-| Khởi Tạo Vòng Sinh Trọn Vẹn (whole-transaction retry) | Đuổi Cút Chết Cuộn Sạch Bắt Tay Test Chốt Và Khởi Lại Trọng Mã SQL Đời Mới (transaction mới) |
-| Chống Lún Lệnh Áo Kép (idempotent attempt) | Vẫn Đỉnh Mã Áo Đó KHÔNG Sút Lệnh Nhét Chết Bổ Sung (Không tạo business effect) |
-| Rụt Giò Trọng Cuộc Cứ (bounded backoff) | Đóng Giới Cú Phọt, Thêm Nhịp Dịch Rụt Kéo Thời Lượng Limit Đo (Attempt cap, delay có jitter) |
+| Serializable Snapshot Isolation (SSI) | Cơ chế của PostgreSQL sử dụng Snapshot và kiểm tra xung đột (dependency checks) để đảm bảo tính tuần tự. |
+| Serialization failure | Lỗi xảy ra khi PostgreSQL hủy giao dịch do không thể sắp xếp lịch sử thực thi hợp lệ (SQLSTATE `40001`). |
+| Predicate lock (`SIReadLock`) | Cơ chế theo dõi các bản ghi thỏa mãn điều kiện đọc. Không phải là khóa ngăn chặn (blocking lock). |
+| Read-write conflict (rw-conflict) | Xung đột xảy ra khi một giao dịch ghi vào tập dữ liệu mà một giao dịch khác vừa đọc. |
+| Chu kỳ nguy hiểm (Serialization cycle) | Chuỗi xung đột chéo giữa các giao dịch, buộc hệ thống phải hủy (abort) để bảo vệ tính nhất quán. |
+| Thử lại toàn bộ giao dịch (Whole-transaction retry) | Quy trình hủy hoàn toàn giao dịch lỗi và thực thi lại toàn bộ logic trong một giao dịch SQL mới. |
+| Xử lý lũy đẳng (Idempotent attempt) | Xử lý lệnh dựa trên mã định danh duy nhất (Command ID) để không gây hiệu ứng phụ khi gọi nhiều lần. |
+| Nghỉ chờ có giới hạn (Bounded backoff) | Khoảng thời gian trì hoãn giữa các lần retry, thường kèm yếu tố ngẫu nhiên (jitter) và giới hạn thời gian (deadline). |
 
-## 7. Trạm Dịch Đường Dây (Điều hướng)
+## 7. Hướng dẫn tham khảo (Navigation)
 
-- [Soi Lỗi Lép Boundary Chết Nát](broken-code.md)
-- [Bắt Bệnh Timeline SSI Chết Lúc Nào](analysis.md)
-- [Lắp Mũi Trạm Tái Sinh Vững Ốp Khóa (Idempotency)](solutions.md)
-- [Sân Bãi Kéo DB Trận Rạch (Testcontainers)](experiments.md)
-- [Nền Móng Bọc Mù Isolation Và DB Dòm Bóng](../../concepts/isolation-levels.md)
-- [Sóng Giằng Deadlock Rút Vòng Sinh Phép](../../concepts/deadlocks-and-retries.md)
-- [Kéo Đo Concurrency Vực Sát](../../concepts/concurrency-testing.md)
+- [Phân Tích Lỗi Thiết Kế Giao Dịch (broken-code.md)](broken-code.md)
+- [Phân Tích Cơ Chế SSI Và Lỗi 40001 (analysis.md)](analysis.md)
+- [Giải Pháp Retry Toàn Bộ Transaction Kèm Idempotency (solutions.md)](solutions.md)
+- [Thực Nghiệm Hành Vi SSI Trong PostgreSQL (experiments.md)](experiments.md)
+- [Nền Móng Mức Cô Lập (Isolation levels)](../../concepts/isolation-levels.md)
+- [Xử Lý Deadlocks (Deadlocks and retries)](../../concepts/deadlocks-and-retries.md)
+- [Kiểm Thử Tương Tranh (Concurrency testing)](../../concepts/concurrency-testing.md)
 
-## 8. Hố Sập Nổ Bể Chảo Trên Chiến Trường Production (Hậu quả)
+## 8. Tác động tới hệ thống (Production impact)
 
-- Oái Mẽ Cút Mã `40001` Chảy Trào Lọt Xuống Khách Thành Trái Đạn HTTP 500 Tuy Việc Có Thể Xong Nếu Tái Đấm;
-- Nấu Trọng Trận Doomed (Giao Dịch Đã Chết) Nhét Retry Dọng Ác Hưởng Cáo `25P02`;
-- Đánh Retry Lì Lợm Lên DB Sập Tịt Họng Khuếch Đại Phá (conflict amplification);
-- Đọc Cứt Mũi Già Khú (stale snapshot) Đục Chết Não Oác Quyết Lệnh Cũ Chứ Hổng Thấy Người Vừa Phá Thắng Bảng;
-- Nhảy Tóp Tép Gửi Tin Notification Trước Lúc Búa Đập Dội Trùng Ụp Xé Đôi Dù DB Trào Rollback;
-- Mất Khách Chờ Sập Caller Ọc Phọt Cắm Lại Reservation Thứ Hai Oan Do Command Đéo Neo Đất Bền Chắc;
-- Bơm Máy Lắm Nút Trạm Scale-out Chồng Chéo Siết Tụ SERIALIZABLE Hút Phá Mảng Lọng Chung 1 Predicate!
+- Lỗi `40001` có thể bị rò rỉ ra ngoài và trả về mã lỗi HTTP 500, dù yêu cầu có thể thành công nếu được thử lại đúng cách.
+- Thử lại bên trong một giao dịch đã lỗi (Doomed transaction) sẽ dẫn đến lỗi `25P02`.
+- Cơ chế thử lại lặp lại liên tục và dồn dập có thể gây quá tải cơ sở dữ liệu (conflict amplification).
+- Đọc dữ liệu cũ từ Snapshot của giao dịch thất bại sẽ dẫn đến các quyết định nghiệp vụ sai lệch.
+- Gửi thông báo (Notification) trước khi giao dịch commit có thể dẫn đến việc phát đi thông tin sai lệch khi giao dịch bị rollback.
+- Yêu cầu xử lý không có tính lũy đẳng (Idempotency) khiến Client thử lại và tạo ra dữ liệu trùng lặp.
 
-## 9. Đơn Thuốc Soi Khớp Lại (Hướng sửa khuyến nghị)
+## 9. Khuyến nghị khắc phục (Remediation steps)
 
-1. Cất `SERIALIZABLE` Vo Rọ CHỈ DÙNG Lúc Bãi Trượt Invariant Chằng Chéo Cực Lớn Giữa Bọn Đọc-Viết (read-write set) Cần Trói Phép Nhé. Constraint Dữ Lưới Gọn / Lách Nhẹ Update Có Predicate Nên Trọng Đất Rẻ Trụ Đẹp Trước.
-2. Ép Trấn Dây Đeo Áo Trực Tiếp Thằng Đệ Chạy Bean (transactional attempt bean) Phải Ngó Ra Xét Lệnh `current_setting('transaction_isolation')`.
-3. Nhét Lão Điều Hành Khởi Động Đấm Trút (Coordinator) Lên Mâm Tầng NGOÀI Cột Giao Dịch Nhen; Áp Cửa Qua Tường Proxy Nhé.
-4. Xẻ Dây Soi Cáo Tử SQLSTATE `40001`, Vuốt Rơi Cuộn Lại Trắng Nát Đáy Ròi Sóng Cắp Áp MỚI RELOAD TRỌN TỪNG CHỮ (reload mọi state).
-5. Vòng Tái Chiến Retry Khóa Chốt Tổng Vòng Phọt (Attempt Cap), Rụt Mỏ Dãn Tụt Trễ Nhấp Exponential Backoff + Jitter Đuôi Limit.
-6. Ôm Dính Command ID; Đút Kép Bản Phán Quyết/Hộp Giấy Két Đáy Cùng Transaction Lúc Thành Công Oai Ác (successful transaction).
-7. ÉO Rảnh Đi Bùn Phọt Retry Mấy Cái Lỗi Tịt Về Mõm Nghiệp Vụ (business rejection), Input Gãy Độc Hay Hộc Đạn Éo Nằm Nhóm Cấp Phép Rìa Nhé!
+1. Chỉ sử dụng `SERIALIZABLE` khi nghiệp vụ có các ràng buộc dữ liệu (invariants) phức tạp, chéo nhau giữa tập đọc và tập ghi (read-write set). Ưu tiên các giải pháp cập nhật nguyên tử (atomic/conditional update) hoặc ràng buộc mức độ cấu trúc (constraints) nếu có thể.
+2. Phương thức xử lý logic nghiệp vụ (transactional attempt bean) cần có khả năng xác nhận nó đang chạy trong mức cô lập đúng thông qua `current_setting('transaction_isolation')`.
+3. Tách biệt thành phần điều phối thử lại (Coordinator) ở TẦNG NGOÀI (ngoài ranh giới giao dịch).
+4. Phân loại ngoại lệ để bắt chính xác lỗi SQLSTATE `40001`, dọn dẹp các bộ đệm bộ nhớ và khởi tạo giao dịch MỚI cho toàn bộ dữ liệu.
+5. Thiết lập chính sách thử lại: Giới hạn số lần (Attempt Cap), độ trễ số mũ (Exponential Backoff), yếu tố ngẫu nhiên (Jitter) và thời hạn tối đa (Deadline).
+6. Duy trì Command ID gốc từ phía Client; Lưu kết quả quyết định cuối cùng (Outcome) vào chung giao dịch thành công.
+7. KHÔNG thử lại các lỗi liên quan đến vi phạm quy tắc nghiệp vụ (Business rejection) hoặc lỗi dữ liệu đầu vào.
 
-## 10. Lúc Nào Kéo Xuống Sân (Khi phù hợp)
+## 10. Khi nào nên áp dụng (Applicability)
 
-Kiếm Giáp `SERIALIZABLE` Trọng Áo Lắp Xuyên Bảng Dòng (predicate/nhiều rows), Trống Bọn Xoáy Giao Nát Hướng Cùng Rạch Đồng Hàng. Đội Ngũ Bắt Mạch Xịn Sẵn Đứa Nuôi Rollback/Retry. Với Tụ Áp Chảo Cục Nóng Đu Đáy Oan Hay Thằng Óc Nặng Xử Lý Kép Tệ Thì Chuyển Trực Tiết Đệm Dòng Explicit Guard/Conditional/Tranh Đẩy Tịch Queue Ngó Lệ Trơn Sáng Nhất Nhé.
-
-## 11. Bờ Lề Xóm Câu Chuyện (Phạm vi)
-
-Ánh Bãi Khoanh Đo Dọc Retry Giữa Trục Thẳng Ục 40001 Này Nhen Nhóc. Đào Chén Hụt Write Skew Gốc Ảo Ở `DB-005`; Ục Vòng Khóa PostgreSQL Deadlock `40P01` Kéo Sập Rìa `DB-008`; Cuộn Lệnh Tráo Advisor Cưa Vượt Ở Giao Dịch Chết Doomed Rách Sót Kẹp Hẹp Ở `SPR-006` Nhé.
+Giải pháp `SERIALIZABLE` phù hợp để bảo vệ tính nhất quán dữ liệu cho các truy vấn theo điều kiện (predicate) hoặc liên quan đến nhiều bản ghi, nơi các ranh giới đọc-ghi chéo nhau. Nó đòi hỏi hệ thống phải triển khai một khung xử lý Rollback/Retry vững chắc. Đối với các hệ thống có mức độ tương tranh quá lớn (hot spots), nên chuyển sang sử dụng khóa nguyên tử (atomic updates) hoặc hàng đợi (queue) để tránh quá tải do thử lại (retry storm).

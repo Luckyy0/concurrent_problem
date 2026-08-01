@@ -1,21 +1,16 @@
-# Cứu Cánh Chữa Cháy — Rặn Retry Kéo Toàn Bộ Transaction Nấp Trong Tường Rào Mới (Giải pháp)
+# Giải Pháp Điều Phối Thử Lại: Quản Lý Giao Dịch và SSI (Transaction Retry Solutions)
 
-## 1. Bản Vẽ Định Hình Mục Tiêu (Mục tiêu thiết kế)
+## 1. Mục tiêu thiết kế (Design Objectives)
 
-```text
-Thằng Gác Cổng (non-transactional coordinator)
-  → Phóng 1 nhát chọt thử Bọc Transaction SERIALIZABLE (transactional attempt)
-  → Nếu Commit Bùi (success): Lôi Ra Cục Án Quyết Sạch (durable decision)
-  → Đụng Búa Tạ 40001: Ép Rollback Sạch Nước Cặn Hoàn Tất
-  → Lùi Nhóp Nhép Bịt Kẽ Chặn (bounded backoff) Ở Lớp NGOÀI Transaction
-  → Nhồi Phát Đấm Tươi Mới (fresh attempt) Bốc Tái Tạo Sạch Bộ Khung State Lên Đầu
-```
+Mô hình kiến trúc được chia làm hai lớp:
+- **Tầng Điều phối (Coordinator)**: Quản lý vòng đời gọi, xử lý thử lại (retry), tạm ngưng (backoff) và kết thúc khi xảy ra sự cố. Lớp này không nằm trong giao dịch.
+- **Tầng Thực thi (Attempt worker)**: Định nghĩa một đơn vị công việc hoàn chỉnh, chạy trong một giao dịch `SERIALIZABLE` độc lập.
 
-Cái Dấu Tích Lệnh Command ID KHÔNG ĐƯỢC PHÉP TRÁO qua lại giữa các vòng nhóp (attempts). Chắc Cú Thằng nào Lọt Trọt Trơn Tru Giao Dịch Thành Công Mới Được Lôi Ngòi Viết (ghi decision, reservation) Lẫn Nạp Tịch Báo Loa Khách (outbox intent).
+Command ID phải được bảo toàn xuyên suốt các lần thử. Quyết định (Decision), bản ghi lưu trữ (Reservation) và thông điệp ngoại vi (Outbox intent) phải được tạo lập cùng nhau trong một lần commit thành công.
 
-## 2. Giải Cứu Phương Án 1 — Tách Đôi Khứa Gác Cổng & Kép Đánh Khổ Sai (Tách coordinator và attempt worker)
+## 2. Giải pháp 1 — Phân tách Bộ Điều phối và Lớp Thực thi (Separation of Coordinator and Worker)
 
-### Đơn Lệnh và Bản Án (Command và outcome)
+### Định nghĩa Đầu vào/Đầu ra (Command and outcome)
 
 ```java
 package example.limit;
@@ -49,7 +44,7 @@ public record LimitDecision(
 }
 ```
 
-### Bọc Túi Một Cuốc Khổ Sai Kín Kẽ Trong Transaction Riêng Tư (Một attempt trong transaction riêng)
+### Lớp Thực thi Giao dịch (Transactional Attempt)
 
 ```java
 package example.limit;
@@ -118,13 +113,12 @@ public class SerializableLimitAttempt {
 }
 ```
 
-Áo Kép Trấn Bùa `REQUIRES_NEW` Bị Ép Quất Vô Vì Tướng Lệnh coordinator Vốn Trụ Án Là Chóp Cổng Lệnh (root use case) ĐÉO Hề Nối Transaction Lõi; Mỗi cú bửa búa attempt PHẢI Ngắt Ngoại Riêng Độc Lập Kéo Rút. Vỡ Nát Nếu Đoạn Hàm này Bị Gọi Đè Phọt Ngược Dọng Từ Áo Khứa Khác Gọi Business Transaction Bọc Ngoài Ôm (outer), Tích Bóc Trục Đinh Commit Rời (independent commit) Của Ả Sẽ Đâm Gãy Đứt Tích (atomicity) Của Lưới Vòng Ngoài Vừa Hao Ốc Connection Đợi Treo Lọng (suspend); Lệnh Thiết Kế Là Ép Cấm Chặn Rút Đầu Chắn Mép Kẽ Này Khéo Rõ Mạch!
+`Propagation.REQUIRES_NEW` bảo đảm rằng phương thức này luôn mở một giao dịch mới mẻ và độc lập. Lệnh này không bao giờ kế thừa từ bất kỳ giao dịch bên ngoài nào, bảo vệ tính an toàn cho toàn bộ vòng đời điều phối thử lại.
+Kết quả (`LimitDecision`) chỉ được phản hồi ra sau khi Proxy xử lý Commit hoàn tất.
 
-Cục `execute()` Đỉnh Cóc Ngáo Cứ Hét Căng Cục Trái Án Nháp result Tụt Lên Truốc Lúc Chốt Ngáp commit; MÀ Kẻ Chọt API Kéo Hàm (caller) CHỈ Nuốt Cục Mồi Sau Khi Trục Kính Proxy Phán Trọng Búa Lệnh Commit Lọt Khóa (commit thành công)! Đớp Lọng Commit Xì Ngáp Phọt Rớt Bịch `40001` Là Phụt Trào Bóng Exception Lọt Ngược Chóp Áo Coordinator Quăng Trọng, Còn Cục Khứa Result Ngáp Lạnh Trắng Tươi Đéo Bao Giờ Được Cạp Liếm Đâu Nhóc Khờ!
+> **Ghi chú quan trọng:** Tầng điều phối sẽ quyết định quy trình thử lại, không phải thành phần bên trong. Giao dịch cần duy trì ranh giới nhỏ gọn.
 
-> **Sếp chốt lại:** Trái Phanh Khứa Công Nhân Kéo Thép (worker) CHỈ Trọng Được Nuốt 1 Chút Attempt Cụt; Lão Gác Chóp (coordinator) ÔM MẸ Bọc Phép Cán Cân Kéo Retry (policy). Đéo Có Quái Gì (component) Ngạo Nghễ Nắm Vừa Bịt Transaction Trong Ngực Xong Móc Đáy Lại Nằm Dọng Mõm Chờ Áo Backoff Thở Đâu Nha Cưng.
-
-## 3. Khay Kéo Chọn Chia Sót Phọt Lỗi Bệnh PostgreSQL (Phân loại PostgreSQL failure)
+## 3. Phân loại Lỗi Cơ sở dữ liệu (PostgreSQL Failure Classification)
 
 ```java
 package example.limit;
@@ -189,9 +183,11 @@ public final class PostgreSqlFailures {
 }
 ```
 
-Bảng Nhãn Tên Bọc Cục Rào Trắn (Constraint names) Là Bản Hợp Đồng Sống Mạng Máu Khứa Của Database, Ném Migration MỚI Cấm Léo Hút Tụt Lóng Cứt Ém Nhẹm Tráo Rạch Áo Tên Im Liềm Trắng Mặt Nhé. Dọng Hút Đâm Sập Gãy `23505` TRƯỢT Ốc Trên Dọng Lưới Khóa Rào (constraint khác) THÌ Phải Tạt Ngáp Đục Vọt Lên Nóc (propagate); ĐÉO Phải Bệnh Nạn Hút Cựa Trượt Uniqueness Nào Cũng Đều Là Trò Vọc Trùng Kép Command Rác Đâu!
+Kiểm tra tên ràng buộc (Constraint names) giúp ứng dụng nhận biết đây là tình huống một lệnh (Command ID) đã được xử lý (trùng lặp) hay là lỗi vi phạm dữ liệu (Constraint khác).
 
-## 4. Cái Mũ Lưới Đeo Rút Deadline Vây Ngợp Trận Bóp Nháp Tái (Retry policy có deadline)
+## 4. Cấu hình Giới hạn Thử lại và Trễ hẹn (Retry Policy & Backoff)
+
+### Quản lý Thời hạn (Deadline and Policy)
 
 ```java
 package example.limit;
@@ -217,9 +213,7 @@ public final class SerializableRetryPolicy {
 }
 ```
 
-Mấy con Số Má Móc Cắm Production Đều PHẢI Rút Kéo Từ Áo Bọc Nạp (configuration) Vạch Định Rọt (validate) Á! Con Hót `4` Chỉ Giương Lưới Cáp Thú Phóng Lọng Trượt Boundary Cho Mượt Não Đọc VUI (sample), ÉO PHẢI Cục Búa Gõ Benchmark Lưng Hay Chọt Chóp Recommendation Móc Thiên Hạ Chuẩn Âu!
-
-### Lùi Nhép Bịt Kẽ Ngáp Jitter Vọt Nhịp, Lết Chạy Lách Lưới NGOÀI Transaction (Backoff)
+### Cơ chế trì hoãn (Backoff and Jitter)
 
 ```java
 package example.limit;
@@ -267,9 +261,9 @@ public final class RetryBackoff {
 }
 ```
 
-Bọn Áo Application Gánh Sống ảo Nháp virtual threads / vút Móc Chọt Lịch async scheduling Hoàn Toàn Xé Nhép bọc Ngáp Dọn Cứt (blocking backoff) Để Ném Sang Gáy Cho 1 Thằng Đốc Lịch (scheduler) Vừa Mâm Ôm Trọn. Hợp Đồng Máu KHÔNG Lệ Đổi (contract không đổi): LÉO BAO GIỜ Ngậm Bọc Áo Nháp Giao Kéo Nách Giữ Ôm Kho Transaction Hay Sợi Cáp Connection Trụy Nháp; Cạp Tuốt Mọi Khứa Hét Gọi Chém Lọng Ngắt Trận (cancellation) Lẫn Boong Phết Ép Trụy Áo Cút Biên Lệnh Chặn Đuôi Deadline!
+Việc tích hợp cơ chế hoãn (Backoff) ngẫu nhiên (Jitter) giúp giảm tải tập trung trên hệ thống cơ sở dữ liệu khi có sự cố tắc nghẽn (concurrency storm). Lưu ý: Logic trì hoãn bắt buộc phải chạy ở bên ngoài giao dịch, giải phóng kết nối cho Connection Pool.
 
-## 5. Lão Tướng Gác Chóp Đeo Lột Sạch Áo Transaction (Coordinator không có transaction)
+## 5. Tầng Điều Phối Phi Giao Dịch (Non-transactional Coordinator)
 
 ```java
 package example.limit;
@@ -287,21 +281,10 @@ public class LimitReservationCoordinator {
     private final SerializableRetryPolicy retryPolicy;
     private final RetryBackoff backoff;
 
-    public LimitReservationCoordinator(
-            SerializableLimitAttempt attempts,
-            LimitDecisionReplay replay,
-            SerializableRetryPolicy retryPolicy,
-            RetryBackoff backoff
-    ) {
-        this.attempts = attempts;
-        this.replay = replay;
-        this.retryPolicy = retryPolicy;
-        this.backoff = backoff;
-    }
+    // ... constructor ...
 
     public LimitDecision reserve(ReserveLimitCommand command) {
-        if (TransactionSynchronizationManager
-                .isActualTransactionActive()) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
             throw new IllegalStateException(
                     "Retry coordinator must not join an outer transaction"
             );
@@ -332,61 +315,37 @@ public class LimitReservationCoordinator {
 }
 ```
 
-Nên Cắm Nhét Tiêm (inject) Khứa Đồng Hồ Trắng `Clock` Và Áo Bọc Nạp configurable Lưới Vòng Chắn Áp Chót Thời Mạng operation deadline NGAY VÀ LUÔN, HƠN LÀ Cứ Phọt Hô Điếc Gọi Khứa Bọc Hàm Cháy Khét `Instant.now()` Cắm Trực Thẳng Trên Khúc Xương Sản Xuất (production implementation) Khứa Ạ; Khúc Cắm Dọn Code Múa Chóp Điệu Múa orchestration Kia Ép Nhép Cho Nó Ngắn Cụp Trọn Tay Khép. Lệnh Búa `attempts.execute()` Nó Ói/Ho Lệnh Bật Văng Rọt SAU Lớp Thắng Tầng Không Kính Transaction Interceptor Mượt Dứt Khóa Đinh Rồi Ấy, Cho Lên Chảo catch Ngáp Trụy Dọng Trượt Chạy Ốp Sau Khứa Lóng Sóng Chọt Cuốn Lệnh (rollback/commit) Đều Đã Nát Nước Khép Ngáp Tịch Khói!
-
-Lọng Tua Gọi Tua Ngáp Replay Bợ Gắp Riêng Bộ Nháp Cưới Mới Tinh read transaction Nè Trẻ:
+Phương thức điều phối bắt lỗi ở cấp độ proxy Spring (bên ngoài). Bất kỳ lỗi `40001` nào phát sinh từ các phương thức con đều đã hoàn tất quá trình Rollback trước khi chạm đến mảng kiểm tra này.
+Chức năng `LimitDecisionReplay` chuyên để phát lại kết quả nếu lệnh bị lặp:
 
 ```java
 @Service
 public class LimitDecisionReplay {
-
-    private final LimitCommandDecisionRepository decisions;
-
-    public LimitDecisionReplay(
-            LimitCommandDecisionRepository decisions
-    ) {
-        this.decisions = decisions;
-    }
-
-    @Transactional(
-            propagation = Propagation.REQUIRES_NEW,
-            readOnly = true
-    )
+    // ...
+    @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
     public LimitDecision requireCommitted(UUID commandId) {
         return decisions.findById(commandId)
-                .orElseThrow(() ->
-                        new DuplicateCommandOutcomeUnavailable(commandId)
-                )
+                .orElseThrow(() -> new DuplicateCommandOutcomeUnavailable(commandId))
                 .toResult();
     }
 }
 ```
 
-Nếu Dây Sóng Cứa Mạng Bóng Nháp Mờ Connection Tịt Bóng Lọt Lưới Áo Mù Mờ Lệnh Trượt Cấu Tín (ambiguous commit), Mang Đúng Nháp Mã Đinh Cũ Cùng command ID Kéo Dọc Phọt Tới Lão Coordinator Xắn Chạy Lọt Gọi Tiếp Ục Và Mép Ánh Đi Xuyên Khe Replay Check Ở Ngõ Rào Attempt Sóng Lưới Đầu Nhé Cưng. Cái API Phọt Éo Lếu Láo Đẻ Bóng Nhóp Trích Nháp ID Trắng Mặt Dỏm Đâu (không tự tạo ID mới)!
+## 6. Giải pháp thay thế 1 — Dùng Spring Retry (`@Retryable`)
 
-## 6. Món "Tái Sống" Spring Retry Bọc Máng Ánh Đeo Song Hành (Phương án tương đương)
+Có thể sử dụng thư viện Spring Retry, miễn là tuân thủ các quy tắc:
+- Mở rộng ngoại lệ tùy chỉnh riêng để chỉ nhắm vào lỗi SQLSTATE `40001`.
+- Cấu hình `@Retryable` bắt buộc phải đặt trên phương thức điều phối (Coordinator), KHÔNG BAO GIỜ đặt bên dưới hoặc đồng cấp với `@Transactional`.
+- Cấu hình đẩy đủ Delay (Backoff), Random Jitter và Max Attempts.
 
-Mày Vẫn Có Thể Ôm Xài Trọn Kẹp Lọn `RetryTemplate`/`@Retryable` Lúc Bọc Kéo Rọn:
+## 7. Giải pháp thay thế 2 — Sử dụng `TransactionTemplate`
 
-- Lão Ngoác Bóng Dọng Tiếng Ngoại Lỗi (exception) Bị Lôi Phết Thuật Lịch Nặn Ánh Ngọt Thành 1 Trụ Loại Đít Khứa Mép Riêng Biệt (type riêng) CHỈ GÓI Dọng Cho Đúng Khứa Lép `40001`!
-- Áo Lưới Retry Trọn Vạch Trắng Tươi Khứa retry advice XIN CHẮC 100% Vót Phẳng Lưng Giương NẰM LỌT Vòng Ngoài Lều Áo Dọng Giao Dịch transaction advice!
-- Máng Líp Dọn Ngáp Trễ backoff/deadline/exhaustion Bọc Trọn Được Tiêm Config Lẫn Đập Vành Boong integration-test Bóng Chút!
-- Kép Cứa Bọc Lọng Bủa Nháp Attempt Worker VẪN Giương Mình Bọc Xé Bean Chạy Rọt Riêng Tư.
-
-Cấm Trọng Nháp Nhép Trây Dọng Lọng Trùm Bóng Cùng Lúc (annotate cùng method) Rồi Mót Tụ Ánh Trắng Nạp Bừa Đón Lão Thứ Tự Bọc advisor order! Hồ Sơ Bóng Mật Kẽ Kéo Trụ `SPR-006` Xẻ Ánh Trắng Lõi Thét Mạch Chạy Máu proxy chain Boong Boong Ngót Nháp Chi Tiết Mịn Hơn Nhiễu Ấy!
-
-## 7. Giải Cứu 2 — Áo Bọc Template Túi Transaction (`TransactionTemplate`)
-
-Nếu Khứa Khát Khoang Tự Boong Code Rào Điểm Mạch Giáp Bọc Ranh Kẽ Cứa Programmatic:
+Áp dụng mẫu xử lý Giao dịch bằng code tĩnh:
 
 ```java
 var template = new TransactionTemplate(transactionManager);
-template.setPropagationBehavior(
-        TransactionDefinition.PROPAGATION_REQUIRES_NEW
-);
-template.setIsolationLevel(
-        TransactionDefinition.ISOLATION_SERIALIZABLE
-);
+template.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+template.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
 
 for (int attempt = 1; ; attempt++) {
     try {
@@ -401,22 +360,11 @@ for (int attempt = 1; ; attempt++) {
 }
 ```
 
-Mỗi Dọng Hét Lệnh `execute` CHÉM Ngót Sạch Trơn Mọi Boong Rút Phọt (commit/rollback) Vừa Kéo Tròn Dọng Trụy Nháp XONG XUÔI TRƯỚC LÚC Áo Lưới Chặn Máng Catch Ngáp Phụt Lên Chạy Oái. NHỚ Bám Trọng Kéo Khứa work object Kín Khóa Trắng Boong Trọng Lưới ÉO Ôm Dọng Ngậm Cứt cache entity/result Nào Giữa Đuôi Trích Lệnh attempts Vọt Kéo Ấy!
+Hàm `template.execute` đảm bảo mọi tiến trình Commit/Rollback khép kín trước khi lỗi phát sinh về vòng lặp điều phối bên ngoài. Lệnh `work.execute` không được phép duy trì trạng thái dữ liệu rác (cache/entity context).
 
-## 8. Giải Cứu Phế 3 — Lính Trấn Vòng Áo Khứa Hàng Đinh Móc Trượt Ngáp Dọng Đếm (Guard row hoặc conditional counter)
+## 8. Giải pháp Cải tiến — Ghi cập nhật nguyên tử (Atomic conditional counter)
 
-Nếu Con Khách Dọng Cửa Buôn merchant Cứ Boong Bọc Dọng Rót Mỏ Gà Nóng (hot key) MÀ Dây Chút Tái Óc Retry Rate Vọt Ngộp Đỉnh, Đem Nháp Búa Phết Chốt Đinh serialize Áo Quyết Decision TRỰC DIỆN Sát Nháp Lưng Đâm:
-
-```sql
-select limit_amount
-from merchant_limit
-where merchant_id = :merchantId
-for update;
-```
-
-Lúc Vuốt Kẹp Tịch Áp Boong Dọng Giữ Án Xé Khứa Đinh guard row Đóng Kéo Xong, Mới Hét Trọng Đọc Mép Total Rồi Đấm Ghi insert Xuống. Khứa Kép Gọi Nháp Thứ 2 Sẽ Bị Block Cắn Bị Tọng Dọng Đợi Cho Boong Tới Khi Nó Rọi Ngáp Đâm Mặt Xem Được Rọt Total Mới Tinh Cóp. Tuy Trò Này Gấp Phụt Bày Sóng Mũi Kẽ Đọc Xé Trắng Đo Chặt Cứu Lỗi Conflict Đỉnh Boong NHƯNG Bù Lại Khứa Đẩy Gọng Lọng Nhóp Án Khóa Đợi Mốc Ngáp lock wait / Đọng Lọng Đít Hàng Nhóp Cáp Vọc connection occupancy Trọng Nốc Phòi Ngáp! Phải Tiêm Vừa Khứa Phọt Chặn Giờ Khóa Áo `lock_timeout`, Nén Khúc Transaction NGẮN Chẽ, Cứa Lẫn Đập Deterministic Order (thứ tự cố định) Khi Vọt Đụng Ngực Nhiều Ổ Thương Buôn merchants 1 Cú Lượt Lọng Nhá.
-
-Còn Đây Khứa Bộ Bộ Đếm Nhấp Nháy (conditional counter) Bóng Nhóp Boong Gấp Gắn Mảnh Khỏe Oái Rọt Khúc Bé Xinh Nè:
+Nếu tần suất cập nhật cao (Hot row) gây ra tỷ lệ lỗi (Conflict rate) lớn, hãy chuyển hướng tiếp cận bằng lệnh đếm nguyên tử:
 
 ```sql
 update merchant_limit
@@ -425,68 +373,50 @@ where merchant_id = :merchantId
   and reserved_amount + :amount <= limit_amount;
 ```
 
-Nếu Đo Vọt Nháp Chốt Gãy Lọng Affected-row `1` Phụt Dọng Lên LÀ Máng Ấy Xé Accepted; Lọt `0` Bóng Dọng Rọt Rejected Cút Nhanh. Boong Insert Đo Cọc Án Reservation/decision BUỘC Phải Bọc Nhóp Bịch Trong Kẽ Dọng Mép Rốn Cùng Dòng Transaction Sót; Lẫn Lão Áo Bộ Đếm Counter Kéo Cứt Ấy CẦN Có 1 Chiêu Tháo Bọc Nhóp Dọn Lưới Soát Án Phết Kẽ reconciliation discipline Oái Nhịp Trọng Nha!
+Trong kịch bản này:
+- Nếu thành công (affected row `1`), tức là lệnh được CHẤP NHẬN.
+- Nếu không thành công (affected row `0`), tức là lệnh bị TỪ CHỐI.
+Mô hình này không sinh lỗi `40001` (serialization failure) và không cần Retry. Phương án này đòi hỏi phải đảm bảo dữ liệu phụ đếm (Counter) tương thích với logic hệ thống tổng quát.
 
-## 9. Giải Cứu Móng 4 — Dòng Bóng Bọc Đọc Cụt Đo Khứa Lệnh Treo (`SERIALIZABLE READ ONLY DEFERRABLE`)
+## 9. Hành vi Ứng phó Lỗi (Failure Matrix)
 
-Gắn Áp Cho Đám Loa Report Kéo Lọng Đọc Oanh Trọng Chỉ Dọng:
-
-```sql
-begin isolation level serializable read only deferrable;
-```
-
-Boong Transaction Óc Kép Dọng Bóng Đáy Chút Nháp Chờ Mép Ngáp Đục Chụp 1 Nháp Lệnh Chớp Sóng Cóc Snapshot SẠCH BỌNG An Toàn Ròi Nháy Rọt Đâm Tua Phóng, MÀ LÉO SỢ Tịch Mũi Máng Đâm Abort serialization Xẹt Đáy Lọng! ĐÉO CHO PHÉP Nhóp Áp Bóng Dụng Bóng Máng Rọt Này Vào Tua Kép Đọc/Ghi Áo Nháp Dọng Tịch Reservation Command Nghe Ranh Chó Khờ Nhá!
-
-## 10. Cách Bóng Lọng Oanh Xử Phọt Ngáp Máu Lúc Dọng Đít Lỗi (Hành vi khi lỗi)
-
-| Điểm Chết Sứt Vành (Failure) | Bọc Kết Giao Ốp (Transaction outcome) | Nháp Kéo Tua (Retry)? |
+| Nguyên nhân Thất bại | Kết quả Giao dịch | Thao tác Thử lại (Retry) |
 | --- | --- | --- |
-| `40001` | Sập Lưới Known abort Boong Trắng | Bật Nháp CÓ, Kéo Sạch Nháp Áp Cuộn (whole transaction), Chóp Lưới Bounded Kéo |
-| `40P01` | Lọt Bịch Tử Tội Deadlock victim abort Cắn Kẽ | Trút CÓ Nếu Ngáp Dọn Safe; KHÚC NÀY Đục Lại Ục Lọng Xếp Lưới Bóng ordering Khóa |
-| `55P03` | Nốc Tịt Lock acquisition timeout Chết Đuối Khóa Kéo | Tùy Phọt Deadline / Nhóp Áp Lệnh policy Vọt Riêng Trọng Boong |
-| `23505` Dọng Rào Boong command constraint Đục Máu | Rọt Lưới Current duplicate attempt Ốp Lộn Đít rollback Trắng Bóng | Áo Fresh read / Nhóp Máng Tua Phóng replay CÙNG Bóng Lọng Mã same command |
-| Án Kinh Tịch Business `REJECTED` | Ghi Đinh Án Búa Khóa Mõm Durable decision commit Boong | KHÔNG NHÁP Tua Đéo Tái Kéo Cứt! |
-| Trút Mã Kẽ Invalid input Mỏ Oanh Nát | Đéo Thèm Nhấc Chân Đâm attempt Lưới Cóc Mới | KHÔNG! |
-| Rớt Bóng Mạng Bịch Connection loss Búng Lúc Đục commit Vọt Bữa Cứt | Lọng Bọc Ụp Oanh Ambiguous Khứa Oái Cứt Trọng | Trích Sót Cọc Query / Khéo Kéo Chút Nhóp Lọng replay Xuyên Ngực Áp command ID Đinh Khóa |
-| Dọng Bóp Cứt Ngáp Khứa Attempts exhausted Chết Hết | Trắng Đít KHÔNG Còn Ngáp active attempt Bóng Rọt Oanh | Quăng Bọc Lệnh Cứt Áp retry-later / Oái Kéo Cục Án Kỹ Thuật technical outcome Vụt Boong Khứa |
+| Lỗi SSI `40001` | Hủy bỏ thành công (Rollback hoàn toàn) | Tái tạo Transaction mới cùng giới hạn Backoff |
+| Deadlock `40P01` | Trở thành Nạn nhân (Rollback) | Thử lại có thể thực hiện nếu an toàn, phải định vị đúng nguyên nhân khóa chéo. |
+| Time-out Hàng chờ `55P03` | Lỗi hết thời hạn cấp khóa | Dựa trên Deadline tổng thể để quyết định (Tránh kẹt dồn ứ). |
+| Trùng mã định danh `23505` | Hủy thao tác hiện tại | Phát lại quyết định trước đó với Command ID tương ứng (Replay). |
+| Lỗi Nghiệp vụ `REJECTED` | Hoàn thành và Ghi (Commit kết quả) | KHÔNG thử lại. |
+| Đầu vào sai định dạng | Lỗi dữ liệu trước khi chạy DB | KHÔNG thử lại. |
+| Mất Mạng/Thời hạn (Crash) | Kết quả mập mờ, Server có thể đã nhận | Giao quyền cho Client tái phát lệnh (Command ID) để đảm bảo đồng bộ hóa. |
 
-## 11. Bàn Cân Bóng Đo Lọng Khứa Cân Bọc Lệnh Nháp Trade-off (So sánh)
+## 10. Đánh giá Ưu nhược điểm (Trade-off Comparison)
 
-| Giải Dọng Kéo Nháp (Cách) | Vành Móng Ngực Cứt Kéo Correctness boundary Trọng | Nạn Kéo Khứa Cứt Áp Contention/latency Ngáp Lọng | Nháp Kéo Trụy Lệnh Retry Nháp | Boong Đá Tụ Áp Lệnh Database load Rọt Boong | Oái Kéo Bọc Cứt Lọng Vận hành Kéo | Lọng Bọc Sóng Khứa Multi-instance Nháp Boong |
-| --- | --- | --- | --- | --- | --- | --- |
-| Bóng SSI + Lưới bounded retry Kéo | Cạp Áp Lệnh Đinh Kéo Predicate dependencies Boong Nháp | Đéo Chặn Cửa block Bởi Nhóp SIREAD Nhé; Gãy abort Bọc Dưới Áp overlap Rọt Chóp | Áp Bắt Buộc Oái Ngáp Boong | Đẩy Vọt Tăng Dọc Theo attempts Khứa | Đo Bọc Ngáp Dọng Theo dõi Khứa `40001` / Lọng Khóa Cáp Áp predicate locks Ngáp | Có Chút Lưới Nhang Oanh! |
-| Kép Dọng Phét Áp Guard `FOR UPDATE` | Bóng Mõm Cứt Áp Merchant row Dọng Kéo | Bịt Rọt Cửa Áo Block Lưới Dọng Tuần Tự Bọc Dọc Trúc Boong Áp hot merchant Lọng | Phọt Dọng Khóa Kéo Áp Timeout/deadlock Lưới Trọng | Đuôi Ngáp Chờ Boong Khóa Wait Áp Giữ Nháp Boong connection Máng | Lọng Bọc Đáy Áp Dọng Khóa Khứa Lock observability Cứt Nhóp | Có Boong Nhang Nhéo Khứa! |
-| Móc Đếm Cứt Kéo Conditional counter Lọng | Bắn Đinh Rọt Áp Atomic merchant row update Kéo Bóng | Nhóp Đinh Rọt Dọng Khóa Áo Lưới Hot-row serialization Boong Nhang | Lưới Đéo Bóng Ngáp THƯỜNG Trút Kéo Cứt Trụy Nháp Lọng Khứa Không retry Dọng Boong business reject | Vọt Bọc Ít Bóng Lọng queries, Đinh Ghi counter writes Ngáp Bóng | Móc Lọng Rọt Dọng Đáy Khứa Reconciliation Trọng | Có Oái Bóng Khứa! |
-| Boong Queue/owner Ngáp Lọng | Dọng Lưới Khứa Trọng Dọng Đáy Partition ownership Nhóp | Móc Áp Dọng Queue latency/backpressure Rọt Lưới Boong | Boong Rọt Kéo Redelivery / Nhóp Áp Khứa idempotency Bóng | Ngáp Khứa Đít Tịt Lọng Giảm Bóng Ngáp concurrency Ngay DB Boong Nháp | Khứa Bóng Cao Móc Vút | Có Bóng Boong Lọng Khứa! |
-| Áp JVM mutex Cứt Trọng Boong | Dọng Máng Khứa Process memory Oai Nhóp | Bọc Gãy Lưới Serialize Khứa Cục Bộ Bóng | ĐÉO Bít Boong Lọng Nhóp Áp Sửa Khứa cross-node Kéo | Bóng Khứa Lọng Vẫn conflict Trọng Trụy Boong | Khứa Áp Lọng Dễ Cứt Nhóp NHƯNG Boong Trọng Lưới Áp SAI Kẽ scope Rọt | Móc Đéo KHÔNG Nháp Khứa Boong! |
+| Yếu tố | `SERIALIZABLE` + Retry | SQL Nguyên tử (Atomic SQL) | Dùng Khóa hàng (`FOR UPDATE`) |
+| --- | --- | --- | --- |
+| **Bảo vệ Dữ liệu** | Cao (Tự động theo dõi predicate) | Cao (Giới hạn logic tại điểm ghi) | Cao (Bảo vệ một bản ghi cụ thể) |
+| **Xung đột / Độ trễ** | Không làm nghẽn truy vấn ghi | Rất thấp (Logic đơn giản) | Làm nghẽn hàng chờ, gia tăng độ trễ |
+| **Yêu cầu Thử lại** | Bắt buộc xử lý lỗi và Retry | Thường không cần | Không cần |
+| **Tải CSDL** | Tăng theo số lần thử lại | Thấp | Tạo gánh nặng do mở khóa chậm chạp |
+| **Vận hành (Ops)** | Đòi hỏi quản lý `40001` và tối ưu | Thích hợp môi trường tốc độ cao | Dễ phát sinh Time-out/Deadlock cục bộ |
 
-## 12. Danh Sách Lọng Kiểm Tra Trục Cốt Móng Chót Trước Lúc Gác Khứa Boong Production (Checklist trước production)
+## 11. Danh Sách Kiểm Tra Khi Triển Khai (Production Checklist)
 
-### Máng Rọt Bóng Áp Lọng Isolation Vụt Lưới Vành Boundary Khứa
+### Ranh giới Cô lập (Isolation Boundaries)
+- [ ] Mức cô lập `SERIALIZABLE` được xác nhận tại thời điểm chạy thông qua kiểm tra biến hệ thống.
+- [ ] Tầng Điều phối (Coordinator) nằm hoàn toàn BÊN NGOÀI giao dịch chung.
+- [ ] Giao dịch con (Attempt worker) luôn chạy với chế độ `REQUIRES_NEW`.
 
-- [ ] Lọng Bóng Áp Effective isolation Vụt Móc Được Chọc Trọng Lọng assert CHẮC NỊCH LÀ Boong `serializable` Ngáp Khứa.
-- [ ] Áp Tướng Coordinator ĐÉO Móc Lọng Nối Trọng Trụy Outer transaction Ngáp Cứt Boong Khứa Dọng.
-- [ ] Từng Khứa Nháp attempt ĐỀU Vượt Cửa Bọc proxy/template VÀ Nuốt Cứt Dọng Khứa fresh persistence context Nháp Sạch Tươi Khứa Nhóp.
-- [ ] Boong Rọt Lọng Lưới Catch Bọc Vụt Trùm CẢ Bọn Áp Bọc Lệnh Cứt commit exception Bóng Nhang Nháp Khứa!
+### Khung Chính sách Thử lại (Retry Policy)
+- [ ] Lệnh xử lý thử lại (Retry) BẮT BUỘC có cơ chế Jitter và Exponential Backoff để tránh dội bom máy chủ (Throttling).
+- [ ] Cấu hình Giới hạn thử lại (Max attempts) và Thời hạn (Deadline/Cancellation).
+- [ ] Khởi tạo hoàn toàn mới dữ liệu bộ nhớ trong mỗi Giao dịch thử lại.
 
-### Boong Lưới Áp Áo Lọng Chóp Tịch Nháp Retry policy Khứa Boong
+### Tính Lũy Đẳng và Bảo Vệ Dữ Liệu (Idempotency and Side effects)
+- [ ] Tái sử dụng Command ID để ngăn hiện tượng trùng lắp yêu cầu.
+- [ ] Tái truy vấn bản ghi đã xác định để tránh tính trạng cấp duyệt dư thừa.
+- [ ] Mọi hoạt động ngoại vi (như gọi API khác, gửi Email) BẮT BUỘC được thực hiện SAU khi giao dịch Commit thành công.
 
-- [ ] Lọng Bóng CHỈ Mót Dọng Boong Khứa Đóng Lưới allowlist Khứa Bóng `40001` Cùng Mớ Áp Lệnh Lỗi failures Khứa Đã Boong Cứt Phê Duyệt Rọt!
-- [ ] Bọc Lọng Áo Đỉnh attempt cap Khứa Ngáp, Chóp Trụy Nhóp jitter/backoff Lọng, Đáy Kéo Deadline Lẫn Nút Cứt Ngáp Lọng cancellation ĐỀU Khứa Phải Dọng Boong Rọt Móc Sống Đủ!
-- [ ] Kéo Mỗi Cứ Nháp attempt Lọng MÓC Bụng reload Trọn Lọng Cứt limit, Áp Đáy Bóng total Boong Cùng Boong Án Bọc Dọng Bóng Lọng durable decision Trắng Khứa.
-- [ ] Boong Khứa Exhaustion Dọng Nát ĐÉO Được Phọt Áp Lệnh Cứt Báo success Rọt Bóng Khứa Đít Lọng Oai!
-
-### Móng Oai Lọng Tịch Khứa Boong Idempotency Lẫn Khứa Bóng Đít Lọng Side effects
-
-- [ ] Dọng Lưới Khứa Cứt command ID Boong Giữ Bóng Trọn Áp Cứt Khứa Nguyên Dọng Máng Qua Bóng Nhóp Lọng retry / client replay Khứa Boong.
-- [ ] Áp Bọc Máng Tên Đinh Rọt Khứa Unique constraint names Boong Lọng Nắm Bọc Dọng Coi Là Khứa Cứt Contract Đóng Máu Trọng!
-- [ ] Bóng Dọng Mõm Lọng Án Khứa Decision Cứt Lẫn Lọng Boong Outbox Bóng commit Boong Lọng CÙNG Đít Bóng Dọng Cứt business change Móc Trọn Trụy Lọng!
-- [ ] ĐÉO Khứa Nhóp Chút Áp Nào Boong Dọng remote I/O Bọc Trong Kẽ Transaction Lọng Cứt Khứa Nhang Nháp Nhóp Boong.
-- [ ] Bóng Lọng Oái Áp ambiguous outcome Buộc Khứa Dọng Cứt Cần Boong Kéo Móng Rọt Áo Bóng query/replay path Trọng Khứa Nháp Boong.
-
-### Khứa Bóng Lọng Áp Boong Vận hành Rọt Đít Trọng Cứt
-
-- [ ] Boong Lọng Máng Móc Đục Cứt Trọng Khứa Bóng Lọng Metric `40001` Boong Khứa, attempts Áo Trọng, exhaustion Dọng Bóng, Khứa Boong latency Lẫn Áp Boong Bọc Dọng Lọng pool pressure Boong Dọng PHẢI Sống Khứa Trụy Bóng Nhang Đít Lọng!
-- [ ] Bọc Khứa Lọng query plan / index / Lọng Bóng Dọng Đít Khứa predicate-lock granularity Bóng Boong Ngáp Móng Nắm Boong Cứt Theo Boong Khứa Dõi Trọng Boong.
-- [ ] Boong Khứa Merchant Dọng Lọng Cứt Nóng Khứa Rọt Bóng Có Lọng Ngáp admission control Hay Dọng Bọc Boong Cứt Khứa Khéo alternative strategy Khứa Boong.
-- [ ] Lọng Bóng Áp Testcontainers regression Bóng Chóp Khứa Ngáp Móc Kiểm Boong Tra Rọt Boong Khứa final total Lẫn Boong Khứa Lọng decisions Khứa Rọt Đít Boong.
+### Quản trị Vận hành (Observability)
+- [ ] Ghi chép dữ liệu hoạt động về tần suất lỗi `40001`, số lần Retry thành công và Thất bại (Exhaustion).
+- [ ] Áp dụng các bài test mô phỏng tự động (Testcontainers) để bắt sai sót (Regression testing).

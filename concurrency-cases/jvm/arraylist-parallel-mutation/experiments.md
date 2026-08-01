@@ -1,26 +1,18 @@
-# Kiểm thử đồng thời và xác minh trong môi trường thực tế
+# Môi Trường Thực Nghiệm: Xác Minh Tính Nguyên Tử Trên Cấu Trúc ArrayList
 
-## Chiến lược kiểm thử
+## 1. Chiến Lược Kiểm Thử (Testing Strategy)
 
-Không nên chỉ chạy `parallelStream()` một lần rồi kết luận `ArrayList` an toàn vì
-size tình cờ đúng. Case dùng ba tầng:
+Không thể kết luận tính an toàn của hệ thống khi chạy thử nghiệm `parallelStream()` qua loa với số lượng phần tử trả về ngẫu nhiên. Cấu trúc thực nghiệm bao gồm ba tầng:
 
-1. mô hình interleaving có hook để chứng minh cơ chế lost update một cách
-   deterministic;
-2. stress test trên `ArrayList` thật để quan sát biểu hiện trên runtime/JDK đang
-   dùng;
-3. regression test cho solution, assertion trực tiếp cardinality, uniqueness và
-   ordering invariant.
+1. Thiết kế mô hình đan xen luồng (Interleaving model) với các cơ chế kiểm soát chốt chặn (hook) nhằm phơi bày lỗ hổng "thất thoát ghi đè" (Lost Update) mang tính chất phân định logic (Deterministic).
+2. Kiểm tra giới hạn chịu tải (Stress test) trực diện trên `ArrayList` nhằm theo dõi sự cố sai lệch tùy biến của từng bộ phân bản JDK/Runtime.
+3. Triển khai cấu trúc kiểm định thoái lui (Regression test) dành riêng cho phương pháp khắc phục; đo lường trực diện các biến Cardinality, tính Độc bản (Uniqueness), và trật tự Đầu vào (Ordering).
 
-Mọi latch, barrier và future đều có timeout. Không dùng `Thread.sleep` làm điều
-kiện pass/fail. Xem thêm
-[Kiểm thử đồng thời](../../concepts/concurrency-testing.md).
+Toàn bộ các tín hiệu rào cản (`Latch`, `Barrier`, `Future`) bắt buộc đính kèm giới hạn thời gian (Timeout). Cấm sử dụng phương thức hoãn luồng vật lý (`Thread.sleep`) làm hệ quy chiếu quyết định Pass/Fail. Tìm hiểu sâu tại **[Kiểm Thử Tương Tranh (Concurrency Testing)](../../concepts/concurrency-testing.md)**.
 
-## Experiment 1: mô hình hóa lost update một cách deterministic
+## 2. Thí Nghiệm 1: Định Hình Cơ Chế Thất Thoát (Deterministic Lost Update)
 
-Không thể chèn latch vào giữa các instruction private của `ArrayList.add` mà
-không instrument JDK. Test harness sau mô hình hóa đúng compound action “đọc
-size → ghi slot → cập nhật size” và ép hai writer cùng chọn index 0.
+Không thể cài đặt Latch vào bên trong các lệnh cấp thấp thuộc quyền riêng tư của JVM trên `ArrayList.add`. Hệ thống kiểm thử này mô phỏng trọn vẹn chuỗi mệnh lệnh "truy xuất Size → Điền thông tin Khe → Cập nhật Size" và thiết lập cưỡng ép hai tác vụ trỏ vào cùng vị trí Index 0.
 
 ```java
 package com.example.quote;
@@ -58,6 +50,7 @@ class LostUpdateInterleavingTest {
             second.get(5, TimeUnit.SECONDS);
         }
 
+        // Bằng chứng thất thoát: Mảng trả về 1 nhưng thực thể sinh ra 2!
         assertEquals(1, accumulator.size());
         assertEquals(1, accumulator.values().size());
     }
@@ -76,8 +69,8 @@ class LostUpdateInterleavingTest {
                 CountDownLatch allowWrites
         ) {
             int index = size;
-            captured.countDown();
-            awaitOrFail(allowWrites);
+            captured.countDown(); // Thông báo đã đánh cắp chỉ mục
+            awaitOrFail(allowWrites); // Đợi lệnh ghi đè đồng loạt
             elements[index] = value;
             size = index + 1;
         }
@@ -94,28 +87,23 @@ class LostUpdateInterleavingTest {
     private static void awaitOrFail(CountDownLatch latch) {
         try {
             if (!latch.await(5, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("latch timed out");
+                throw new IllegalStateException("Hết hạn chờ đồng bộ Latch");
             }
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted while waiting", exception);
+            throw new IllegalStateException("Phát sinh gián đoạn luồng", exception);
         }
     }
 }
 ```
 
-Đây là executable model của race, không phải test xác nhận implementation nội bộ
-của một phiên bản JDK. Nó giúp code review nhìn thấy non-atomic operation mà
-không phụ thuộc scheduler.
+Kiến trúc đại diện cho tính Không-Nguyên-Tử của đối tượng, đóng vai trò bản mẫu kiểm chứng độc lập hoàn toàn khỏi hệ thống phân luồng máy tính (Scheduler).
 
-> **Nói ngắn gọn:** deterministic test chứng minh cơ chế; stress test tiếp theo
-> mới khảo sát biểu hiện của `ArrayList` thật.
+> **Nguyên tắc kỹ thuật:** Bằng chứng Deterministic chứng minh lý thuyết cốt lõi; Khảo sát Stress Test sau đây sẽ đánh giá hệ lụy phát sinh của cấu trúc `ArrayList` thực.
 
-## Experiment 2: stress test trên ArrayList thật
+## 3. Thí Nghiệm 2: Giới Hạn Tải Vật Lý Trên ArrayList
 
-Test này có tính xác suất và nên đặt trong test suite riêng như `@Tag("stress")`.
-Nếu nó không fail, code production vẫn sai vì API không có thread-safety
-contract.
+Bài kiểm thử mang tính xác suất, yêu cầu khởi chạy trong chuỗi kiểm thử độc lập `@Tag("stress")`. Việc hệ thống chạy ngang qua mà không bộc lộ lỗi không phủ nhận mã nguồn Production hoàn toàn có khả năng sụp đổ do thiếu hụt hợp đồng bảo hộ (Thread-safety).
 
 ```java
 package com.example.quote;
@@ -137,7 +125,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 @Tag("stress")
 class ArrayListConcurrentAddStressTest {
 
-    @RepeatedTest(200)
+    @RepeatedTest(200) // Đẩy cao tần suất phát sinh đụng độ
     void concurrentAddsMustNotBeTrusted() throws Exception {
         int itemCount = 2_000;
         ArrayList<Integer> results = new ArrayList<>(itemCount);
@@ -147,7 +135,7 @@ class ArrayListConcurrentAddStressTest {
             List<Future<?>> futures = IntStream.range(0, itemCount)
                     .mapToObj(value -> executor.submit(() -> {
                         awaitOrFail(start);
-                        results.add(value);
+                        results.add(value); // Thao tác nguy hiểm
                     }))
                     .toList();
 
@@ -157,6 +145,7 @@ class ArrayListConcurrentAddStressTest {
             }
         }
 
+        // Lỗi Thất Thoát Dữ Liệu Chắc Chắn Xảy Ra!
         assertEquals(itemCount, results.size());
         assertEquals(itemCount, results.stream().distinct().count());
     }
@@ -164,24 +153,21 @@ class ArrayListConcurrentAddStressTest {
     private static void awaitOrFail(CountDownLatch latch) {
         try {
             if (!latch.await(5, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("start gate timed out");
+                throw new IllegalStateException("Hết hạn chờ lệnh kích hoạt đồng bộ");
             }
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted while waiting", exception);
+            throw new IllegalStateException("Gián đoạn trong quá trình đồng bộ", exception);
         }
     }
 }
 ```
 
-Test có thể fail vì size/uniqueness sai hoặc một future bọc exception từ task.
-Không dùng test này làm bằng chứng duy nhất và không tăng số vòng lặp vô hạn trong
-CI. Lưu seed, JDK, CPU count và failure round khi dùng harness stress riêng.
+Kiểm định lỗi qua sai số kích thước (size mismatch), trùng lặp dữ liệu, hoặc ngoại lệ đính kèm vào khối Giao dịch. Không sử dụng kết quả bài đo lường này làm tiêu chuẩn độ tin cậy duy nhất. Khuyến nghị ghi lại phiên bản JDK, tài nguyên cấp phát khi vận hành các bộ Stress test diện rộng.
 
-## Experiment 3: regression test giữ cardinality và input order
+## 4. Thí Nghiệm 3: Bảo Toàn Tính Quy Mô Vị Trí (Regression Test)
 
-Fake client cố tình hoàn tất `request-b` trước `request-a`. Solution vẫn phải trả
-output theo input order vì coordinator collect future theo thứ tự submit.
+Mô phỏng máy chủ phản hồi bất đối xứng: Yêu cầu B hoàn thành tốc độ nhanh hơn Yêu cầu A. Kiến trúc tối ưu bắt buộc tái lập nguyên trạng quy mô tham số đầu vào.
 
 ```java
 package com.example.quote;
@@ -205,9 +191,9 @@ class BatchQuoteServiceTest {
 
         QuoteClient client = request -> {
             if (request.requestId().equals("request-a")) {
-                awaitOrFail(secondCompleted);
+                awaitOrFail(secondCompleted); // Chờ B hoàn thành trước
             } else {
-                secondCompleted.countDown();
+                secondCompleted.countDown(); // B hoàn thành báo cáo sớm
             }
             return new QuoteResult(
                     request.requestId(),
@@ -227,11 +213,13 @@ class BatchQuoteServiceTest {
                     Duration.ofSeconds(5)
             );
 
+            // Xác minh trình tự trả về phải tuyệt đối ăn khớp với cấu trúc Mảng Input ban đầu
             assertEquals(2, result.size());
             assertEquals(
                     List.of("request-a", "request-b"),
                     result.stream().map(QuoteResult::requestId).toList()
             );
+            // Xác thực độ độc bản
             assertEquals(2, result.stream()
                     .map(QuoteResult::requestId)
                     .distinct()
@@ -242,24 +230,21 @@ class BatchQuoteServiceTest {
     private static void awaitOrFail(CountDownLatch latch) {
         try {
             if (!latch.await(5, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("dependency timed out");
+                throw new IllegalStateException("Hết hạn chờ đồng bộ");
             }
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("interrupted while waiting", exception);
+            throw new IllegalStateException("Luồng kiểm thử gián đoạn", exception);
         }
     }
 }
 ```
 
-Assertion dùng business identity `requestId`, không chỉ kiểm tra list không ném
-exception. Nếu API không yêu cầu input order, bỏ assertion order nhưng vẫn giữ
-cardinality và uniqueness.
+Lấy trục đối chiếu là định danh `requestId`. Bỏ qua chuỗi thứ tự (order) nếu API không quy định, nhưng nguyên tắc Toàn Vẹn Quy Mô (Cardinality) và Độc bản (Uniqueness) luôn phải thi hành nghiêm ngặt.
 
-## Experiment 4: failure phải cancel task còn lại
+## 5. Thí Nghiệm 4: Chính Sách Khử Toàn Cục Nếu Lỗi (All-or-Nothing Failure)
 
-Test điều phối để task chậm chắc chắn đã chạy trước khi task còn lại fail. Khi
-batch fail, `finally` phải gửi interrupt tới task chậm.
+Một Lô xử lý khi đổ vỡ phải điều hướng tín hiệu Khử (Interrupt) truy kích các tiến trình xử lý chậm hơn (Unfinished task).
 
 ```java
 @Test
@@ -273,16 +258,16 @@ void failureCancelsUnfinishedTaskAndPublishesNoPartialResult() throws Exception 
             slowTaskStarted.countDown();
             try {
                 neverReleasedNormally.await(30, TimeUnit.SECONDS);
-                throw new AssertionError("slow task should have been cancelled");
+                throw new AssertionError("Tác vụ xử lý chậm phải nhận lệnh Cancel, không được tiếp tục");
             } catch (InterruptedException exception) {
                 interrupted.countDown();
                 Thread.currentThread().interrupt();
-                throw new IllegalStateException("slow task interrupted", exception);
+                throw new IllegalStateException("Xác nhận tiến trình chạm ngưỡng ngắt", exception);
             }
         }
 
         awaitOrFail(slowTaskStarted);
-        throw new IllegalStateException("provider failed");
+        throw new IllegalStateException("Nhà cung cấp ngoại vi văng lỗi");
     };
 
     try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
@@ -296,54 +281,46 @@ void failureCancelsUnfinishedTaskAndPublishesNoPartialResult() throws Exception 
                 Duration.ofSeconds(5)
         ));
 
-        assertTrue(interrupted.await(5, TimeUnit.SECONDS));
+        assertTrue(interrupted.await(5, TimeUnit.SECONDS)); // Đảm bảo luồng chậm đã tiếp thu lệnh Cancel
     }
 }
 ```
 
-Để compile snippet, dùng static imports cho `assertThrows` và `assertTrue`; các
-type/helper còn lại lấy từ Experiment 3. Test xác nhận cancellation signal, không
-khẳng định remote system đã rollback. Client timeout và idempotency vẫn phải được
-kiểm thử ở integration boundary.
+Kiểm định phản hồi Hủy từ Client (Cancellation signal), không mang tính cam kết về quá trình hệ thống bên ngoài tự động Hoàn Tác (Rollback). Ràng buộc bảo mật mạng và cơ chế chống lặp (Idempotency) là hai tuyến bảo mật song song cần thiết trên cấp độ Tích hợp.
 
-## Kiểm thử progress semantics
+## 6. Mô Phỏng Hợp Đồng Đo Lường Tiến Độ
 
-Nếu dùng `ConcurrentLinkedQueue`, test progress reader chỉ nên yêu cầu:
+Khi khai thác cấu trúc `ConcurrentLinkedQueue`, quy chuẩn dữ liệu đối với người truy xuất Tiến độ (Progress reader):
 
-- mọi item quan sát được đều hợp lệ;
-- không có duplicate `requestId` nếu mỗi task publish một lần;
-- progress count không vượt input count;
-- final snapshot sau completion barrier có đủ item.
+- Xác nhận mọi phân mảnh dữ liệu (Item) hợp pháp hóa (Valid).
+- Loại trừ bản sao `requestId` khi phân luồng phân phát một chiều.
+- Khống chế dung lượng Mảng Tiến độ <= Dung lượng Yêu cầu.
+- Snapshot Mảng Cuối (Final Snapshot) được công nhận tại điểm chốt Rào cản (Barrier).
 
-Không assert một progress snapshot giữa chừng phải chứa result vừa hoàn tất nếu
-contract của iterator là weakly consistent. Nếu product cần acknowledgement mạnh
-hơn, dùng event/channel protocol có sequence thay vì suy diễn từ collection
-iterator.
+Không ép buộc Snapshot Mảng Trung Gian (Progress Snapshot) hiển thị tuyệt đối mọi thuộc tính nếu Iterator chạy trên cơ chế Đảm Bảo Đứt Quãng (Weakly consistent).
 
-## Xác minh trong môi trường thực tế
+## 7. Giám Sát Môi Trường Khai Thác (Production Metrics)
 
-Ghi metric theo batch:
+Các thông số cần đo lường liên tục:
 
-- `input_count`, `completed_count`, `failed_count`, `cancelled_count`;
-- cardinality mismatch và duplicate `requestId` trước publish;
-- batch deadline exceeded và remote timeout;
-- executor active count, queue depth hoặc concurrency permit;
-- task latency distribution và batch latency;
-- số task vẫn chạy sau khi batch đã fail/cancel.
+- Biến đếm: `input_count`, `completed_count`, `failed_count`, `cancelled_count`.
+- Dấu hiệu mất cân xứng tập lệnh (Cardinality mismatch), lặp thông số truy xuất.
+- Thời gian Lô hết hạn và Lỗi Timeout cục bộ (Client).
+- Mức độ sử dụng Executor queue, luồng xử lý tồn đọng (Saturation).
+- Độ phân tán hiệu suất (Latency distribution) giữa các luồng con và Tác vụ Lô.
+- Phát hiện rò rỉ tác vụ (Task leak) bám trụ hệ thống dù Lô đã bị Cancel.
 
-Log `batchId`, input count, outcome và elapsed time. Không log toàn bộ quote data
-nhạy cảm. Với stress failure, lưu JDK version, processor count và iteration để có
-thể tái hiện gần nhất.
+Khống chế khai báo nhật ký nhạy cảm (PII). Xây dựng cấu trúc tham số chuẩn (JDK, Processor count, Iteration) nhằm tái định vị hệ thống lúc gặp lỗi (Stress failure).
 
-## Checklist chất lượng của case
+## 8. Khung Tiêu Chuẩn Thực Nghiệm (Quality Checklist)
 
-- [ ] Deterministic model ép hai writer dùng cùng logical index.
-- [ ] Stress test thật được tách khỏi test suite ổn định.
-- [ ] Không dùng `Thread.sleep` làm synchronization.
-- [ ] Mọi latch và future đều có timeout.
-- [ ] Fixed test kiểm tra cardinality, uniqueness và ordering.
-- [ ] Failure test xác nhận unfinished task nhận cancellation signal.
-- [ ] Interrupt status được khôi phục.
-- [ ] Executor được đóng sau test.
-- [ ] Progress assertion khớp collection semantics.
-- [ ] Production validation kiểm tra invariant trước khi publish response.
+- [ ] Cấu trúc mô phỏng Deterministic khẳng định đặc tả dùng chung vị trí Index.
+- [ ] Phân vùng bài Stress test vào quy chuẩn đánh giá độc lập.
+- [ ] Triệt tiêu cấu trúc `Thread.sleep` thay thế bằng Rào cản Đồng Bộ (CountDownLatch).
+- [ ] 100% Cấu trúc chặn giới hạn đính kèm Thời hạn (Timeout).
+- [ ] Kiểm chứng các trục Tọa độ Hệ thống: Quy Mô, Độc Bản, và Trình Tự.
+- [ ] Đánh giá khả năng Cắt đứt nguồn tài nguyên đối với Tiến trình ngoại lệ.
+- [ ] Trả nguyên hiện trạng Cờ Báo Gián Đoạn (Interrupt status).
+- [ ] Kết thúc sạch môi trường thực thi bộ đệm sau Test (Executor shutdown).
+- [ ] Hợp nhất các tham chiếu đo lường theo đúng đặc tả của Dữ liệu Cấu trúc.
+- [ ] Xác nhận toàn vẹn (Invariant assertion) bắt buộc chạy trước tiến trình Trả kết quả Phân luồng.

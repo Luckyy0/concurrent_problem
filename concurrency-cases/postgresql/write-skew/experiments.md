@@ -1,21 +1,19 @@
-# Deterministic write-skew experiments
+# Các thử nghiệm write skew tất định
 
 ## Mục tiêu
 
-Test suite chứng minh:
+Bộ kiểm thử (Test suite) chứng minh:
 
-1. `READ COMMITTED` và `REPEATABLE READ` đều có thể commit write skew;
-2. two version predicates cùng affected-row `1`;
-3. `SERIALIZABLE` abort một actor với `40001`, final count giữ `1`;
-4. roster guard lock serialize decisions;
-5. conditional counter có đúng một successful decrement;
-6. rollback không để assignment/counter dở dang.
+1. `READ COMMITTED` và `REPEATABLE READ` đều có thể commit lỗi write skew;
+2. hai thao tác cập nhật phiên bản cùng có số row bị ảnh hưởng là `1`;
+3. `SERIALIZABLE` hủy (abort) một tiến trình với `40001`, số lượng cuối cùng giữ nguyên là `1`;
+4. Roster guard lock tuần tự hóa các quyết định;
+5. Bộ đếm có điều kiện chỉ có đúng một giao dịch giảm thành công;
+6. Rollback không để lại phân công hoặc bộ đếm ở trạng thái dở dang.
 
-Latch buộc cả actors đọc count trước khi update. Mọi wait/future có timeout; test
-không dựa vào wall-clock delay.
+Latch buộc cả hai tiến trình đọc số lượng trước khi cập nhật. Mọi thời gian chờ (wait/future) đều có timeout; kiểm thử không dựa vào độ trễ theo thời gian thực (wall-clock delay).
 
-> **Nói ngắn gọn:** test đúng phải assert both technical outcomes và final
-> roster invariant, vì write skew thường không tạo exception ở isolation thấp hơn.
+> **Nói ngắn gọn:** kiểm thử đúng phải xác nhận (assert) cả kết quả kỹ thuật và quy tắc bất biến cuối cùng của danh sách trực, vì write skew thường không tạo ngoại lệ ở mức cô lập thấp hơn.
 
 ## PostgreSQL Testcontainers
 
@@ -103,9 +101,9 @@ class WriteSkewIntegrationTest {
 }
 ```
 
-Test methods không có outer transaction; mỗi actor sở hữu JDBC connection riêng.
+Các phương thức kiểm thử (Test methods) không có outer transaction; mỗi tiến trình sở hữu kết nối JDBC riêng.
 
-## Gate và outcome
+## Cổng chặn và kết quả (Gate and outcome)
 
 ```java
 final class BothObservedGate {
@@ -146,7 +144,7 @@ private static void await(CountDownLatch latch, String step) {
 }
 ```
 
-## Broken actor helper
+## Phương thức lỗi phụ trợ (Broken actor helper)
 
 ```java
 private static LeaveOutcome runBrokenLeave(
@@ -207,7 +205,7 @@ private static int markOffCall(
 }
 ```
 
-## Experiment 1 — `REPEATABLE READ` commits write skew
+## Thử nghiệm 1 — `REPEATABLE READ` commits write skew
 
 ```java
 @Test
@@ -225,9 +223,9 @@ void repeatableReadAllowsDifferentRowWriteSkew() throws Exception {
 }
 ```
 
-Hai affected-row `1` chứng minh `@Version`-style predicates không conflict.
+Hai thao tác trả về số row bị ảnh hưởng là `1` chứng minh các điều kiện kiểu `@Version` không xung đột.
 
-## Experiment 2 — `READ COMMITTED` cũng vỡ invariant
+## Thử nghiệm 2 — `READ COMMITTED` cũng làm sai quy tắc bất biến
 
 ```java
 @Test
@@ -242,7 +240,7 @@ void readCommittedRaceAlsoLeavesNoOperator() throws Exception {
 }
 ```
 
-## Experiment 3 — `SERIALIZABLE` abort một actor
+## Thử nghiệm 3 — `SERIALIZABLE` hủy (abort) một tiến trình
 
 ```java
 @Test
@@ -260,10 +258,9 @@ void serializableKeepsAtLeastOneOperator() throws Exception {
 }
 ```
 
-Production retry của `40001` phải mở transaction mới; khi recount thấy `1`, loser
-trả `LAST_OPERATOR_REQUIRED`.
+Việc thử lại `40001` trên production phải mở một transaction mới; khi đếm lại và thấy là `1`, bên thua sẽ trả về `LAST_OPERATOR_REQUIRED`.
 
-## Shared broken-race runner
+## Chạy các thử nghiệm bị lỗi (Shared broken-race runner)
 
 ```java
 private List<LeaveOutcome> runBrokenRace(int isolation) throws Exception {
@@ -283,10 +280,9 @@ private List<LeaveOutcome> runBrokenRace(int isolation) throws Exception {
 }
 ```
 
-`observedInvariant()` vẫn buộc both COUNT hoàn tất trước either UPDATE dù
-`releaseUpdates()` được gọi sớm.
+`observedInvariant()` vẫn buộc việc đếm hoàn tất trước bất kỳ thao tác UPDATE nào dù `releaseUpdates()` được gọi sớm.
 
-## Experiment 4 — Guard row serialize quyết định
+## Thử nghiệm 4 — Guard row tuần tự hóa quyết định
 
 ```java
 record GuardedOutcome(boolean accepted, long observedCount) {
@@ -346,7 +342,7 @@ void guardRowAllowsOneLeaveAndRejectsTheOther() throws Exception {
 }
 ```
 
-## Experiment 5 — Guard lock timeout bounded
+## Thử nghiệm 5 — Giới hạn timeout cho Guard lock
 
 ```java
 @Test
@@ -390,10 +386,9 @@ void contenderGetsBoundedLockTimeout() throws Exception {
 }
 ```
 
-## Experiment 6 — Conditional counter có một winner
+## Thử nghiệm 6 — Bộ đếm có điều kiện chỉ có một giao dịch thắng
 
-Hai actors update own rows rồi cùng decrement roster counter. Loser rollback own
-row khi affected-row `0`:
+Hai tiến trình cập nhật row của chính mình rồi cùng giảm giá trị bộ đếm danh sách trực. Phía thua sẽ rollback row của mình khi số row bị ảnh hưởng là `0`:
 
 ```java
 @Test
@@ -421,7 +416,7 @@ void conditionalCounterRollsBackSecondLeave() throws Exception {
 }
 ```
 
-`leaveWithCounter` throws/rolls back when:
+`leaveWithCounter` ném ngoại lệ và rollback khi:
 
 ```sql
 update on_call_roster
@@ -431,7 +426,7 @@ where roster_id = :rosterId
 -- affected row 0 for loser
 ```
 
-## Experiment 7 — Rollback release locks và state
+## Thử nghiệm 7 — Rollback giải phóng locks và state
 
 ```java
 @Test
@@ -468,7 +463,7 @@ void failedGuardedAttemptLeavesBothOperatorsOnCall() {
 }
 ```
 
-## SQL helpers và inspector
+## Hàm SQL phụ trợ (SQL helpers và inspector)
 
 ```java
 private static void lockRoster(Connection connection) throws SQLException {
@@ -511,32 +506,30 @@ private static void insertAssignment(JdbcTemplate jdbc, UUID operatorId) {
 }
 ```
 
-`committedRosterCount()` đọc `on_call_roster.on_call_count`. Helper
-`leaveWithCounter()` dùng JDBC transaction, update assignment conditionally, chạy
-counter UPDATE, rollback và return `false` khi counter affected-row `0`.
+`committedRosterCount()` đọc `on_call_roster.on_call_count`. Phương thức hỗ trợ `leaveWithCounter()` dùng JDBC transaction, cập nhật phân công có điều kiện, chạy lệnh UPDATE bộ đếm, sau đó rollback và trả về `false` khi lệnh cập nhật bộ đếm trả về số row ảnh hưởng là `0`.
 
-## Coverage matrix
+## Bảng độ phủ (Coverage matrix)
 
-| Experiment | Mechanism | Technical outcome | Business outcome |
+| Thử nghiệm | Cơ chế | Kết quả kỹ thuật | Kết quả nghiệp vụ |
 | --- | --- | --- | --- |
-| 1 | RR + disjoint `@Version` writes | both affected `1` | unsafe count `0` |
-| 2 | RC + disjoint writes | both commit | unsafe count `0` |
-| 3 | SERIALIZABLE SSI | one `40001` | safe count `1` |
-| 4 | Guard `FOR UPDATE` | second waits/recounts | one accepted |
-| 5 | Guard + `lock_timeout` | contender `55P03` | owner unchanged |
-| 6 | Conditional counter | loser affected `0`/rollback | rows/counter `1` |
-| 7 | Forced rollback | lock/state rollback | count remains `2` |
+| 1 | RR + disjoint `@Version` writes | cả hai có số affected `1` | số lượng sai lệch `0` |
+| 2 | RC + disjoint writes | cả hai đều commit | số lượng sai lệch `0` |
+| 3 | SERIALIZABLE SSI | một bên gặp lỗi `40001` | số lượng an toàn `1` |
+| 4 | Guard `FOR UPDATE` | bên thứ hai chờ/đếm lại | một yêu cầu được chấp nhận |
+| 5 | Guard + `lock_timeout` | bên cạnh tranh gặp `55P03` | dữ liệu của bên sở hữu không đổi |
+| 6 | Bộ đếm có điều kiện | bên thua có affected `0` rồi rollback | các rows và bộ đếm là `1` |
+| 7 | Bắt buộc rollback | lock và state bị rollback | số lượng giữ nguyên `2` |
 
-## Chống flaky và production verification
+## Chống flaky và xác minh trên production
 
-- Connections/transactions độc lập; không outer test transaction.
-- Latch đặt cả predicate reads trước writes; futures đều bounded.
-- SERIALIZABLE test assert count/SQLSTATE, không actor identity.
-- Test class chạy `SAME_THREAD`, reset committed state trước mỗi method.
-- Timeout thu thập `pg_stat_activity`, `pg_locks` và thread dump.
-- PostgreSQL Testcontainers là evidence; H2 không thay thế MVCC/SSI.
+- Các connections và transactions độc lập; không sử dụng transaction của bộ kiểm thử bao bọc bên ngoài.
+- Cổng chặn đặt cả điều kiện đọc trước điều kiện ghi; các lệnh futures đều có giới hạn thời gian.
+- Kiểm thử SERIALIZABLE đối chiếu (assert) kết quả đếm và SQLSTATE, không phụ thuộc định danh của tiến trình.
+- Lớp kiểm thử chạy `SAME_THREAD`, cài đặt lại trạng thái commit trước mỗi phương thức.
+- Cơ chế timeout thu thập `pg_stat_activity`, `pg_locks` và thread dump.
+- PostgreSQL Testcontainers là bằng chứng thực tế; H2 không thể thay thế MVCC/SSI.
 
-Production query:
+Truy vấn trên môi trường production:
 
 ```sql
 select r.roster_id, r.on_call_count,
@@ -549,5 +542,4 @@ having count(a.*) filter (where a.on_call) = 0
     or r.on_call_count <> count(a.*) filter (where a.on_call);
 ```
 
-Theo dõi `40001`, `40P01`, `55P03`, retry attempts/exhaustion, lock waits và
-unsafe-roster count.
+Theo dõi lỗi `40001`, `40P01`, `55P03`, số lần thử lại/cạn kiệt, thời gian chờ lock và số lượng danh sách trực không an toàn.

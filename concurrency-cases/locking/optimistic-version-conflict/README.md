@@ -1,129 +1,127 @@
-# LOCK-001 — Bảo vệ dữ liệu cơ bản bằng Khóa Lạc Quan (`@Version`)
+# Bài toán LOCK-001 — Bảo vệ dữ liệu cơ bản bằng Khóa Lạc Quan (`@Version`)
 
-## Tóm tắt
+## 1. Tóm tắt vấn đề
 
-Tưởng tượng có hai nhân viên (A và B) cùng mở một sản phẩm (offer `42`), đang có giá là `100`, phiên bản (version) là `7`. 
-- Nhân viên A đổi giá thành `90` và bấm Lưu.
-- Nhân viên B ngâm trang web hơi lâu, sửa giá thành `80` và cũng bấm Lưu sau đó.
+Giả sử có hai nhân viên (A và B) cùng truy cập vào một sản phẩm `42` với mức giá hiện tại là `100` và phiên bản (version) là `7`. 
+- Nhân viên A thay đổi mức giá thành `90` và lưu lại.
+- Nhân viên B giữ màn hình một thời gian, sau đó thay đổi mức giá thành `80` và thực hiện lưu.
 
-Nếu code bạn không có rào chắn `version`, CẢ HAI lệnh UPDATE đều báo sửa thành công 1 dòng (affected rows `1`). Hậu quả là B âm thầm đè bẹp công sức của A mà A không hề hay biết!
+Nếu hệ thống thiếu cơ chế quản lý version, CẢ HAI lệnh UPDATE đều thông báo thực thi thành công 1 bản ghi (số dòng bị ảnh hưởng là `1`). Hệ quả là thao tác của B ghi đè kết quả của A mà A không hề được thông báo.
 
-Chỉ cần bạn thêm Annotation `@Version` vào Code, Hibernate sẽ tự động chế ra câu SQL lợi hại như thế này:
+Khi bổ sung annotation `@Version` vào mã nguồn, Hibernate (hoặc các trình cung cấp JPA khác) sẽ tự động tạo ra câu lệnh SQL như sau:
 
 ```sql
 update product_offer
 set price = 90.00,
-    version = 8      -- tự động tăng version lên
+    version = 8      -- tự động tăng version
 where offer_id = 42
-  and version = 7;   -- BẮT BUỘC version trong DB lúc này phải đúng là 7
+  and version = 7;   -- BẮT BUỘC version trong database phải khớp với 7
 ```
 
-Lúc này, A chạy trước sẽ sửa được 1 dòng. Đến lượt B chạy sau, vì B vẫn dùng version cũ `7` để đi tìm, nhưng DB lúc này đã lên `8` rồi, nên câu lệnh của B sửa được `0` dòng! 
-Ngay lập tức, Hibernate sẽ ném thẳng cái ngoại lệ `OptimisticLockException` vào mặt B, Spring sẽ dịch nó thành `ObjectOptimisticLockingFailureException`, và giao dịch của B sẽ bị Hủy bỏ (rollback) toàn tập.
+Trong trường hợp này, khi A thực thi trước, câu lệnh sẽ cập nhật thành công 1 bản ghi. Khi đến lượt B thực thi, do B vẫn sử dụng version cũ là `7` làm điều kiện WHERE, nhưng dữ liệu trong database đã được cập nhật lên `8`, câu lệnh của B sẽ không tìm thấy bản ghi nào hợp lệ (cập nhật `0` bản ghi). 
+Lập tức, hệ thống ORM sẽ ném ngoại lệ `OptimisticLockException` (được Spring chuyển đổi thành `ObjectOptimisticLockingFailureException`), và transaction của B sẽ bị rollback.
 
-> **Nói ngắn gọn:** Khóa Lạc Quan `@Version` KHÔNG NGĂN CẢN 2 người cùng đọc chung dữ liệu; nhưng nó giúp **phát hiện ra sự đụng chạm (conflict)** khi ghi, thay vì nhắm mắt cho phép ghi đè trong im lặng (silent overwrite).
+> **Ghi chú quan trọng:** Khóa lạc quan (`@Version`) KHÔNG NGĂN CẢN các luồng đọc dữ liệu đồng thời; mục đích của nó là phát hiện xung đột tại thời điểm ghi dữ liệu, thay vì cho phép ghi đè ngầm.
 
-## Các "Diễn viên" và Dữ liệu dùng chung (Actor và trạng thái)
+## 2. Các thực thể và trạng thái chia sẻ
 
-| Thành phần | Giá trị hiện tại |
+| Thành phần | Trạng thái hiện tại |
 | --- | --- |
-| Sản phẩm `product_offer` | `offer_id=42`, Giá đang là `100`, Phiên bản `version=7` |
-| Người dùng A (Editor A) | Nhập giá muốn đổi thành `90` |
-| Người dùng B (Editor B) | Nhập giá muốn đổi thành `80` |
-| Kẻ phán xử (Authoritative state) | Dòng dữ liệu dưới database PostgreSQL |
+| Sản phẩm `product_offer` | `offer_id=42`, Giá hiện hành: `100`, Version: `7` |
+| Người dùng A | Yêu cầu cập nhật giá thành `90` |
+| Người dùng B | Yêu cầu cập nhật giá thành `80` |
+| Trạng thái cơ sở dữ liệu | Bản ghi vật lý trong hệ quản trị CSDL (ví dụ: PostgreSQL) |
 
-Điểm tranh chấp sứt đầu mẻ trán diễn ra NGAY LÚC câu lệnh UPDATE mang version được nã xuống DB (khi chạy hàm flush hoặc commit), **CHỨ KHÔNG PHẢI** lúc bạn gọi hàm Set trên Object Java hay gọi hàm `repository.save()`.
+Tình trạng tranh chấp tài nguyên xảy ra NGAY TẠI THỜI ĐIỂM câu lệnh UPDATE mang theo version được gửi tới database (khi thực thi hàm `flush` hoặc `commit`), KHÔNG PHẢI tại thời điểm thay đổi thuộc tính trên đối tượng Java hay gọi hàm `repository.save()`.
 
-## Các Luật Bất biến (Invariant)
-
-```text
-Một thao tác lưu chỉ được phép chốt sổ (commit) nếu sản phẩm trong DB VẪN ĐANG Ở ĐÚNG PHIÊN BẢN (expected version) mà người dùng đó đã thấy lúc tải trang web.
-
-Tuyệt đối không một thao tác nào mang dữ liệu ôi thiu (stale edit) được phép báo Thành Công, nếu đã có người khác nhanh tay chốt sổ trước đó.
-
-Số Version CHỈ DO bản thân Framework (Hibernate) tự động quản lý tăng lên; Lập trình viên không bao giờ được viết code tự gán hay tự sửa số này.
-```
-
-Trong Case Study này, chúng ta chọn cách báo lỗi "Đụng độ, xin vui lòng tải lại trang và làm lại" (conflict), CHỨ KHÔNG tự động thử lại (retry) hành động gán giá này. 
-Lý do là nếu bạn code cho nó "mù quáng" tự retry đè lên cái giá `90` của người kia thành `80` thì hệ thống sẽ loạn. (Muốn biết cách thử lại an toàn, hãy sang bài `LOCK-002`).
-
-## Ranh giới Giao dịch (Transaction Boundaries)
-
-Mỗi lần một nhân viên bấm Lưu, luồng xử lý qua Spring Proxy sẽ diễn ra y như sau:
+## 3. Các quy tắc bất biến
 
 ```text
-BẮT ĐẦU GIAO DỊCH (BEGIN)
-1. Tải Sản phẩm kèm Version mới nhất từ DB lên
-2. So sánh với cái Version cũ (expectedVersion) mà API đẩy lên
-3. Đổi giá mới vào Object Java
-4. Bắn câu SQL UPDATE có version xuống DB (flush)
-5. Nếu suôn sẻ -> CHỐT SỔ (COMMIT). Nếu bị DB báo sửa 0 dòng -> Ném lỗi đụng độ Khóa Lạc Quan và HỦY BỎ (ROLLBACK).
+Một thao tác cập nhật chỉ được xác nhận (commit) nếu trạng thái bản ghi trong database VẪN KHỚP VỚI PHIÊN BẢN (expected version) mà phía gọi đã tải.
+
+Bất kỳ thao tác nào mang dữ liệu lỗi thời đều không được phép ghi nhận thành công nếu đã có một transaction khác commit trước đó.
+
+Thuộc tính version BẮT BUỘC phải được quản lý và gia tăng tự động bởi framework (ví dụ: Hibernate); Lập trình viên không được phép gán hoặc sửa đổi giá trị này bằng tay.
 ```
 
-Lỗi đụng độ có thể văng ra ở bước 4 (lúc xả rác flush) hoặc ở bước 5 (lúc commit). Nhớ rằng, Code của bạn chỉ được báo về Client là Thành Công SAU KHI cục Proxy Giao Dịch kia báo đã Commit xong xuôi.
+Trong kịch bản này, giải pháp tiêu chuẩn là từ chối transaction, thông báo xung đột và yêu cầu người dùng nạp lại dữ liệu, THAY VÌ thử lại tự động thao tác gán giá trị tuyệt đối. Việc tự động thử lại thao tác ghi đè tuyệt đối (ví dụ: ghi đè giá `90` bằng `80`) sẽ phá vỡ tính nhất quán nghiệp vụ. (Để tìm hiểu kỹ thuật tự động thử lại an toàn đối với các phép toán tương đối, tham khảo bài `LOCK-002`).
 
-## Bức tường ranh giới của Client (Detached/client boundary)
+## 4. Ranh giới transaction
 
-Việc bạn nhét `@Version` vào Entity thôi là **CHƯA ĐỦ AN TOÀN**. Tưởng tượng nếu bạn viết API hời hợt, không bắt Client (màn hình) gửi kèm cái Version mà họ đang xem:
+Quy trình xử lý một yêu cầu cập nhật đi qua Spring proxy được mô tả như sau:
 
 ```text
-1. Màn hình máy B đang hiển thị version 7
-2. Màn hình máy A chốt giá thành công, version trong DB nhảy lên 8
-3. Máy B bấm Lưu, nhưng gửi API mà KHÔNG kẹp cái version 7 kia theo.
-4. Code Backend của bạn ngây thơ chui xuống DB lấy cái v8 mới nhất lên, gán giá = 80 vào.
-5. Code ra lệnh UPDATE với version = 8. THÀNH CÔNG! Đè bẹp luôn công sức của A!
+BẮT ĐẦU TRANSACTION
+1. Truy xuất đối tượng sản phẩm và version mới nhất từ database.
+2. Xác minh đối chiếu với phiên bản kỳ vọng được phía gọi truyền lên.
+3. Cập nhật các trường dữ liệu trên đối tượng entity.
+4. Đồng bộ (flush) câu lệnh SQL UPDATE chứa mệnh đề điều kiện version.
+5. Nếu cập nhật thành công (số dòng bị ảnh hưởng = 1) -> Xác nhận (commit). 
+   Nếu cập nhật thất bại (số dòng bị ảnh hưởng = 0) -> Ném ngoại lệ khóa lạc quan và rollback.
 ```
 
-Vì vậy, mọi lệnh sửa dữ liệu (command/API) **BẮT BUỘC** phải mang theo `expectedVersion` (cái Version mà người dùng đang nhìn thấy). Service Backend phải đối chiếu cái này với cái Version vừa lôi từ DB lên; còn cái `@Version` của Hibernate sẽ làm nhiệm vụ bảo vệ dữ liệu ở khúc chạy đua từ lúc Backend bốc dữ liệu lên đến lúc đẩy lệnh UPDATE xuống (luồng A và luồng B giành giật nhau ở dưới DB).
+Ngoại lệ có thể phát sinh tại bước 4 (trong quá trình `flush`) hoặc tại bước 5 (khi thực hiện `commit`). Tầng API chỉ được phép trả về trạng thái thành công sau khi quá trình commit của proxy transaction hoàn tất.
 
-## Các Thuật ngữ dân trong nghề hay dùng
+## 5. Ranh giới phía gọi
 
-| Thuật ngữ | Ý nghĩa trong ngữ cảnh này |
+Việc khai báo `@Version` trên entity là ĐIỀU KIỆN CẦN nhưng CHƯA ĐỦ. Thiết kế API không đồng bộ hóa phiên bản hiển thị tại phía gọi sẽ dẫn đến rò rỉ dữ liệu:
+
+```text
+1. Màn hình của B tải dữ liệu tại version 7.
+2. A hoàn tất cập nhật, version trong database tăng lên 8.
+3. B yêu cầu lưu dữ liệu nhưng API KHÔNG ĐÍNH KÈM thông số version (expected version).
+4. Máy chủ tải bản ghi version 8 mới nhất từ database, và áp dụng giá trị 80 của B lên đó.
+5. Lệnh UPDATE được thực thi thành công với version 8. Kết quả của A bị ghi đè hoàn toàn.
+```
+
+Do đó, mọi lệnh sửa đổi dữ liệu BẮT BUỘC phải mang theo thông số phiên bản kỳ vọng (phiên bản mà người dùng đang thao tác). Tầng dịch vụ có nhiệm vụ đối chiếu phiên bản kỳ vọng với version hiện tại từ database; trong khi đó, `@Version` của Hibernate đóng vai trò khóa chặn các giao dịch cạnh tranh song song trong khoảng thời gian từ lúc tải dữ liệu đến lúc thực thi UPDATE.
+
+## 6. Thuật ngữ
+
+| Thuật ngữ | Ý nghĩa trong ngữ cảnh |
 | --- | --- |
-| Khóa Lạc Quan (optimistic locking) | Cứ cho phép nhiều người cùng đọc thoải mái, nhưng ai lưu sau thì báo đụng độ (conflict) |
-| Cột Version (version column) | Số đếm lịch sử thay đổi do Hibernate (persistence provider) tự xử |
-| Version kỳ vọng (expected version) | Cái Version mà màn hình Client đang giữ (lúc họ bấm nút sửa) |
-| Lệnh ôi thiu (stale entity/edit) | Lệnh gửi lên mang theo một cái Version lỗi thời, không còn là mới nhất |
-| Số dòng được tác động (affected-row count) | = `1` nghĩa là bạn thắng; = `0` nghĩa là bạn thua vì sai Version |
-| `OptimisticLockException` | Mã tín hiệu (signal) báo có đụng độ từ Jakarta Persistence ném ra |
-| Flush | Giây phút hệ thống xả đống lệnh SQL bẩn (dirty) cất trên RAM xuống Database |
-| Trạng thái detached | Cái Object Java bị rớt lại bên ngoài Giao dịch (ngoài persistence context) |
+| Khóa lạc quan | Kỹ thuật kiểm soát đa truy cập: cho phép đọc song song nhưng kiểm tra xung đột ở thời điểm ghi. |
+| Cột version | Bộ đếm nội bộ dùng để theo dõi sự thay đổi của thực thể, được quản lý tự động bởi trình cung cấp JPA. |
+| Phiên bản kỳ vọng | Phiên bản dữ liệu mà phía gọi đang sở hữu và căn cứ vào đó để yêu cầu thay đổi. |
+| Dữ liệu lỗi thời | Đối tượng mang phiên bản đã cũ, không còn khớp với trạng thái mới nhất trong database. |
+| Số dòng bị ảnh hưởng | Giá trị trả về từ database: `1` xác nhận cập nhật thành công, `0` chỉ định thất bại do xung đột phiên bản. |
+| `OptimisticLockException` | Ngoại lệ tiêu chuẩn của Jakarta Persistence báo hiệu sự cố vi phạm khóa lạc quan. |
+| Đồng bộ dữ liệu (flush) | Tiến trình chuyển đổi trạng thái của các đối tượng trong bộ đệm thành các lệnh SQL tương ứng để gửi tới database. |
+| Trạng thái tách rời (detached) | Tình trạng của một đối tượng entity không còn nằm trong sự quản lý của ngữ cảnh transaction hiện tại. |
 
-## Sơ đồ Bản đồ (Điều hướng)
+## 7. Điều hướng tài liệu
 
-- [Code viết sai và Lỗ hổng API không truyền Version](broken-code.md)
-- [Phân tích Dòng thời gian khóa dòng và đụng độ MVCC](analysis.md)
-- [Cách cấu hình `@Version`, Thiết kế API và Bắt mã lỗi (outcome mapping)](solutions.md)
-- [Thực nghiệm bằng PostgreSQL Testcontainers](experiments.md)
-- [Khái niệm: Khóa Lạc quan (Optimistic locking) và đụng độ phiên bản](../../concepts/optimistic-locking.md)
-- [Khái niệm: Cơ chế MVCC của PostgreSQL](../../concepts/postgresql-mvcc.md)
-- [Khái niệm: Kiểm thử đồng thời (Concurrency testing)](../../concepts/concurrency-testing.md)
+- [Phân Tích Lỗi Thiết Kế Và Lỗ Hổng API Không Truyền Version (broken-code.md)](broken-code.md)
+- [Phân Tích Chuyên Sâu Dòng Thời Gian Và Cơ Chế MVCC (analysis.md)](analysis.md)
+- [Giải Pháp Cấu Hình `@Version` Và Xử Lý Ngoại Lệ (solutions.md)](solutions.md)
+- [Thực Nghiệm Với PostgreSQL Testcontainers (experiments.md)](experiments.md)
+- [Khóa Lạc Quan (Optimistic locking) Và Xung Đột Phiên Bản](../../concepts/optimistic-locking.md)
+- [Cơ Chế Điều Khiển Đa Phiên Bản (MVCC) Của PostgreSQL](../../concepts/postgresql-mvcc.md)
+- [Kiểm Thử Tương Tranh (Concurrency testing)](../../concepts/concurrency-testing.md)
 
-## Hậu quả nếu code ẩu đưa lên Production
+## 8. Tác động tới hệ thống
 
-- Nhân viên A nhận thông báo Thành Công, nhưng sáng mai ra check thì thấy bị đổi thành giá khác (của B).
-- Lịch sử thay đổi (Audit) không hề lưu vết của B, không ai biết B đã đè lên A lúc nào!
-- Bộ đệm (Cache) hoặc các hệ thống nhận Event báo lung tung không khớp với Database hiện tại.
-- Lỗi đụng độ bị chôn vùi mãi đến tận lúc chốt sổ (commit), văng ra cho Client cái mã `500 Internal Server Error` chung chung khó hiểu.
-- Cố tình viết vòng lặp "thử lại" trong một Giao dịch đã chết, kết quả chỉ nhận thêm 1 rổ Exception!
-- Tranh chấp ở một cái Ví siêu Hot sẽ tạo ra hiệu ứng khuếch đại (amplification) làm cháy máy chủ.
-- Dùng `Lock` của Java trên 1 máy nhưng có đến tận 5 máy cùng chạy chung 1 cái DB thì vô nghĩa (node-local lock không chống được tranh chấp).
+Hệ quả của việc thiết kế thiếu khóa lạc quan hoặc kiểm soát phiên bản yếu kém:
+- Dữ liệu bị ghi đè ngầm, dẫn đến việc người dùng nhận được phản hồi thành công nhưng dữ liệu cuối cùng lại sai lệch.
+- Nhật ký kiểm toán không ghi nhận đầy đủ luồng tác động, gây mất tính khả xuất.
+- Bộ nhớ đệm hoặc các hệ thống hướng sự kiện xử lý thông tin không nhất quán với database gốc.
+- Lỗi xung đột chỉ bộc phát tại thời điểm commit, trả về mã lỗi `500 Internal Server Error` không thể hiện rõ nguyên nhân cho phía gọi.
+- Áp dụng cơ chế thử lại sai cách vào một transaction đã hỏng (rollback-only) gây ra lỗi lan truyền.
+- Bỏ qua cơ chế phiên bản đối với các thực thể cạnh tranh cao (dữ liệu nóng) có thể làm tê liệt hệ thống.
+- Nhầm lẫn khi áp dụng cơ chế khóa mức ứng dụng (ví dụ: `synchronized`) trên kiến trúc triển khai nhiều instance, dẫn đến tình trạng cạnh tranh dữ liệu không kiểm soát.
 
-## Hướng sửa chữa Khuyến nghị
+## 9. Khuyến nghị áp dụng
 
-1. Thêm cái cột `version not null` (tuyệt đối không null) và Annotation `@Version` vào class trọng tâm (aggregate root).
-2. Viết file migration SQL điền version = 0 cho các dòng dữ liệu cũ TRƯỚC KHI bật Hibernate lên.
-3. API và Request JSON **bắt buộc** phải có trường chứa Version.
-4. Phải chủ động gọi `flush` ngay trong thân hàm để cục Proxy văng lỗi cho mình còn bắt được sớm. Phải nhớ bao bọc khối `catch` thật kỹ vì lúc `commit` nó cũng có thể ném ra Exception.
-5. Bóp chết Giao Dịch (Rollback) kẻ đi sau và chuyển mã lỗi thành `409 Conflict` (Xung đột) hoặc `412 Precondition Failed` báo cho Frontend biết đường xử lý.
-6. **TUYỆT ĐỐI KHÔNG tự động thử lại** những thao tác nhập liệu của con người (user edit); Hãy báo cho họ biết bản mới nhất trên DB là gì và để họ tự quyết định nạp lại hay hợp nhất (merge).
+1. Thiết lập cột `version` với ràng buộc `NOT NULL` và áp dụng annotation `@Version` cho tất cả các thực thể gốc tập hợp (aggregate root).
+2. Xây dựng kịch bản migration để gán giá trị mặc định (ví dụ: `version = 0`) cho các bản ghi hiện có TRƯỚC KHI triển khai tính năng khóa lạc quan.
+3. Yêu cầu thiết kế API (payload) BẮT BUỘC phải đính kèm thuộc tính `version`.
+4. Chủ động gọi phương thức `flush` trước khi kết thúc tiến trình nghiệp vụ nhằm phát hiện và bắt sớm các ngoại lệ khóa lạc quan.
+5. Xử lý triệt để các transaction thất bại, rollback thay đổi và chuyển đổi ngoại lệ thành phản hồi HTTP chuẩn như `409 Conflict` hoặc `412 Precondition Failed`.
+6. KHÔNG tự động khởi động cơ chế thử lại đối với các lệnh gán trạng thái trực tiếp của người dùng; quy trình đúng là hiển thị trạng thái mới nhất và trao quyền quyết định hợp nhất lại cho phía gọi.
 
-## Khi nào nên xài bài này?
+## 10. Phạm vi áp dụng
 
-Khóa Lạc Quan sinh ra là để xử lý các bảng dữ liệu ít/vừa bị tranh chấp (contention thấp/vừa), và áp dụng cho mấy món mà kẻ đi sau (loser) có thể bấm Hủy, tải lại trang, hoặc nhìn màn hình để tự sửa tay. 
-Nếu bạn đang code hệ thống Ví tiền (hot counter) hay đếm số lượng Tồn kho (stock delta) chạy liên tục hàng nghìn click mỗi giây, hãy chuyển qua xài bài Cộng Trừ Nguyên Tử (SQL) hoặc Khóa Bi Quan xếp hàng.
+Khóa lạc quan được thiết kế tối ưu cho các mô hình dữ liệu có độ cạnh tranh truy cập ở mức thấp hoặc trung bình, đặc biệt đối với các yêu cầu chỉnh sửa thủ công từ phía người dùng.
+Đối với các kịch bản cạnh tranh cao với tần suất hàng ngàn transaction/giây (ví dụ: quản lý số dư, quản lý tồn kho), các mô hình kiến trúc như cập nhật nguyên tử hoặc khóa bi quan sẽ đem lại hiệu quả cao hơn.
 
-## Phạm vi bài học
-
-Case này tập trung hướng dẫn bạn BẮT TẬN TAY CÁI LỖI ĐỤNG ĐỘ. 
-Nếu bạn muốn code cho nó "Tự động thử lại" (Retry có jitter), mời đọc `LOCK-002`; Nếu muốn khóa mõm Bi quan (`FOR UPDATE`), xin mời qua `LOCK-003`; Nếu muốn Cập nhật Nguyên tử (Atomic mutation), mời đọc `LOCK-004`.
+Chi tiết về tự động thử lại với xử lý độ trễ ngẫu nhiên được trình bày tại `LOCK-002`. Các hệ thống áp dụng cơ chế khóa bi quan được phân tích trong `LOCK-003`, và phương pháp cập nhật nguyên tử tại `LOCK-004`.

@@ -1,6 +1,6 @@
-# Giải phẫu những đoạn Code "có mùi" — Lỗi Đọc, Kiểm tra rồi Ghi đè số cứng
+# Phân Tích Mã Nguồn Lỗi: Rủi Ro Trong Luồng Đọc-Kiểm Tra-Ghi (Read-Check-Write)
 
-## Cấu trúc bảng ban đầu (Schema)
+## 1. Cấu Trúc Bảng (Schema) Ban Đầu
 
 ```sql
 CREATE TABLE inventory_item (
@@ -27,11 +27,11 @@ CREATE TABLE inventory_reservation (
 );
 ```
 
-Giả sử Sản phẩm `77` đang có Tổng=`5`, Sẵn sàng=`5`, Đã giữ=`0`.
+Giả định: Sản phẩm `77` hiện tại có Tổng `on_hand_quantity=5`, Số lượng sẵn có `available_quantity=5`, Đã giữ `reserved_quantity=0`.
 
-Lưu ý: Các rào chắn `CHECK` ở cấp độ dòng (row-level) vẫn bị vượt mặt dễ dàng khi xảy ra lỗi ghi đè (lost update): Luồng đi sau cùng chỉ ghi lại trạng thái Sẵn sàng=`1`, Đã giữ=`4`, trong khi dưới bảng Lịch sử (inventory_reservation) đã có tận 2 cái lịch sử tổng cộng tới `8` chiếc. Database vẫn vui vẻ chập nhận vì `1 + 4 = 5` và `>= 0`.
+Lưu ý: Các ràng buộc (`CHECK`) cấp độ dòng (Row-level) không ngăn chặn được lỗi mất cập nhật (Lost update). Nếu hai transaction đồng thời trừ số lượng trên giá trị cũ, bản ghi kho hàng có thể kết thúc ở trạng thái hợp lệ (`1 + 4 = 5` và `>= 0`), nhưng bảng lịch sử (`inventory_reservation`) lại ghi nhận tổng số lượng giữ chỗ là `8`. Dữ liệu sẽ mất đồng bộ.
 
-## Thực thể (Entity) thiếu thẻ `@Version`
+## 2. Lỗi Thiếu Cơ Chế Lock Lạc Quan (`@Version`)
 
 ```java
 @Entity
@@ -43,7 +43,7 @@ public class InventoryItem {
     private int onHandQuantity;
     private int availableQuantity;
     private int reservedQuantity;
-    private long revision; // <-- Thiếu @Version ở đây
+    private long revision; // <-- Thiếu annotation @Version
 
     protected InventoryItem() {}
 
@@ -62,9 +62,9 @@ public class InventoryItem {
 }
 ```
 
-Trường `revision` ở đây chỉ là một biến đếm số nguyên bình thường. Do bạn không gắn thẻ `@Version`, Hibernate sẽ **không** tự động biến nó thành lớp khóa bảo vệ (optimistic lock) khi chạy lệnh `UPDATE`.
+Trường `revision` trong thực thể này chỉ là một biến đếm số nguyên cơ bản. Do thiếu annotation `@Version`, Hibernate sẽ không tự động áp dụng cơ chế lock lạc quan (Optimistic locking) khi sinh mã `UPDATE`. Điều này khiến ứng dụng mất đi lớp bảo vệ trước lỗi dữ liệu đồng thời.
 
-## Dịch vụ viết sai (Broken service)
+## 3. Thiết Kế Service Chứa Lỗi Logic (Broken Service)
 
 ```java
 @Service
@@ -91,12 +91,12 @@ public class BrokenInventoryReservationService {
         InventoryItem item = inventory.findById(command.productId())
                 .orElseThrow(ProductNotFoundException::new);
 
-        // LỖI: Kiểm tra nghiệp vụ trên RAM bằng đồ "thiu"
+        // LỖI: Kiểm tra điều kiện nghiệp vụ dựa trên trạng thái cũ (Stale state) trong RAM
         if (!item.canReserve(command.quantity())) {
             return ReservationResult.outOfStock();
         }
 
-        // LỖI: Cập nhật biến trên RAM
+        // LỖI: Cập nhật trực tiếp số lượng tuyệt đối trên RAM
         item.reserve(command.quantity());
         
         InventoryReservation reservation =
@@ -109,9 +109,9 @@ public class BrokenInventoryReservationService {
 }
 ```
 
-Hàm này được gắn `@Transactional` đàng hoàng, mọi thứ được lưu cùng nhau. Nhưng chết ở chỗ: Logic kiểm tra "còn hàng không" lại nằm trên code Java dựa trên cái Ảnh chụp cũ rích lúc mới `findById`, nó hoàn toàn đứt liên kết với câu lệnh `UPDATE` lát nữa mới đẩy xuống DB.
+Service trên sử dụng `@Transactional` để đảm bảo lưu dữ liệu trọn vẹn. Tuy nhiên, logic kiểm tra `canReserve` lại đánh giá trên bản ghi đã tải lên RAM từ phương thức `findById()`. Nó không truyền điều kiện ràng buộc xuống câu lệnh `UPDATE`.
 
-Lúc này Hibernate ngây thơ xuất ra câu SQL ghi đè con số chết (absolute value):
+Hibernate sẽ phát sinh câu lệnh SQL ghi đè số lượng tĩnh (Absolute update):
 
 ```sql
 UPDATE inventory_item
@@ -121,41 +121,38 @@ SET available_quantity = 1,
 WHERE product_id = 77;
 ```
 
-Nếu 2 luồng cùng lúc chạy, cả 2 đối tượng `item` trên RAM đều bị cũ, cùng tự trừ đi 4 và cùng phát ra y chang cái lệnh Update này. Và Database lại báo sửa thành công 1 dòng cho cả 2 bên.
+Trong tình huống đồng thời, cả hai tiến trình đều áp dụng câu lệnh ghi đè y hệt nhau thay vì giảm trừ tương đối (Relative decrement), dẫn đến việc PostgreSQL ghi nhận thao tác hợp lệ (Affected rows = 1) cho cả hai, nhưng số liệu thực tế bị sai lệch nghiêm trọng.
 
-## Điều kiện để tai nạn này xảy ra
+## 4. Điều Kiện Phát Sinh Sự Cố
 
-- Database chạy ở mức cách ly `READ COMMITTED` (mặc định của Postgres).
-- Sản phẩm `77` có sẵn `5` cái.
-- 2 Khách hàng cùng mua `4` cái với 2 Mã đơn khác nhau.
-- Cả 2 luồng cùng chạy qua lệnh `SELECT` (findById) xong xuôi hết rồi mới có 1 luồng kịp đẩy (flush) xuống DB.
-- Không hề dùng `@Version`, không dùng khóa bi quan `FOR UPDATE` và cũng không dùng Cập nhật có điều kiện.
-- ID của lịch sử và ID của hộp thư (outbox) sinh ra ngẫu nhiên nên không đụng độ nhau.
+- Database hoạt động ở mức cô lập `READ COMMITTED` (Mặc định).
+- Sản phẩm `77` hiện có `5` sản phẩm.
+- Hai transaction đồng thời yêu cầu mua `4` sản phẩm, sử dụng Command ID khác biệt.
+- Cả hai transaction cùng thực hiện thao tác `SELECT` và hoàn tất đánh giá điều kiện trên RAM trước khi bất kỳ lệnh cập nhật (Flush) nào được gửi xuống database.
+- Hệ thống không sử dụng Lock lạc quan (`@Version`), Lock bi quan (`FOR UPDATE`), hoặc Cập nhật có điều kiện.
 
-## Dòng thời gian của Tai nạn
+## 5. Dòng Thời Gian Xảy Ra Lỗi (Timeline)
 
-| Bước | Giao dịch A | Giao dịch B |
+| Bước | Transaction A | Transaction B |
 | --- | --- | --- |
-| 1 | `SELECT` → Thấy có sẵn `5` | |
-| 2 | | `SELECT` → Thấy có sẵn `5` |
-| 3 | Java phán: `5 >= 4`, DUYỆT | Java phán: `5 >= 4`, DUYỆT |
+| 1 | `SELECT` → Nhận giá trị `5` | |
+| 2 | | `SELECT` → Nhận giá trị `5` |
+| 3 | Đánh giá nghiệp vụ: `5 >= 4`, CHẤP NHẬN | Đánh giá nghiệp vụ: `5 >= 4`, CHẤP NHẬN |
 | 4 | Lưu lịch sử A / Hộp thư A | Lưu lịch sử B / Hộp thư B |
-| 5 | `UPDATE` gửi con số chết → `1/4` | |
-| 6 | Chốt sổ (commit) | |
-| 7 | | `UPDATE` mù quáng ghi đè số cũ → `1/4`, chốt sổ |
+| 5 | Gửi lệnh `UPDATE` ghi đè giá trị tĩnh `1/4` | |
+| 6 | Xác nhận (Commit) | |
+| 7 | | Gửi lệnh `UPDATE` ghi đè giá trị tĩnh `1/4` và Xác nhận (Commit) |
 
-Hậu quả thảm khốc:
+Hậu quả: 
 ```text
-Trong bảng kho: available=1, reserved=4
-Trong bảng lịch sử: Đơn A giữ 4 chiếc, Đơn B giữ 4 chiếc, TỔNG = 8 chiếc
+Bảng kho hàng (`inventory_item`): available=1, reserved=4
+Bảng lịch sử (`inventory_reservation`): Đơn A giữ 4, Đơn B giữ 4, Tổng cộng = 8 sản phẩm
 ```
-Không có cái `CHECK constraint` nào của DB bị vi phạm, nhưng cái sổ đối soát giữa 2 bảng thì lệch nhau 1 dặm.
+Không có ràng buộc (Constraint) nào bị vi phạm, nhưng tiến trình đối soát (Reconciliation) sẽ ghi nhận sự chênh lệch dữ liệu bất thường. Ràng buộc cấp độ dòng không thể nhận thức được số lượng đơn đặt hàng đã được ghi trong bảng khác.
 
-> **Nói ngắn gọn:** Rào chắn (Constraint) chỉ bảo vệ đúng hình hài của 1 dòng dữ liệu; nó không thông minh tới mức biết bạn vừa sinh ra 2 cái lịch sử sai sự thật ở cái bảng bên cạnh.
+## 6. Các Phản Mẫu Kinh Điển (Anti-Patterns) Cần Tránh
 
-## 12 Lỗi kinh điển của lập trình viên mới
-
-### Lỗi 1 — Tin mù quáng rằng `@Transactional` sẽ tự khóa dữ liệu
+### Phản Mẫu 1 — Phụ thuộc quá mức vào `@Transactional`
 
 ```java
 @Transactional
@@ -168,138 +165,130 @@ public ReservationResult reserve(ReserveStockCommand command) {
     return ReservationResult.reserved();
 }
 ```
-Cái chữ `@Transactional` chỉ vẽ ra một "vùng an toàn" cho việc Commit hoặc Rollback chung. Còn bên trong đó, cái lệnh `SELECT` đầu tiên và cái `UPDATE` cuối cùng vẫn là 2 câu lệnh rời rạc, thừa sức cho luồng khác chạy chen ngang vào giữa.
+Annotation `@Transactional` chỉ tạo ranh giới cho Commit/Rollback. Nó không tự động gom nhóm `SELECT` và `UPDATE` thành một khối nguyên tử (Atomic block) nếu thiếu cơ chế lock (Locking mechanism). Các transaction khác vẫn có quyền can thiệp vào giữa quá trình.
 
-### Lỗi 2 — Viết UPDATE có điều kiện nhưng... bỏ quên kết quả trả về
+### Phản Mẫu 2 — Bỏ qua kết quả của câu lệnh UPDATE (Ignoring affected rows)
 
 ```java
 @Transactional
 public ReservationResult reserve(ReserveStockCommand command) {
-    // Gọi lệnh atomic update xịn nhưng quên lấy kết quả trả về
+    // Thực thi atomic update nhưng phớt lờ số lượng dòng trả về
     inventory.decrementIfEnough(command.productId(), command.quantity());
     reservations.save(InventoryReservation.reserved(command));
-    return ReservationResult.reserved(); // Lúc nào cũng báo thành công!
+    return ReservationResult.reserved();
 }
 ```
-Nếu hết hàng, DB không update dòng nào (trả về `0`). Code của bạn chả thèm đoái hoài kiểm tra số `0` đó mà cứ nhắm mắt báo là "Giữ chỗ thành công". Lệnh SQL thông minh mà người dùng nó không kiểm tra thì cũng bằng thừa.
+Khi thao tác bị từ chối (trả về `0` dòng), ứng dụng không kiểm tra kết quả mà vẫn tiếp tục tạo lịch sử thành công. Hệ thống cần sử dụng kết quả dòng để phân nhánh luồng nghiệp vụ.
 
-### Lỗi 3 — Viết SQL thiếu đi cái "khiên bảo vệ" (business guard)
+### Phản Mẫu 3 — Cập nhật tương đối thiếu điều kiện (Missing predicate guard)
 
 ```sql
 UPDATE inventory_item
 SET available_quantity = available_quantity - :quantity,
     reserved_quantity = reserved_quantity + :quantity
-WHERE product_id = :productId; -- Đợi đã, thiếu điều kiện kiểm tra tồn kho!!
+WHERE product_id = :productId; -- THIẾU KIỂM TRA NGHIỆP VỤ
 ```
-Bạn trừ tương đối (Atomic arithmetic) thì chống được chuyện ghi đè mất kết quả, nhưng không chống được chuyện kho bị ÂM. Phải nhét cái điều kiện `AND available_quantity >= :quantity` vào cụm WHERE nữa mới đủ.
+Giảm trừ tương đối (Relative update) giải quyết được lỗi ghi đè tĩnh, nhưng lại cho phép giá trị kho hàng giảm xuống số âm nếu thiếu điều kiện `AND available_quantity >= :quantity`.
 
-### Lỗi 4 — Đọc lên RAM kiểm tra rồi xuống DB nhắm mắt trừ bừa
+### Phản Mẫu 4 — Đánh giá nghiệp vụ tách rời Cập nhật dữ liệu
 
 ```java
 if (inventory.currentAvailable(productId) >= quantity) {
-    // Đã thỏa điều kiện ở RAM, tao trừ dưới DB luôn bất chấp
+    // Điều kiện đánh giá trên RAM, rủi ro sai sót cao
     inventory.decrementUnconditionally(productId, quantity); 
 }
 ```
-Check trên RAM là check đồ "thiu". Cụm điều kiện (Predicate) và cụm sửa dữ liệu (Mutation) phải luôn dính chặt vào nhau trong 1 câu lệnh dưới Database.
+Điều kiện kiểm tra (Predicate) và tác vụ thay đổi (Mutation) phải được tích hợp trong cùng một câu lệnh SQL duy nhất tại database.
 
-### Lỗi 5 — Gửi Bulk DML thẳng xuống DB nhưng RAM vẫn ngậm đồ cũ
+### Phản Mẫu 5 — Gây lỗi bộ đệm JPA do Bulk DML (Stale persistence context)
 
 ```java
 @Transactional
 public void reserve(long productId, int quantity) {
-    // Bước 1: JPA tự ngậm dữ liệu cũ vào RAM (Bộ đệm)
+    // Entity được tải vào bộ đệm của JPA
     InventoryItem stale = inventory.findById(productId).orElseThrow();
 
-    // Bước 2: Bắn SQL trực tiếp trừ kho lách qua mặt JPA
+    // Thực thi cập nhật SQL trực tiếp (Bỏ qua JPA)
     int changed = inventory.decrementIfEnough(productId, quantity);
     if (changed == 1) {
-        // Bước 3: Sửa nhẹ 1 field khác trên object cũ mèm trên RAM
+        // Thay đổi thuộc tính trên entity cũ
         stale.renameForAudit("reserved"); 
     }
-    // Cuối hàm, JPA tự động flush object cũ này xuống DB và... BÙM! 
-    // Thành quả của lệnh SQL ở Bước 2 bị ghi đè sạch.
+    // Lỗi: JPA sẽ tự động flush entity (chứa dữ liệu cũ) xuống database, phá vỡ hiệu ứng cập nhật của lệnh Bulk DML.
 }
 ```
-Đừng bao giờ trộn lẫn việc bắn SQL trực tiếp (Bulk DML) với việc lôi Thực thể (Entity) lên RAM sửa nếu bạn chưa rành việc dọn dẹp bộ đệm (`clear/refresh`).
+Tránh sử dụng Entity cùng với Bulk DML trong cùng một transaction nếu không quản lý vòng đời bộ đệm một cách rõ ràng thông qua `EntityManager.clear()` và `refresh()`.
 
-### Lỗi 6 — Gọi `save()` dư thừa sau lệnh Atomic UPDATE
+### Phản Mẫu 6 — Gọi `save()` dư thừa sau khi thực thi SQL nguyên tử
 
 ```java
 int changed = inventory.decrementIfEnough(productId, quantity);
 InventoryItem detachedSnapshot = mapper.fromEarlierRequest(request);
 inventory.save(detachedSnapshot); // LỖI
 ```
-Hàm `save()` (hoặc `merge`) của Spring Data sẽ cố gắng ghi lại toàn bộ cái object vào DB. Việc này vô tình phá hỏng hoàn toàn kết quả nguyên tử mà lệnh UPDATE ở trên vừa cực khổ làm được. Ai thắng lệnh Atomic UPDATE thì coi như xong việc, KHÔNG cần phải `save` cái entity nào nữa!
+Gọi phương thức `save()` hoặc `merge()` sẽ ép Spring Data ghi lại toàn bộ thuộc tính đối tượng xuống database. Điều này phá hỏng cấu trúc nguyên tử mà lệnh `UPDATE` trước đó vừa thiết lập.
 
-### Lỗi 7 — Nhắm mắt phán số "0 dòng" luôn là `OUT_OF_STOCK`
+### Phản Mẫu 7 — Đánh đồng 0 dòng với lỗi Hết Hàng (`OUT_OF_STOCK`)
 
-Nếu Database trả về là sửa `0` dòng (affected rows = 0), nó có thể vì:
-- Mã sản phẩm đó bị sai, không hề tồn tại.
-- Bạn truyền số lượng mua bằng `0` (sai logic).
-- Sản phẩm đó đang bị Khóa vô hiệu hóa.
-- Hoặc đúng là Hết hàng thật.
+Giá trị trả về `0` có thể do nhiều nguyên nhân:
+- Sản phẩm không tồn tại (ID không hợp lệ).
+- Số lượng mua không hợp lệ.
+- Trạng thái vô hiệu hóa.
+- Thiếu tồn kho (Hết hàng).
 
-Đừng thiết kế API theo kiểu "ngồi đoán mò". Phải validate input tử tế, đảm bảo sản phẩm có tồn tại rồi mới chạy lệnh, hoặc phải trả ra các mã lỗi nghiệp vụ rõ ràng cho Frontend.
+Ứng dụng cần có hệ thống kiểm duyệt đầu vào (Input validation) và tách biệt logic tìm kiếm bản ghi để định hướng mã lỗi chính xác.
 
-### Lỗi 8 — Đánh tráo khái niệm: Lỗi quá tải = Lỗi hết hàng
+### Phản Mẫu 8 — Xử lý lỗi hệ thống như lỗi nghiệp vụ (Masking system exceptions)
 
 ```java
 try {
     return inventory.decrementIfEnough(productId, quantity) == 1;
 } catch (CannotAcquireLockException ignored) {
-    return false; // Code bẩn: Ém nhẹm lỗi kẹt khóa (55P03) thành lỗi Hết hàng (OUT_OF_STOCK)
+    return false; // Phản mẫu: Biến lỗi quá tải cấp lock (55P03) thành lỗi Hết hàng
 }
 ```
-Bị cập nhật `0` dòng là một kết quả hợp lệ của quy tắc kinh doanh. Nhưng việc văng lỗi `55P03` là do hệ thống đang quá tải không chen chân vào lấy khóa nổi. Bạn phải ném lỗi này ra để hệ thống báo động hoặc Tự thử lại (retry), chứ không được lừa user là "Bạn ơi hết hàng rồi".
+Lỗi hết thời gian chờ lock (Lock timeout) là dấu hiệu hệ thống quá tải (Contention). Cần lan truyền ngoại lệ này để kích hoạt luồng Retry hoặc thông báo lỗi hạ tầng, tuyệt đối không ẩn giấu dưới danh nghĩa lỗi nghiệp vụ.
 
-### Lỗi 9 — Khách bấm liên tục, sinh mã đơn mới để thử lại
+### Phản Mẫu 9 — Vi phạm tính Lũy Đẳng (Broken Idempotency)
 
-Khi mạng bị lag mất kết quả trả về, nếu bạn cứ sinh ra cái mã đơn (command ID) mới toanh rồi đập vô hệ thống, DB sẽ coi đó là 2 đơn khác nhau và sẽ trừ kho 2 lần. Phải tái sử dụng lại cái "Mã lệnh cũ" và có bảng chống trùng lặp (durable claim) để tự vệ. Lệnh SQL Cập nhật có điều kiện chỉ chống bán âm kho, nó KHÔNG CHỐNG ĐƯỢC CHUYỆN KHÁCH BỊ TRỪ HÀNG NHIỀU LẦN.
+Khi hệ thống mạng bị trễ, người dùng có thể gửi lại yêu cầu bằng việc sinh một mã định danh (Command ID) mới. Do lệnh khác nhau, database sẽ trừ tồn kho nhiều lần. Cần duy trì tính duy nhất của mã lệnh và triển khai bảng chống trùng lặp (Durable claim) để tái tạo trạng thái phản hồi mà không lặp lại tác vụ nghiệp vụ.
 
-### Lỗi 10 — Hý hửng báo tin trước khi chốt sổ (Publish trước commit)
+### Phản Mẫu 10 — Lan truyền hiệu ứng phụ (Side effect) trước khi Commit
 
 ```java
 int changed = inventory.decrementIfEnough(productId, quantity);
 if (changed == 1) {
-    kafkaTemplate.send("inventory-reserved", event); // Gửi tin nhắn ầm ĩ lên mạng
+    kafkaTemplate.send("inventory-reserved", event); // Lỗi kiến trúc: Giao tiếp mạng không hoàn tác được
     reservations.save(reservation);
 }
-// Nếu bị lỗi văng exception ở dòng dưới, Giao dịch Rollback, DB hủy bỏ lệnh trừ kho
-// Nhưng tin nhắn thì đã bay qua máy khác mất rồi!
 ```
-Muốn gửi tin nhắn ra ngoài, hãy xài mô hình Hộp thư gửi đi (Outbox). Lưu tin nhắn vào DB chung 1 Giao dịch với lệnh sửa kho. Sau khi Commit xong xuôi mới cho tiến trình ngầm chui vào DB đọc Hộp thư ra mà gửi đi.
+Nếu transaction phát sinh lỗi và bị hủy bỏ (Rollback), hệ thống ngoại vi vẫn nhận được thông báo không chính xác. Phải áp dụng mô hình Transactional Outbox.
 
-### Lỗi 11 — Dùng từ khóa Java (JVM lock) trong môi trường nhiều máy chủ
+### Phản Mẫu 11 — Sử dụng lock phân giải cấp JVM trong hệ thống phân tán
 
 ```java
 synchronized (localProductMutex(productId)) {
     return transactionalWorker.reserve(command);
 }
 ```
-Lệnh `synchronized` của Java chỉ khóa được trong đúng 1 máy tính của bạn. Mở 2 máy chủ lên là nó mù tịt. Điểm phân xử tranh chấp chéo (cross-node) chuẩn mực nhất chính là câu lệnh UPDATE dưới Database.
+Từ khóa `synchronized` chỉ có hiệu lực trên một máy chủ đơn lẻ (Single instance). Đối với hệ thống có nhiều máy chủ, bắt buộc phải sử dụng cơ chế xử lý đồng thời tại database.
 
-### Lỗi 12 — Dùng Database "chép" (Replica) để kiểm tra nghiệp vụ
+### Phản Mẫu 12 — Kiểm tra nghiệp vụ trên Node bản sao (Read Replica)
 
-Đọc tồn kho từ cục DB Replica (DB đọc) sẽ rất nhanh, nhưng dữ liệu của nó luôn trễ hơn DB chính (Primary). Nếu bạn dại dột tin vào con số lấy từ Replica để quyết định nghiệp vụ (bỏ qua điều kiện kiểm tra ở cụm WHERE khi Ghi), bạn sẽ rước lại lỗi bán lố hàng. Replica chỉ sinh ra để phục vụ cho các nút "Hiển thị" (Display) trên màn hình mà thôi.
+Dữ liệu trên Node bản sao (Replica) thường có độ trễ đồng bộ so với Node chính (Primary). Phụ thuộc vào dữ liệu này để thực hiện kiểm tra nghiệp vụ có thể dẫn đến việc vượt rào số lượng tồn kho. Replica chỉ nên phục vụ các thao tác hiển thị, không dùng cho xử lý logic ghi.
 
-## Những triệu chứng bệnh (Dấu hiệu quan sát được)
+## 7. Dấu Hiệu Nhận Biết Lỗi (Observability Symptoms)
 
-- Tính tống hàm SUM() trong bảng Lịch sử thì ra một số, nhưng field `reserved_quantity` trong bảng Kho lại là một số khác.
-- Lệnh UPDATE bắn về `0` dòng (hết hàng) nhưng API chóp bu vẫn trả về chữ `RESERVED` xanh lè.
-- Hibernate nhả ra con số cũ mèm dù bạn vừa gọi câu lệnh SQL thuần cập nhật.
-- 1 cái Mã lệnh (Duplicate command) bị trừ kho tận 2-3 lần vì Client spam nút "Thử lại".
-- Mã lỗi kẹt xe `55P03` bị log nhầm thành lỗi Nghiệp vụ Khách hàng.
-- Bug biến mất khi chạy trên máy Dev, nhưng lên Production (chạy nhiều máy chủ) thì lỗi lòi ra.
+- Kết quả báo cáo (SUM) trên bảng lịch sử không khớp với cột lưu giá trị tổng trong bảng tồn kho.
+- Hệ thống trừ không thành công (0 dòng) nhưng API vẫn ghi nhận lịch sử và báo `RESERVED`.
+- Khung JPA/Hibernate duy trì và lưu các dữ liệu không tương thích.
+- Bị trùng lặp xử lý do mã Command bị thay đổi khi Client gọi thử lại.
+- Báo cáo nhầm mã lỗi kỹ thuật hệ thống (`55P03`) thành lỗi hết hàng nghiệp vụ.
+- Tình trạng lỗi xuất hiện ngẫu nhiên trên môi trường phân tán nhưng không xảy ra trên môi trường cục bộ.
 
-## Trình tự "Độc Hại" cần phải vứt bỏ ngay lập tức
+## 8. Chuỗi Logic Xử Lý Khuyến Nghị (Correct Workflow)
 
-```text
-BƯỚC 1: Lấy số lượng từ Database lên
-→ BƯỚC 2: Code Java ngồi xét duyệt `có sẵn >= số lượng mua`
-→ BƯỚC 3: Code Java ngồi bấm máy tính trừ trừ cộng cộng ra con số tuyệt đối
-→ BƯỚC 4: Xuống Database gọi UPDATE ghi đè vào bằng ID
-```
+Tuyệt đối từ bỏ luồng làm việc tuyến tính rủi ro:
+`Tải cấu trúc -> Kiểm tra nghiệp vụ bằng bộ đệm -> Tính toán số đếm -> Cập nhật ghi đè`.
 
-**Cách trị bệnh duy nhất:** Hãy ném cụm kiểm tra và cụm ý định trừ hàng thành một khối duy nhất (`WHERE` làm màng lọc, `SET` làm hành động), và nhớ LẤY KẾT QUẢ SỐ DÒNG (affected-row) về để rẽ nhánh nghiệp vụ.
-
+Hãy chuyển đổi thành: **Đóng gói điều kiện kiểm tra (WHERE) và ý định thay đổi (SET) thành một transaction SQL nguyên tử duy nhất. Xử lý logic nghiệp vụ và rẽ nhánh dựa vào số lượng bản ghi trả về.**

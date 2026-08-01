@@ -4,18 +4,17 @@
 
 Test suite chứng minh:
 
-1. check-then-insert không constraint tạo hai rows;
-2. named unique constraint chỉ cho một durable winner;
-3. loser có thể wait winner transaction outcome;
-4. winner rollback cho phép waiter trở thành winner;
-5. `ON CONFLICT DO NOTHING RETURNING` trả one ID/one empty;
-6. `23505` làm transaction abort và exact constraint metadata được giữ;
-7. Hibernate `saveAndFlush()` surface conflict ở insert-attempt boundary.
+1. Thao tác kiểm tra rồi chèn (check-then-insert) mà không có ràng buộc sẽ tạo ra hai rows;
+2. ràng buộc duy nhất có tên (named unique constraint) chỉ cho phép một bên thắng bền bỉ;
+3. bên thua có thể chờ kết quả transaction của bên thắng;
+4. bên thắng bị rollback cho phép bên chờ (waiter) trở thành bên thắng;
+5. lệnh `ON CONFLICT DO NOTHING RETURNING` trả về một ID và một kết quả rỗng (empty);
+6. lỗi `23505` làm transaction bị hủy và siêu dữ liệu (metadata) chính xác của ràng buộc được giữ lại;
+7. Lệnh `saveAndFlush()` của Hibernate làm lộ xung đột ở ranh giới của lần thử insert.
 
-Không dùng wall-clock delay để sắp interleaving. Latch/future đều có timeout.
+Không dùng độ trễ thời gian thực (wall-clock delay) để sắp xếp sự xen kẽ (interleaving). Các cơ chế Latch/future đều có thời gian chờ (timeout).
 
-> **Nói ngắn gọn:** test phải assert one durable business key và domain loser
-> outcome, không chỉ assert một actor đã ném exception.
+> **Nói ngắn gọn:** bài kiểm thử (test) phải xác nhận (assert) có một business key bền bỉ duy nhất và kết quả nghiệp vụ của bên thua, thay vì chỉ xác nhận rằng một chủ thể đã ném ra ngoại lệ.
 
 ## PostgreSQL Testcontainers
 
@@ -89,8 +88,7 @@ class UniqueConstraintConcurrencyIntegrationTest {
 }
 ```
 
-Mỗi actor mở connection/transaction riêng; test method không có outer
-`@Transactional`.
+Mỗi chủ thể mở connection/transaction riêng biệt; phương thức kiểm thử không có `@Transactional` bao ngoài.
 
 ## Gate helpers
 
@@ -125,7 +123,7 @@ private static void await(CountDownLatch latch, String step) {
 }
 ```
 
-## Experiment 1 — Broken check-then-insert tạo duplicates
+## Thí nghiệm 1 — Thao tác kiểm tra rồi chèn bị lỗi tạo ra dữ liệu trùng lặp
 
 ```java
 @Test
@@ -156,7 +154,7 @@ private static UUID unsafeCreate(BothCheckedGate gate) throws SQLException {
 }
 ```
 
-## Experiment 2 — Unique constraint có one winner
+## Thí nghiệm 2 — Unique constraint chỉ có một bên thắng
 
 ```java
 record InsertOutcome(boolean created, String sqlState, String constraint) {
@@ -194,10 +192,9 @@ void uniqueConstraintAllowsExactlyOneDurableRow() throws Exception {
 }
 ```
 
-`trySafeInsert()` catches `PSQLException` outside statement result, rollback
-connection, và lấy constraint từ `getServerErrorMessage()`.
+`trySafeInsert()` bắt ngoại lệ `PSQLException` bên ngoài kết quả của statement, thực hiện rollback connection và lấy tên ràng buộc từ `getServerErrorMessage()`.
 
-## Experiment 3 — Loser waits uncommitted unique key
+## Thí nghiệm 3 — Bên thua chờ khóa duy nhất chưa commit
 
 ```java
 @Test
@@ -242,10 +239,9 @@ void conflictingInsertCannotPassUncommittedWinner() throws Exception {
 }
 ```
 
-Timeout outcome không được map thành duplicate; winner chưa commit tại thời điểm
-loser timeout.
+Kết quả quá thời gian chờ (timeout) không được ánh xạ thành dữ liệu trùng lặp; bên thắng chưa commit tại thời điểm bên thua bị quá thời gian.
 
-## Experiment 4 — Winner rollback cho phép waiter insert
+## Thí nghiệm 4 — Bên thắng rollback cho phép bên chờ thực hiện lệnh insert
 
 ```java
 @Test
@@ -282,10 +278,9 @@ void waiterCanBecomeWinnerAfterFirstInsertRollsBack() throws Exception {
 }
 ```
 
-Test không phụ thuộc waiter đã block bao lâu; invariant/outcome sau first rollback
-là waiter commit đúng một row.
+Bài kiểm thử không phụ thuộc vào việc bên chờ đã bị chặn (block) trong bao lâu; kết quả bất biến sau lần rollback đầu tiên là bên chờ commit đúng một row.
 
-## Experiment 5 — `ON CONFLICT DO NOTHING RETURNING`
+## Thí nghiệm 5 — `ON CONFLICT DO NOTHING RETURNING`
 
 ```java
 @Test
@@ -316,7 +311,7 @@ void onConflictReturnsOneIdAndOneEmpty() throws Exception {
 }
 ```
 
-Claim helper chạy transaction riêng và dùng:
+Trợ thủ yêu cầu quyền (Claim helper) chạy transaction riêng biệt và dùng:
 
 ```sql
 insert into work_item_safe(...)
@@ -325,7 +320,7 @@ on conflict (tenant_id, external_reference) do nothing
 returning work_item_id;
 ```
 
-## Experiment 6 — `23505` abort transaction
+## Thí nghiệm 6 — `23505` abort transaction
 
 ```java
 @Test
@@ -352,9 +347,9 @@ void queryAfterUniqueViolationInSameTransactionGetsAbortedState()
 }
 ```
 
-Đây là regression evidence cho requirement “catch outside failed transaction”.
+Đây là bằng chứng hồi quy (regression evidence) cho yêu cầu “phải bắt ngoại lệ bên ngoài transaction đã thất bại”.
 
-## Experiment 7 — Hibernate flush boundary
+## Thí nghiệm 7 — Hibernate flush boundary
 
 Spring integration test không có outer transaction:
 
@@ -377,8 +372,7 @@ void saveAndFlushSurfacesExactConstraintAtAttemptBoundary() {
 }
 ```
 
-Mỗi `insertAttempt.insert()` là `REQUIRES_NEW` và gọi `saveAndFlush()`. Reader chạy
-sau failed attempt đã rollback.
+Mỗi lời gọi `insertAttempt.insert()` sử dụng mức lan truyền `REQUIRES_NEW` và gọi `saveAndFlush()`. Thao tác đọc (Reader) chạy sau khi lần thử thất bại đã bị rollback.
 
 ## Core JDBC helpers
 
@@ -431,28 +425,28 @@ private static long count(String table) {
 }
 ```
 
-Table name chỉ nhận test constants, không nhận untrusted input.
+Tên bảng chỉ nhận các hằng số kiểm thử (test constants), không nhận đầu vào không đáng tin cậy.
 
-## Coverage matrix
+## Ma trận độ phủ (Coverage matrix)
 
-| Experiment | Controlled condition | Technical assertion | Business assertion |
+| Thí nghiệm | Điều kiện được kiểm soát | Xác nhận kỹ thuật | Xác nhận nghiệp vụ |
 | --- | --- | --- | --- |
-| 1 | both checks before inserts | no conflict | unsafe count `2` |
-| 2 | same unique key | one `23505` exact constraint | safe count `1` |
-| 3 | winner uncommitted | loser `55P03` bounded | no second row |
-| 4 | first rollback | waiter commits | count `1` |
-| 5 | concurrent `DO NOTHING` | one ID/one empty | count `1` |
-| 6 | query after `23505` | `25P02` | requires rollback |
-| 7 | JPA `saveAndFlush` | classified wrapper | existing ID intact |
+| 1 | cả hai thao tác kiểm tra trước các lệnh insert | no conflict | số lượng không an toàn là 2 |
+| 2 | cùng một unique key | một lỗi `23505` đúng ràng buộc | số lượng an toàn là 1 |
+| 3 | bên thắng chưa commit | bên thua bị lỗi `55P03` trong giới hạn | không có row thứ hai |
+| 4 | rollback đầu tiên | bên chờ commit | count `1` |
+| 5 | các lệnh `DO NOTHING` đồng thời | một ID/một rỗng | count `1` |
+| 6 | truy vấn sau lỗi `23505` | lỗi `25P02` | yêu cầu rollback |
+| 7 | lệnh JPA `saveAndFlush` | bộ bọc đã phân loại | ID hiện tại không đổi |
 
-## Chống flaky và production verification
+## Chống lỗi ngẫu nhiên (flaky) và xác minh trên production
 
-- Independent connections/transactions; no outer test transaction.
-- Latches control absence checks and transaction outcomes.
-- Mọi futures/waits bounded, interrupt flag được restore.
-- Test class `SAME_THREAD`, reset committed tables mỗi test.
-- Timeout thu thập `pg_stat_activity`, `pg_locks` và thread dump.
-- PostgreSQL Testcontainers, không H2, là evidence cho unique wait/SQLSTATE.
+- Sử dụng các connections/transactions độc lập; không dùng transaction kiểm thử bao ngoài.
+- Các Latches kiểm soát các thao tác kiểm tra chưa tồn tại và kết quả transaction.
+- Mọi futures/waits đều được giới hạn thời gian (bounded), cờ ngắt (interrupt flag) được khôi phục.
+- Lớp kiểm thử dùng `SAME_THREAD`, đặt lại (reset) các bảng đã commit sau mỗi bài kiểm thử.
+- Khi quá thời gian chờ, hệ thống thu thập `pg_stat_activity`, `pg_locks` và thread dump.
+- Sử dụng PostgreSQL Testcontainers, không dùng H2, để làm bằng chứng cho trạng thái chờ khóa duy nhất hoặc mã SQLSTATE.
 
 Production checks:
 
@@ -463,5 +457,4 @@ group by tenant_id, external_reference
 having count(*) > 1;
 ```
 
-Theo dõi unique violations theo constraint, claim no-op, wait/timeout, aborted
-transactions, payload mismatch và duplicate-to-created ratio.
+Theo dõi các vi phạm duy nhất (unique violations) theo constraint, quyền sở hữu không làm gì (claim no-op), thời gian chờ/timeout, các transactions bị hủy, sự sai lệch tải trọng (payload mismatch) và tỷ lệ trùng lặp so với tạo mới (duplicate-to-created ratio).

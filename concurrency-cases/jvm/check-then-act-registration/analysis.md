@@ -1,171 +1,142 @@
-# Dòng thời gian tranh chấp và nguyên nhân gốc
+# Phân Tích Chuyên Sâu: Dòng Thời Gian Tranh Chấp Và Cội Nguồn Vấn Đề
 
-## Trạng thái ban đầu
+## 1. Trạng Thái Khởi Điểm (Initial state)
+
+Cấu hình tài nguyên hệ thống trước thời điểm xung đột:
 
 ```text
 resources = {}
 resourceKey = "tenant-a"
-factory open count = 0
+Bộ đếm kích hoạt factory (factory open count) = 0
 
-T1 gọi register("tenant-a")
-T2 gọi register("tenant-a")
+Luồng T1 triệu gọi register("tenant-a")
+Luồng T2 triệu gọi register("tenant-a")
 ```
 
-Quy tắc cần bảo vệ:
+Hệ quy tắc Bất biến (Business Invariant) cần được bảo chứng tuyệt đối:
 
 ```text
-active resource cho "tenant-a" <= 1
-mọi caller nhận cùng resource đang được registry quản lý
-factory open count cho lần đăng ký này = 1
+Số lượng tài nguyên đang hoạt động cho "tenant-a" <= 1
+Mọi Caller phải thu thập chính xác cùng một phiên bản tài nguyên đang được Registry quản trị
+Hệ số kích hoạt Factory cho một phiên đăng ký = 1
 ```
 
-## Thứ tự thực thi xen kẽ
+## 2. Kịch Bản Lỗi: Thứ Tự Thực Thi Đan Xen (Interleaved Execution)
 
 ```text
-T1                                             T2
+Luồng T1                                       Luồng T2
 ---------------------------------------------  ----------------------------------
 resources.get("tenant-a") -> null
                                                 resources.get("tenant-a") -> null
-factory.open("tenant-a") -> Resource A
-                                                factory.open("tenant-a") -> Resource B
-resources.put("tenant-a", Resource A)
-return Resource A
-                                                resources.put("tenant-a", Resource B)
-                                                return Resource B
+factory.open("tenant-a") -> Kích hoạt Tài nguyên A
+                                                factory.open("tenant-a") -> Kích hoạt Tài nguyên B
+resources.put("tenant-a", Tài nguyên A)
+Hoàn trả Tài nguyên A
+                                                resources.put("tenant-a", Tài nguyên B) (Ghi đè A)
+                                                Hoàn trả Tài nguyên B
 ```
 
-Map cuối cùng:
+Trạng thái Map cuối cùng:
 
 ```text
-resources = { "tenant-a" -> Resource B }
+resources = { "tenant-a" -> Tài nguyên B }
 ```
 
-Nhưng process vẫn có thể chứa cả Resource A và Resource B. Resource A đã được
-trả cho T1 nhưng không còn nằm trong registry, vì vậy shutdown/cleanup đi qua
-registry không biết để đóng nó.
+Tuy nhiên, tiến trình (Process) của hệ thống lúc này đã cấp phát cả Tài nguyên A và Tài nguyên B. Tài nguyên A đã được phân phối cho T1 nhưng lại hoàn toàn nằm ngoài tầm kiểm soát của Registry. Do đó, các chu trình Dọn dẹp/Shutdown dò qua Registry hoàn toàn "mù" trước sự tồn tại của Tài nguyên A, dẫn đến rò rỉ.
 
-## Kết quả mong đợi và kết quả thực tế
+## 3. Đối Chiếu Kết Quả (Expected vs Actual)
 
 ```text
-Expected:
-  factory calls     = 1
-  active resources  = 1
-  T1 result         = Resource A
-  T2 result         = Resource A
-  registry value    = Resource A
+Mục Tiêu Đề Ra (Expected):
+  Tần suất gọi factory = 1
+  Tài nguyên hoạt động = 1
+  Phản hồi cho T1      = Tài nguyên A
+  Phản hồi cho T2      = Tài nguyên A
+  Dữ liệu lưu Registry = Tài nguyên A
 
-Actual:
-  factory calls     = 2
-  active resources  = 2
-  T1 result         = Resource A
-  T2 result         = Resource B
-  registry value    = Resource B
-  orphan resources  = Resource A
+Thực Tế Vận Hành (Actual):
+  Tần suất gọi factory = 2 (Gây áp lực hệ thống)
+  Tài nguyên hoạt động = 2 (Rò rỉ)
+  Phản hồi cho T1      = Tài nguyên A
+  Phản hồi cho T2      = Tài nguyên B
+  Dữ liệu lưu Registry = Tài nguyên B
+  Tài nguyên mồ côi    = Tài nguyên A (Không thể dọn dẹp)
 ```
 
-> **Nói ngắn gọn:** map không bị hỏng cấu trúc, nhưng business invariant vẫn bị
-> phá vì hai resource đã được tạo trước khi map chọn value cuối cùng.
+> **Nguyên tắc kỹ thuật:** Cấu trúc vật lý của Map không sụp đổ, nhưng Quy tắc Nghiệp vụ đã hoàn toàn vỡ vụn do hai tập tài nguyên vật lý đã bị phân bổ trước khi Map đưa ra phán quyết chọn lựa cuối cùng.
 
-## Nguyên nhân theo từng lớp
+## 4. Phân Tích Lớp Trách Nhiệm Gây Lỗi (Root Cause Mapping)
 
-### Vòng đời Spring bean
+### Hệ Sinh Thái Vòng Đời Spring Bean
+`ManagedResourceRegistry` được cấu hình dưới dạng Singleton, đồng nghĩa mọi yêu cầu trong cùng `ApplicationContext` dùng chung một tham chiếu Map. Mặc định, Spring không cung cấp bộ chặn đồng bộ để ép buộc các lệnh gọi `register(...)` diễn ra tuần tự.
 
-`ManagedResourceRegistry` là singleton nên mọi request trong cùng
-`ApplicationContext` dùng chung một map. Spring không buộc các lời gọi
-`register(...)` phải chạy lần lượt.
-
-### ConcurrentHashMap
-
-`get` và `put` riêng lẻ đều an toàn cho nhiều luồng. Tuy nhiên, registry cần một
-operation logic lớn hơn:
+### Đặc Điểm Của ConcurrentHashMap
+Bản thân các lệnh `get` và `put` đơn lẻ là bất khả xâm phạm. Tuy nhiên, Registry yêu cầu một chu trình logic phức hợp:
 
 ```text
-nếu key vắng mặt thì tạo value và công bố value đó
+Kiểm tra biến Key -> Nếu vắng mặt -> Cấp phát giá trị -> Công bố
 ```
 
-Đây là kiểu **kiểm tra rồi hành động** (`check-then-act`). Không có điểm hiệu lực
-duy nhất cho toàn bộ chuỗi. T1 và T2 đều có thể quan sát cùng trạng thái “chưa có
-key” và cùng đưa ra quyết định hợp lệ dựa trên snapshot cục bộ đó.
+Đây là nguyên mẫu của lỗ hổng **Kiểm tra rồi hành động (Check-then-act)**. Hệ thống thiếu vắng một *Điểm Hiệu Lực Duy Nhất* trói buộc toàn chuỗi. Cả T1 và T2 đều có khả năng đánh giá trạng thái "Vắng mặt Key", và căn cứ vào Snapshot cục bộ để thực thi các hành vi hợp pháp hóa (hóa ra lại gây thảm họa hệ thống).
 
-### Java Memory Model
+### Giới Hạn Của Bộ Nhớ Java (Java Memory Model)
+`ConcurrentHashMap` cam kết hành vi Công bố An Toàn (Safe publication) giá trị sau khi đã nạp vào Map. Lỗi không nằm ở việc T2 đọc nhầm một đối tượng dở dang; Lỗi ở chỗ hai đối tượng thực thụ (Hoàn chỉnh vật lý) đã cùng được sinh ra độc lập.
 
-`ConcurrentHashMap` công bố value đã được đưa vào map một cách an toàn. Vấn đề
-không phải T2 nhìn thấy một object được khởi tạo dở dang; vấn đề là hai object
-hoàn chỉnh đã được tạo ra.
+Sự tách biệt giữa **Công Bố An Toàn (Safe Publication)** và **Tính Nguyên Tử (Atomicity)**:
+- Safe Publication đảm bảo các luồng nhìn thấy phiên bản khởi tạo hoàn chỉnh.
+- Atomicity đòi hỏi duy trì quyền Độc tôn (chỉ một chủ thể duy nhất được cấp quyền tạo và đăng ký).
 
-An toàn công bố (`safe publication`) và tính nguyên tử (`atomicity`) là hai yêu
-cầu khác nhau:
+### Lằn Ranh Giới Hạn Giao Dịch Database
+Cấu trúc lỗi này phi cơ sở dữ liệu. `@Transactional` không có thẩm quyền trên Java Map nội bộ, không có chức năng Rollback khi Factory lỡ mở Socket/Thread và cũng không áp đặt cơ chế Lock trên các thuộc tính của Singleton.
 
-- safe publication giúp thread khác nhìn thấy state hoàn chỉnh của value;
-- atomicity bảo đảm chỉ một actor thực hiện chuỗi tạo và đăng ký.
+## 5. Điểm Hiệu Lực Duy Nhất (Linearization Point)
 
-### Spring transaction và database
+Bất kỳ một cấu trúc khắc phục chuẩn mực nào cũng bắt buộc định hình một **Điểm Hiệu Lực Duy Nhất (Linearization point)**: Thời khắc thao tác được hệ thống công nhận quyền thống trị (Winning actor) và ép các bên còn lại tuân phục kết quả.
 
-Case không truy cập database. `@Transactional` không quản lý Java map, không
-rollback việc factory đã mở socket/thread và không khóa singleton field.
+- Khai thác `computeIfAbsent`: Điểm hiệu lực nằm ngầm trong khối mã Nguyên Tử của Map.
+- Khai thác `putIfAbsent`: Điểm hiệu lực đo bằng thời khắc lệnh chèn (insert) trả về kết quả thành công; Tuy nhiên, phải trả giá bằng việc truy quét và dọn dẹp các tài nguyên sinh thừa.
+- Khai thác `FutureTask` Placeholder: Điểm hiệu lực là lúc mỏ neo (Placeholder) chèn thành công; Kể từ đó chỉ Luồng thắng được kích hoạt Factory.
 
-## Điểm hiệu lực duy nhất
+## 6. Xử Lý Phân Loại Lỗi, Timeout Và Dọn Dẹp Tài Nguyên
 
-Một cách sửa đúng cần tạo **điểm hiệu lực duy nhất** (`linearization point`):
-thời điểm operation được xem là đã thắng và mọi actor phải đồng ý với kết quả
-đó.
+- Nếu Factory bộc phát ngoại lệ (Exception) trước khi hoàn trả, cấu trúc Map chưa tiếp nhận Entry. Factory buộc phải Tự thân thu dọn (Clean up) các thành phần tài nguyên dở dang.
+- Triển khai `computeIfAbsent` nếu hàm ánh xạ bị hủy (throw Exception), Map từ chối cập nhật giá trị; Luồng Caller tiếp theo được quyền Retry.
+- Áp dụng `FutureTask`, các Entry lỗi phải tuân thủ điều kiện gỡ bỏ (Remove) để giải phóng môi trường cho chu trình Retry.
+- Khi Application Process Crash, toàn bộ Registry cục bộ bốc hơi (Đây không phải là Durable State).
+- Nếu chu trình hoạt động đi kèm các quy trình Unregister/Close phức tạp, bắt buộc thiết lập một mô hình Quản Trị Vòng Đời độc lập để không "đóng nhầm" tài nguyên Caller khác đang khai thác.
 
-- Với `computeIfAbsent`, điểm này nằm trong atomic map operation.
-- Với `putIfAbsent`, điểm này là lần insert thành công; resource tạo dư vẫn cần
-  cleanup.
-- Với placeholder `FutureTask`, điểm này là lần placeholder được đưa vào map;
-  chỉ actor thắng chạy factory.
-
-## Lỗi, timeout và dọn dẹp tài nguyên
-
-- Nếu factory throw trước khi trả về, map chưa có entry. Factory phải tự dọn phần
-  resource đã mở dở dang.
-- Nếu dùng `computeIfAbsent` và mapping function throw, map không ghi value;
-  caller sau có thể thử lại.
-- Nếu dùng `FutureTask`, entry thất bại phải được remove có điều kiện trước khi
-  cho phép lần đăng ký sau retry.
-- Nếu process crash, toàn bộ local registry biến mất; đây không phải durable
-  state.
-- Nếu resource có thao tác unregister/close đồng thời, cần một case lifecycle
-  riêng để tránh đóng resource đang được caller khác sử dụng.
-
-## Khi có nhiều application instance
+## 7. Ứng Dụng Trên Kiến Trúc Phân Tán (Multi-instance Fallacy)
 
 ```text
-App A: registry A -> Resource A
-App B: registry B -> Resource B
+Nút Mạng A: registry A -> Kích hoạt Tài nguyên A
+Nút Mạng B: registry B -> Kích hoạt Tài nguyên B
 ```
 
-`computeIfAbsent`, `putIfAbsent`, `synchronized` và `FutureTask` chỉ phối hợp các
-thread trong cùng JVM. Chúng không bảo đảm toàn cluster chỉ có một resource cho
-mỗi key.
+Toàn bộ các chiến lược `computeIfAbsent`, `putIfAbsent`, `synchronized`, hoặc `FutureTask` chỉ đóng vai trò phân xử các Thread trong phạm vi 1 máy ảo JVM. Chúng tuyệt đối không đảm bảo tính độc nhất của cấu trúc tài nguyên nếu xét trên tổng thể Cluster.
 
-> **Nói ngắn gọn:** registry cục bộ có thể đúng trong từng node nhưng vẫn tạo một
-> resource ở mỗi node.
+> **Nguyên tắc kỹ thuật:** Đảm bảo tính toàn vẹn cục bộ cho một Nút hoàn toàn có thể vô tình sinh ra hàng loạt tài nguyên độc lập rải rác trên từng Nút của hệ thống.
 
-## Hậu quả
+## 8. Tác Động Tới Hệ Thống (Production Impact)
 
-### Hậu quả kỹ thuật
+### Hệ Quả Kỹ Thuật
+- Kích hoạt ồ ạt tài nguyên dư thừa, rò rỉ không hồi kết.
+- Phân tách cấu trúc, hai Caller lưu trữ hai định dạng object rẽ nhánh trên cùng một Key.
+- Trình thu dọn tài nguyên vô tác dụng trước các đối tượng bị ghi đè ngầm (Overwrite).
+- Số lượng Thread/Socket/File descriptor phình to tỷ lệ thuận với xung đột luồng.
+- Lỗ hổng ẩn mình hoàn toàn trước lệnh đo lường `map.size()`.
 
-- tạo resource dư và rò rỉ tài nguyên;
-- hai caller giữ hai object khác nhau cho cùng key;
-- cleanup không quản lý được resource đã bị overwrite;
-- thread/socket/file descriptor tăng theo các lần tranh chấp;
-- lỗi không thể phát hiện chỉ bằng `map.size()`.
+### Hệ Quả Nghiệp Vụ
+- Khách hàng (Tenant) đối mặt với sự phân tán Consumer hoặc lỗi kết nối.
+- Logic tích lũy thông báo Event/Callback bị kích hoạt lặp.
+- Tổn hao chi phí kết nối ngoại vi và vượt trần băng thông cấp phép (Quota).
+- Triển khai Release dưới mức Tải cao làm rút ngắn tuổi thọ máy chủ trước khi Crash.
 
-### Hậu quả nghiệp vụ
+## 9. Giới Hạn Áp Dụng (Out of Scope)
 
-- một tenant có nhiều consumer hoặc connection ngoài dự kiến;
-- event/callback có thể được xử lý lặp;
-- chi phí kết nối và quota phía ngoài tăng;
-- deploy dưới tải có thể gây cạn tài nguyên nhanh hơn.
+Chuyên đề này đóng khung trong phạm vi cấu hình Đăng ký Tài nguyên Cục bộ (Local Registration). Cấu trúc KHÔNG giải quyết các bài toán sau:
 
-## Phạm vi không được giải quyết trong case này
-
-Case chỉ bảo vệ việc đăng ký resource cục bộ. Nó không giải quyết:
-
-- uniqueness bền vững sau restart;
-- uniqueness giữa nhiều application instance;
-- distributed lease hoặc fencing;
-- database check-then-insert;
-- lifecycle phức tạp giữa register, unregister và close.
+- Bảo lưu đặc tính Độc nhất (Uniqueness) sau quá trình Tái Khởi Động.
+- Ràng buộc phân tán toàn cục giữa nhiều Application Instance.
+- Triển khai hệ thống Thuê phân tán (Distributed lease / Fencing).
+- Mô hình "Kiểm tra rồi Chèn" (Check-then-insert) trên Cơ Sở Dữ Liệu.
+- Vòng đời phức hợp Đăng ký - Ngắt kết nối - Phân rã (Register/Unregister/Close).

@@ -1,151 +1,80 @@
-# Dòng thời gian tranh chấp và nguyên nhân gốc
+# Phân Tích Chuyên Sâu: Dòng Thời Gian Tranh Chấp Và Ranh Giới Điểm Hiệu Lực
 
-## Trạng thái ban đầu
+## 1. Dòng Thời Gian Đan Xen (Interleaving Timeline)
 
-Registry đang giữ generation 41:
-
+Giả định Trạng Thái Gốc bảo lưu Thế hệ 41:
 ```text
-merchant-a → Provider-X, generation=41
-merchant-b → Provider-Y, generation=41
+merchant-a → Provider-X, Thế hệ=41
+merchant-b → Provider-Y, Thế hệ=41
 ```
 
-Config service trả về generation 42 với hai route hợp lệ:
-
+Hệ thống Dịch vụ cấu hình phát lệnh Thế hệ 42:
 ```text
-merchant-a → Provider-Z, generation=42
-merchant-b → Provider-Y, generation=42
+merchant-a → Provider-Z, Thế hệ=42
+merchant-b → Provider-Y, Thế hệ=42
 ```
 
-Writer áp dụng generation mới bằng `routes.clear()` rồi `routes.putAll(loaded)`.
-`putAll` không phải một lần thay thế snapshot; về mặt semantics nó là nhiều
-mutation trên cùng map.
+Tuyến Ghi (Writer) tháo dỡ bằng `routes.clear()` rồi đổ dữ liệu bằng `routes.putAll(loaded)`. Mấu chốt kỹ thuật: `putAll` KHÔNG phải một thao tác nguyên khối; dưới góc độ ngữ nghĩa (semantics), nó bị phân rã thành một chuỗi liên hoàn các đột biến (mutations) cày xới trên bề mặt Map.
 
-## Thứ tự thực thi xen kẽ
+### Cửa Sổ Rủi Ro Đứt Gãy
 
-| Bước | Refresh thread T1 | Request T2 | Diagnostic thread T3 | State quan sát được |
+| Trình tự | Luồng Làm mới (T1) | Luồng Yêu cầu (T2) | Luồng Giám sát (T3) | Trạng Thái Hệ Thống Thực Tế |
 | --- | --- | --- | --- | --- |
-| 1 | tải xong generation 42 | | | map chứa đủ generation 41 |
-| 2 | gọi `routes.clear()` | | | map rỗng |
-| 3 | tạm dừng | gọi `get("merchant-b")` | | nhận `null`, có thể chạy fallback |
-| 4 | thêm route của `merchant-a` | | | map chỉ có một phần generation 42 |
-| 5 | tạm dừng | | iterate `entrySet()` | báo cáo chỉ thấy `merchant-a` |
-| 6 | thêm route của `merchant-b` | | | map chứa đủ generation 42 |
+| 1 | Nạp xong Thế hệ 42 | | | Chứa toàn vẹn Thế hệ 41 |
+| 2 | Kích hoạt `routes.clear()` | | | Bản đồ bộ nhớ bị san phẳng (Rỗng) |
+| 3 | (Đóng băng) | Triệu gọi `get("merchant-b")` | | Nhận `null`, buộc dạt vào Fallback |
+| 4 | Nạp Khóa `merchant-a` | | | Map biến dị mang một mảnh của Thế hệ 42 |
+| 5 | (Đóng băng) | | Lặp qua `entrySet()` | Giám sát báo cáo hệ thống chỉ có `merchant-a` |
+| 6 | Nạp Khóa `merchant-b` | | | Tái cấu trúc thành công Thế hệ 42 |
 
-Không cần hai writer để vi phạm invariant. Một writer và một reader là đủ. Nếu
-iteration thực sự chồng lên structural modification, `HashMap` còn có thể ném
-`ConcurrentModificationException`; fail-fast là best-effort nên không được dùng
-như một cơ chế bảo đảm phát hiện.
+Không cần tới 2 Tuyến Ghi để xé nát Quy tắc Bất biến (Invariant). Chỉ 1 Tuyến Ghi và 1 Tuyến Đọc là quá đủ làm sập hệ thống. Nếu vòng lặp (Iteration) đâm sầm vào Cấu trúc đang biến đổi, `HashMap` sẽ thẳng tay ném ngoại lệ `ConcurrentModificationException`. Đặc tính Ngắt nhanh (Fail-fast) chỉ là nỗ lực vớt vát (Best-effort), nghiêm cấm coi đây là Tấm khiên bảo vệ.
 
-> **Nói ngắn gọn:** kết quả cuối cùng có thể đúng, nhưng request đã ra quyết định
-> nghiệp vụ trong lúc state chỉ hoàn thành một nửa.
+> **Nguyên tắc kỹ thuật:** Kết quả cuối cùng hoàn toàn có thể đúng, nhưng sự thật đằng sau là Luồng Yêu Cầu đã tự phán xét và xử lý Sinh Mệnh Giao Dịch ngay tại thời khắc Dữ liệu đang vỡ nát.
 
-## Kết quả mong đợi và kết quả thực tế
+## 2. Đối Chiếu Kết Quả (Expected vs Actual)
 
-| Khía cạnh | Mong đợi | Thực tế với broken code |
+| Tiêu Chí Đánh Giá | Kỳ Vọng (Expected) | Hệ Quả Thực Tế (Broken code) |
 | --- | --- | --- |
-| Tính đầy đủ | Reader thấy đủ generation 41 hoặc 42 | Reader có thể thấy map rỗng hoặc một phần generation 42 |
-| Tính nhất quán | Các route trong một lần đọc thuộc cùng generation | Một chuỗi đọc có thể ghép state trước và sau refresh |
-| Visibility | Refresh thành công được request sau đó nhìn thấy | Không có contract visibility nếu snapshot được gán qua field thường |
-| Iteration | Diagnostic có một snapshot ổn định | Iterator có thể thiếu entry, thấy update xen kẽ hoặc ném exception |
-| Failure | Refresh lỗi giữ nguyên state tốt gần nhất | Mutate tại chỗ có thể để lại map rỗng hoặc dở dang nếu lỗi xảy ra giữa chừng |
+| Tính Toàn Vẹn | Tuyến Đọc thụ hưởng 100% Thế hệ 41 hoặc 42 | Tuyến Đọc hứng chịu Map Rỗng hoặc Mảnh vỡ Thế hệ 42 |
+| Tính Nhất Quán | Dữ liệu quét qua thuộc chuẩn 1 Thế hệ | Truy xuất đứt gãy lai tạp giữa 2 Thế hệ |
+| Khả Kiến (Visibility) | Ghi thành công báo hiệu tức thời cho Mạng lưới | Vắng bóng Hợp đồng Khả kiến do gán qua Thuộc tính thường |
+| Vòng Lặp (Iteration) | Giám sát bóc tách Bản chụp tĩnh | Vòng lặp mất Khóa, Đội dữ liệu, hoặc Văng Ngoại Lệ |
+| Sai Số (Failure) | Cập nhật lỗi thì lùi về Bản chụp Tốt Gần Nhất | Đột biến Dữ liệu Phá hủy trạng thái phục vụ vĩnh viễn |
 
-## Nguyên nhân theo từng lớp
+## 3. Bản Chất Cội Nguồn Lỗi Theo Các Lớp Phân Tách
 
-### HashMap
+### Khuyết Tật Của Cấu Trúc HashMap
+`HashMap` tuyên bố cự tuyệt khả năng Chống biến đổi Cấu trúc Đồng thời (Concurrent structural modification). Vắng mặt Cơ chế Đồng bộ Ngoại vi (External synchronization), giao lộ Đọc/Ghi biến thành một Đấu trường Đua dữ liệu (Data race). Tuyệt đối cấm xây dựng độ tin cậy của hệ thống dựa trên ảo mộng "phiên bản JDK hiện tại dường như chạy ổn".
 
-`HashMap` không hỗ trợ concurrent structural modification. Khi không có external
-synchronization, đọc và ghi đồng thời là data race; hành vi quan sát được không
-có thread-safety contract. Không nên xây correctness dựa trên việc một phiên bản
-JDK cụ thể “có vẻ chạy được”.
+### Hành Vi Phức Hợp (Compound Action)
+Góc độ Nghiệp vụ coi Đợt làm mới là Một Hành Vi Đơn Thể. Góc độ Bộ nhớ coi Đợt làm mới là Một Chuỗi Hành Vi Phân Rã (`clear` + `put` + `put`). Không thiết lập **Điểm Hiệu Lực Duy Nhất (Linearization point)**, Tuyến Đọc ngang nhiên lách qua khe hở của sự biến thiên.
 
-### Compound action
+### Góc Khuất Mô Hình Bộ Nhớ (Java Memory Model)
+Cho dù tái cấu trúc mã thành Sao-Chép-Và-Tráo-Đổi (Copy-and-swap), nhưng nếu Biến tham chiếu (Reference field) là một cấu trúc Biến thường, JMM sẽ không bao giờ vẽ ra đường gạch nối `happens-before` giữa Tuyến Đọc và Tuyến Ghi. Việc xây Map cục bộ trước khi Gán là đúng với Quy tắc Trình tự (Program order) của Luồng, nhưng Vô nghĩa trong việc Khai báo sự Khả kiến.
 
-Nghiệp vụ coi refresh là một operation duy nhất, nhưng code triển khai bằng
-`clear()` và nhiều `put()`. Không có điểm hiệu lực duy nhất (`linearization
-point`) cho toàn bộ generation, nên reader có thể chen vào giữa.
+`volatile`, Monitor Lock, hay Atomic Variable là các chìa khóa thiết lập Ranh giới `happens-before`.
 
-### Java Memory Model
+### Ảo Giác Container Spring
+Định nghĩa Singleton chỉ trói buộc Quy mô Vòng Đời, không trói buộc Chính Sách Đồng Bộ. Container xuất bản cá thể một cách an toàn, tuy nhiên Phương thức Làm Mới Định Kỳ (Scheduled) và Tuyến Yêu Cầu Controller có quyền tự do tung hoành trên nhiều Luồng và cùng chà đạp lên một Biến Khả Biến (Mutable field).
 
-Nếu code chuyển sang copy-and-swap nhưng field giữ reference là field thường,
-writer và reader vẫn không có quan hệ happens-before. Việc build map trước dòng
-gán là đúng theo program order của writer, nhưng chưa đủ để công bố update cho
-thread khác.
+### Giới Hạn Cơ Chế Giao Dịch
+Không Tồn tại Database Row, không có MVCC, Commit hay Rollback. `@Transactional` không có tư cách bảo vệ Trạng Thái Bộ Nhớ Cục Bộ (Memory state). Nếu Luồng Cập Nhật đục phá Map rồi văng Ngoại lệ, Transaction DB sẽ tự hoàn tác, nhưng Mảnh rác trong Java Map vĩnh viễn không thể lùi về trạng thái cũ.
 
-`volatile`, monitor lock và atomic variable đều có thể tạo cạnh happens-before
-phù hợp. Chi tiết nền tảng nằm trong
-[Java Memory Model và công bố object](../../concepts/java-memory-model-and-atomicity.md).
+## 4. Ranh Giới Điểm Hiệu Lực (Linearization Point) Chuẩn Mực
 
-### Spring
+Áp dụng Bản chụp Bất biến (Immutable snapshot), Tuyến Ghi phân rã thành 3 tiến trình:
+1. Tải và Validate dữ liệu bên trong Không gian Biến cục bộ.
+2. Đóng gói Bản chụp hoàn chỉnh qua `Map.copyOf(...)`, phong ấn biến đổi.
+3. Xuất bản qua lệnh `AtomicReference.set` hoặc write `volatile`.
 
-Spring singleton là scope vòng đời, không phải synchronization policy. Container
-công bố bean đã khởi tạo một cách an toàn, nhưng scheduled method và controller
-method vẫn có thể chạy trên các thread khác nhau và truy cập cùng mutable field.
+Giai đoạn 3 là Điểm Hiệu Lực Độc Tôn. Tuyến Đọc nắm giữ Tham chiếu 1 lần duy nhất, đảm bảo tính Toàn vẹn Thế hệ cho 100% logic xử lý. Nếu đa Tuyến Ghi cùng hội tụ, Hoán đổi Nguyên tử chỉ bảo vệ Tính Toàn Vẹn, chưa bảo vệ Tính Tươi Mới (Độ Trễ). Bắt buộc phải áp dụng Cờ So Sánh (`compare-and-set`) và phế truất Bản chụp Lỗi thời (Stale).
 
-### Transaction
+## 5. Xử Lý Phân Loại Lỗi Hệ Thống Và Vòng Đời Cấu Trúc
 
-Không có database row, MVCC snapshot, commit hoặc rollback nào tham gia. Thêm
-`@Transactional` không bảo vệ memory state. Nếu refresh mutate map rồi ném
-exception, transaction rollback cũng không hoàn tác các mutation Java đã xảy ra.
+- Tuyệt đối cấm `clear()` Trạng thái Đang Phục Vụ để dọn chỗ cho dữ liệu rác chưa qua Khâu Validate.
+- Nếu Bản chụp Hoán đổi bằng phương pháp Nguyên tử duy nhất, Hệ thống không cần lo lắng về Lỗi Rollback Phân mảnh.
+- Application Crash sau khi Swap, Yêu cầu cục bộ đã thấy Thế hệ Mới, nhưng không có nghĩa các Nút (Node) khác cũng tự động đồng bộ Thế hệ đó.
 
-## Điểm hiệu lực của lời giải đúng
+## 6. Giới Hạn Phạm Vi Và Môi Trường Phân Tán
 
-Với immutable snapshot, writer thực hiện ba pha:
-
-1. tải và validate dữ liệu trong biến cục bộ;
-2. tạo `Map.copyOf(...)` hoàn chỉnh, không còn mutate;
-3. công bố snapshot bằng `AtomicReference.set` hoặc một volatile write.
-
-Bước 3 là điểm hiệu lực duy nhất. Reader lấy reference đúng một lần nên toàn bộ
-quyết định của request dùng cùng snapshot.
-
-Nếu nhiều refresh writer có thể chạy đồng thời, atomic swap chỉ bảo vệ tính toàn
-vẹn chứ chưa bảo vệ độ mới. Generation 42 tải chậm có thể ghi đè generation 43.
-Khi invariant yêu cầu generation tăng đơn điệu, writer phải dùng compare-and-set
-và từ chối snapshot cũ hơn.
-
-## Lỗi, timeout và vòng đời process
-
-- Nếu config client timeout hoặc trả dữ liệu không hợp lệ trước bước publish,
-  giữ nguyên snapshot tốt gần nhất.
-- Không `clear()` state đang phục vụ để chuẩn bị cho dữ liệu chưa validate.
-- Nếu publish bằng một lần atomic swap, không có rollback một phần cần thực hiện.
-- Nếu process crash trước swap, snapshot cũ mất cùng process; sau restart phải
-  bootstrap lại từ nguồn cấu hình.
-- Nếu process crash sau swap, request trong process đó đã thấy snapshot mới,
-  nhưng node khác không tự động nhận cùng generation.
-- Retry tải cấu hình phải có backoff và không được cho một response cũ ghi đè
-  generation mới hơn.
-
-## Khi có nhiều application instance
-
-Mỗi JVM có một `AtomicReference` riêng. Lời giải local bảo đảm mỗi request trên
-một node đọc snapshot hoàn chỉnh, nhưng không bảo đảm node A và node B cùng dùng
-một generation.
-
-Nếu thay đổi như “disable provider ngay lập tức” cần có hiệu lực đồng bộ toàn hệ
-thống, cần thêm protocol ở nguồn cấu hình: generation có thứ tự, event delivery,
-acknowledgement/readiness hoặc một ranh giới database/distributed phù hợp. Không
-nên mở rộng JVM lock với kỳ vọng nó khóa được node khác.
-
-## Hậu quả
-
-### Hậu quả kỹ thuật
-
-- data race trên cấu trúc map và reference snapshot;
-- state một phần lọt vào request path;
-- exception hoặc metric không nhất quán khi iterate;
-- refresh cũ ghi đè refresh mới nếu có nhiều writer;
-- khó chẩn đoán vì log sau cùng chỉ cho thấy map đã đầy đủ.
-
-### Hậu quả nghiệp vụ
-
-- payment bị route sai, fallback sai hoặc từ chối sai;
-- cấu hình disable khẩn cấp có thể bị bỏ qua;
-- merchant trong cùng batch quan sát các generation khác nhau;
-- retry ở tầng request có thể tạo thêm duplicate attempt phía provider.
-
-## Phạm vi không được giải quyết trong case này
-
-Case không làm cho nhiều thay đổi nghiệp vụ trên nhiều database row trở thành
-atomic. Nó cũng không thay thế versioning và coordination giữa các node. Trọng
-tâm là cấu trúc map, visibility và snapshot semantics trong một JVM.
+Bản chất `AtomicReference` chỉ cai quản ranh giới JVM nội bộ. Không một khóa (JVM Lock) nào đủ thẩm quyền ép buộc Nút B phải nghe theo Nút A. Đối với Lệnh Yêu cầu Tức thời (Vô hiệu hóa Provider), cần xây dựng Cấu trúc Giao thức từ gốc Config: Mã Thế hệ (Generation order), Kênh Phân phối Sự kiện (Event delivery), Chứng nhận Tiếp nhận (Acknowledgement) hoặc một ranh giới Cấu trúc Phân Tán (Distributed Database).

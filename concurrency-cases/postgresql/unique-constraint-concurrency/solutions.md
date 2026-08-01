@@ -2,13 +2,13 @@
 
 ## Mục tiêu thiết kế
 
-Database phải enforce:
+Database phải thực thi (enforce):
 
 ```text
 count(tenant_id, external_reference) <= 1
 ```
 
-Application phải map one winner/loser rõ ràng mà không reuse failed transaction.
+Ứng dụng phải ánh xạ (map) một bên thắng/bên thua rõ ràng mà không tái sử dụng transaction đã thất bại.
 
 ## Solution 1 — Named unique constraint
 
@@ -20,7 +20,7 @@ alter table work_item
     unique (tenant_id, external_reference);
 ```
 
-Entity mapping để code/schema intent cùng rõ:
+Ánh xạ thực thể (Entity mapping) để ý định của mã nguồn/schema đều rõ ràng:
 
 ```java
 @Entity
@@ -36,11 +36,9 @@ public class WorkItem {
 }
 ```
 
-Migration tool/schema validation mới là production authority; annotation không
-thay deployed DDL.
+Công cụ migration hoặc kiểm tra schema mới là nguồn có thẩm quyền trên production; annotation không thay thế DDL đã được triển khai.
 
-> **Nói ngắn gọn:** constraint bảo vệ invariant; Java code chỉ quyết định cách
-> diễn giải winner và duplicate cho caller.
+> **Nói ngắn gọn:** ràng buộc bảo vệ tính bất biến; mã Java chỉ quyết định cách diễn giải bên thắng và lỗi trùng lặp cho phía gọi (caller).
 
 ## Solution 2 — Flush trong transaction riêng, catch bên ngoài
 
@@ -92,7 +90,7 @@ public class WorkItemReader {
 }
 ```
 
-Outer coordinator không có transaction:
+Trình điều phối bên ngoài (Outer coordinator) không có transaction:
 
 ```java
 @Service
@@ -139,24 +137,20 @@ public class WorkItemCreator {
 }
 ```
 
-A insert transaction đã kết thúc trước catch. Duplicate reader dùng new physical
-transaction/snapshot nên không gặp aborted state.
+Transaction thực hiện insert của A đã kết thúc trước khối catch. Trình đọc dữ liệu trùng lặp (Duplicate reader) sử dụng một transaction vật lý/snapshot mới nên không gặp trạng thái bị hủy (aborted state).
 
-Classifier traverse cause chain, xác nhận PostgreSQL SQLSTATE `23505` và
-`ServerErrorMessage.getConstraint()`. Nếu driver metadata unavailable, fail closed
-thay vì map mọi integrity error thành duplicate.
+Trình phân loại duyệt qua chuỗi nguyên nhân, xác nhận mã PostgreSQL SQLSTATE `23505` và `ServerErrorMessage.getConstraint()`. Nếu siêu dữ liệu của driver không khả dụng, hãy ưu tiên xử lý lỗi theo hướng đóng (fail closed) thay vì ánh xạ mọi lỗi toàn vẹn dữ liệu thành lỗi trùng lặp.
 
-### Loser behavior
+### Hành vi của bên thua
 
-- winner commit: loser waits/gets `23505`, then reads existing;
-- winner rollback: waiting insert may succeed và return `CREATED`;
-- other constraint violation: propagate;
-- read existing missing: treat as operational anomaly/retry bounded, không fabricate
-  ID.
+- bên thắng commit: bên thua chờ hoặc nhận lỗi `23505`, sau đó đọc bản ghi đã tồn tại;
+- bên thắng rollback: lệnh insert đang chờ có thể thành công và trả về `CREATED`;
+- vi phạm ràng buộc khác: lan truyền lỗi (propagate);
+- không tìm thấy bản ghi khi đọc: coi đó là một bất thường vận hành/thử lại trong giới hạn, không bịa ra (fabricate) ID.
 
 ## Solution 3 — `ON CONFLICT DO NOTHING RETURNING`
 
-Repository dùng `JdbcTemplate` để có returning semantics rõ:
+Repository dùng `JdbcTemplate` để có ngữ nghĩa trả về (returning semantics) rõ ràng:
 
 ```java
 @Repository
@@ -214,10 +208,9 @@ WorkItemView existing = reader.findByBusinessKey(tenantId, reference);
 return CreateWorkItemResult.existing(existing.id());
 ```
 
-`DO NOTHING` không abort transaction do expected duplicate. Tách reader transaction
-vẫn giúp visibility nhất quán giữa RC/RR và giữ API boundary rõ.
+Lệnh `DO NOTHING` không hủy transaction do lỗi trùng lặp đã được dự kiến. Việc tách biệt transaction đọc vẫn giúp tính hiển thị (visibility) nhất quán giữa mức RC/RR và giữ ranh giới API rõ ràng.
 
-## `DO UPDATE RETURNING` trade-off
+## Đánh đổi khi dùng `DO UPDATE RETURNING`
 
 Một pattern:
 
@@ -229,19 +222,18 @@ do update set external_reference = excluded.external_reference
 returning work_item_id;
 ```
 
-Nó luôn trả ID nhưng no-op UPDATE có thể:
+Cách này luôn trả về ID nhưng lệnh UPDATE không có tác dụng thực tế có thể:
 
-- tạo new tuple version/bloat;
-- chạy update triggers/audit;
-- acquire stronger row lock;
-- làm `updated_at`/CDC thay đổi sai nghĩa.
+- tạo ra một phiên bản tuple mới, gây phình to dữ liệu (bloat);
+- kích hoạt các trigger cập nhật hoặc tiến trình kiểm toán (audit);
+- xin cấp khóa hàng (row lock) mạnh hơn;
+- làm cho trường `updated_at` hoặc cơ chế CDC thay đổi sai ngữ nghĩa.
 
-Chỉ dùng `DO UPDATE` khi duplicate có legitimate merge semantics. Không overwrite
-original payload/fingerprint chỉ để lấy ID.
+Chỉ dùng `DO UPDATE` khi dữ liệu trùng lặp có ngữ nghĩa hợp nhất (merge semantics) hợp lệ. Không ghi đè tải trọng hoặc dấu vân tay ban đầu chỉ để lấy ID.
 
-## Payload fingerprint
+## Dấu vân tay của tải trọng (Payload fingerprint)
 
-Nếu external reference được dùng như idempotency key, lưu fingerprint:
+Nếu tham chiếu bên ngoài được dùng như một khóa lũy đẳng (idempotency key), hãy lưu thêm dấu vân tay:
 
 ```sql
 alter table work_item
@@ -251,14 +243,13 @@ alter table work_item
 Loser đọc existing:
 
 ```text
-same fingerprint    -> return existing
-different fingerprint -> reject KEY_REUSED_WITH_DIFFERENT_REQUEST
+cùng dấu vân tay -> trả về bản ghi hiện tại
+khác dấu vân tay -> từ chối vì key được sử dụng lại cho yêu cầu khác (KEY_REUSED_WITH_DIFFERENT_REQUEST)
 ```
 
-Cách canonicalize/hash phải stable và versioned. Full response/status lifecycle
-thuộc idempotency cases sau; DB-006 không giả định row uniqueness là full replay.
+Cách chuẩn hóa hoặc băm (hash) phải ổn định và được đánh phiên bản. Toàn bộ vòng đời của phản hồi/trạng thái thuộc về các trường hợp lũy đẳng sau này; DB-006 không giả định tính duy nhất của hàng là sự phát lại đầy đủ (full replay).
 
-## Migration khi production đã có duplicates
+## Chuyển đổi (Migration) khi trên production đã có dữ liệu trùng lặp
 
 Detect:
 
@@ -271,57 +262,55 @@ having count(*) > 1;
 
 Rollout:
 
-1. dừng/route writes hoặc deploy temporary atomic path;
-2. chọn canonical rows và remap dependents theo business policy;
-3. verify không duplicates;
-4. tạo unique index, thường cân nhắc `CONCURRENTLY` để giảm blocking;
-5. attach constraint bằng existing index khi phù hợp;
-6. deploy code mapping exact constraint;
-7. monitor `23505`.
+1. dừng/chuyển hướng các lệnh ghi hoặc triển khai một luồng nguyên tử tạm thời;
+2. chọn các hàng chuẩn (canonical rows) và ánh xạ lại các thành phần phụ thuộc theo chính sách nghiệp vụ;
+3. xác minh không còn dữ liệu trùng lặp;
+4. tạo unique index, thường cân nhắc tùy chọn `CONCURRENTLY` để giảm tình trạng bị khóa;
+5. gắn ràng buộc bằng index đã có nếu phù hợp;
+6. triển khai mã nguồn để ánh xạ ràng buộc một cách chính xác;
+7. giám sát các lỗi `23505`.
 
-`CREATE UNIQUE INDEX CONCURRENTLY` không chạy trong ordinary transaction block và
-vẫn fail nếu duplicate rows tồn tại. Sau failure phải inspect invalid index state.
+Lệnh `CREATE UNIQUE INDEX CONCURRENTLY` không chạy trong một khối transaction thông thường và vẫn thất bại nếu tồn tại các hàng trùng lặp. Sau khi thất bại, phải kiểm tra trạng thái index không hợp lệ.
 
-## Alternative: `SERIALIZABLE`
+## Giải pháp thay thế: SERIALIZABLE
 
-SSI có thể abort check-then-insert race, nhưng uniqueness là direct invariant:
+Mức độ SSI có thể hủy bỏ tình trạng tranh chấp khi kiểm tra rồi chèn, nhưng tính duy nhất lại là một bất biến trực tiếp:
 
-- constraint hoạt động ở mọi isolation level;
-- bảo vệ direct SQL/other services;
-- conflict signal gắn đúng key;
-- không cần retry toàn arbitrary transaction.
+- ràng buộc hoạt động ở mọi mức độ cô lập;
+- bảo vệ khỏi các thao tác SQL trực tiếp hoặc từ các dịch vụ khác;
+- tín hiệu xung đột được gắn vào đúng key;
+- không cần thử lại (retry) toàn bộ một transaction tùy ý.
 
-Dùng `SERIALIZABLE` cho broader predicate invariants, không thay unique constraint
-cho exact business key.
+Chỉ dùng `SERIALIZABLE` cho các bất biến vị từ (predicate invariants) rộng hơn, không thay thế unique constraint cho các business key chính xác.
 
-## Transaction, timeout và crash
+## Transaction, quá thời gian chờ (timeout) và sự cố (crash)
 
-- Constraint violation rollback loser attempt.
-- Lock timeout/deadlock không được map thành duplicate.
-- Winner crash trước commit: waiter có thể win.
-- Winner commit/response lost: next request reads existing.
-- External side effects chỉ sau durable claim hoặc qua outbox.
-- Không giữ insert transaction open quanh remote I/O.
+- Vi phạm ràng buộc sẽ rollback lần thử của bên thua.
+- Quá thời gian chờ khóa/tiến trình bế tắc (deadlock) không được ánh xạ thành lỗi trùng lặp.
+- Bên thắng gặp sự cố trước khi commit: bên chờ có thể trở thành bên thắng.
+- Bên thắng commit nhưng phản hồi bị mất: yêu cầu tiếp theo sẽ đọc bản ghi đã tồn tại.
+- Các tác dụng phụ bên ngoài chỉ xảy ra sau khi đã có quyền sở hữu bền bền hoặc thông qua outbox.
+- Không giữ transaction thực hiện insert ở trạng thái mở trong lúc thực hiện I/O từ xa.
 
-## Trade-off comparison
+## So sánh sự đánh đổi
 
-| Cách | Atomicity | Loser signal | DB load | Complexity |
+| Cách | Tính nguyên tử (Atomicity) | Tín hiệu bên thua | Tải trên DB | Độ phức tạp |
 | --- | --- | --- | --- | --- |
-| Unique + caught `23505` | Database key | exception + read | Exception path | Medium |
-| `DO NOTHING RETURNING` | Database key | empty result | Không expected exception | Medium |
-| `DO UPDATE RETURNING` | Database key + update | returned row | Extra update/bloat | Semantics-sensitive |
-| SERIALIZABLE check/insert | SSI predicate | `40001` retry | Retry transaction | Higher |
-| JVM lock | Process only | local wait | Không DB-wide | Incorrect multi-instance |
+| Unique + caught `23505` | Key của database | exception + read | Luồng ngoại lệ | Trung bình |
+| `DO NOTHING RETURNING` | Key của database | kết quả rỗng | Không có ngoại lệ dự kiến | Trung bình |
+| `DO UPDATE RETURNING` | Key của database + update | hàng trả về | Cập nhật thêm/bloat | Nhạy cảm với ngữ nghĩa |
+| SERIALIZABLE check/insert | Vị từ SSI | thử lại 40001 | Thử lại transaction | Cao hơn |
+| JVM lock | Chỉ trong tiến trình | chờ cục bộ | Không bao quát toàn DB | Sai trong đa phiên bản (multi-instance) |
 
-## Production checklist
+## Danh sách kiểm tra (Checklist) khi triển khai trên production
 
-- [ ] Business key scope/normalization/null semantics đúng.
-- [ ] Named unique constraint tồn tại trong deployed schema.
-- [ ] Insert conflict được forced tại controlled flush boundary.
-- [ ] Catch nằm ngoài failed transaction.
-- [ ] Classifier kiểm tra `23505` và exact constraint.
-- [ ] `DO UPDATE` chỉ dùng khi có true update semantics.
-- [ ] Duplicate payload mismatch có explicit outcome.
-- [ ] Winner rollback, response timeout và crash behavior được test.
-- [ ] Multi-instance integration test assert exactly one durable row.
-- [ ] Migration cleanup/index build runbook tồn tại.
+- [ ] Phạm vi/chuẩn hóa/ngữ nghĩa null của business key là chính xác.
+- [ ] Ràng buộc duy nhất có tên tồn tại trong schema đã triển khai.
+- [ ] Xung đột insert bị ép buộc (forced) xảy ra tại ranh giới flush được kiểm soát.
+- [ ] Khối Catch nằm ngoài transaction đã thất bại.
+- [ ] Trình phân loại (Classifier) kiểm tra mã `23505` và ràng buộc chính xác.
+- [ ] `DO UPDATE` chỉ dùng khi có ngữ nghĩa cập nhật thực sự.
+- [ ] Sự sai lệch tải trọng đối với bản ghi trùng lặp có kết quả xử lý rõ ràng.
+- [ ] Các trường hợp bên thắng rollback, quá thời gian phản hồi và hành vi khi gặp sự cố đều được kiểm thử.
+- [ ] Kiểm thử tích hợp đa phiên bản (Multi-instance integration test) xác nhận chính xác chỉ có một hàng bền bỉ.
+- [ ] Có sẵn tài liệu hướng dẫn (runbook) dọn dẹp dữ liệu migration/xây dựng index.

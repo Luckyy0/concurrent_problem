@@ -2,47 +2,41 @@
 
 ## Tóm tắt
 
-Hai reservation commands cùng load SKU `BOOK-42` ở `version = 7`. Command A commit
-trước, làm stock `2 -> 1` và version `7 -> 8`. Command B flush stale update với
-predicate `version = 7`, nhận optimistic conflict.
+Hai reservation command cùng đọc SKU `BOOK-42` ở `version = 7`. Command A commit trước, làm stock giảm `2 -> 1` và version tăng `7 -> 8`. Command B flush một stale update với predicate `version = 7`, dẫn đến optimistic conflict (xung đột lạc quan).
 
-Broken service catch exception trong một retry loop nằm bên trong cùng
-`@Transactional` method. Attempt tiếp theo reuse physical transaction đã
-`rollback-only` và persistence context vừa failed flush. `clear()` hay reload
-không biến transaction đó thành clean attempt.
+Service bị lỗi đã catch ngoại lệ trong một vòng lặp retry nằm bên trong cùng phương thức `@Transactional`. Lần thử (attempt) tiếp theo sử dụng lại physical transaction đã bị đánh dấu `rollback-only` và persistence context vừa bị lỗi khi flush. Việc gọi `clear()` hay tải lại (reload) không biến transaction đó thành một lần thử hợp lệ (clean attempt).
 
-Invariant:
+Invariant (Bất biến):
 
 ```text
-Mỗi retry attempt phải chạy trong physical transaction và persistence context mới.
-Một returned success phải tương ứng đúng một committed reservation/decrement.
-Mỗi attempt phải reload current version và re-evaluate available stock.
-Retry phải bounded bởi attempt limit và operation deadline.
+Mỗi lần thử retry phải chạy trong một physical transaction và persistence context mới.
+Một kết quả thành công trả về phải tương ứng đúng với một decrement/reservation đã được commit.
+Mỗi lần thử phải tải lại version hiện tại và đánh giá lại lượng stock khả dụng.
+Retry phải bị giới hạn bởi số lần thử và thời gian timeout của operation.
 ```
 
-> **Nói ngắn gọn:** rollback attempt cũ trước, rồi mới retry; loop không phải
-> transaction boundary.
+> **Nói ngắn gọn:** cần rollback lần thử cũ trước, rồi mới retry; vòng lặp không phải là ranh giới của transaction.
 
 ## Actors và shared state
 
 | Thành phần | Vai trò |
 | --- | --- |
-| Command A | Winner commit update từ version 7 lên 8 |
-| Command B | Loser conflict, sau đó retry trên version mới |
-| `inventory_item` | Authoritative stock và `@Version` |
-| `reservation_record` | Durable result keyed theo command ID |
-| Spring transaction proxy | Tạo/rollback transaction cho từng attempt |
-| Hibernate persistence context | Giữ managed entity snapshot trong một attempt |
-| PostgreSQL | Kiểm tra version predicate và committed row state |
+| Command A | Tiến trình thắng, commit cập nhật từ version 7 lên 8 |
+| Command B | Tiến trình thua do xung đột, sau đó retry trên version mới |
+| `inventory_item` | Dữ liệu stock có thẩm quyền và `@Version` |
+| `reservation_record` | Kết quả được lưu trữ định danh theo command ID |
+| Spring transaction proxy | Tạo/rollback transaction cho từng lần thử |
+| Hibernate persistence context | Giữ managed entity snapshot trong một lần thử |
+| PostgreSQL | Kiểm tra version predicate và trạng thái dòng đã commit |
 
-Initial state:
+Trạng thái ban đầu:
 
 ```text
 SKU BOOK-42: available = 2, version = 7
 reservation records: none
 ```
 
-Correct final state khi cả hai distinct commands được phép reserve:
+Trạng thái cuối cùng hợp lệ khi cả hai command riêng biệt được phép reserve:
 
 ```text
 available = 0, version = 9
@@ -51,51 +45,49 @@ reservation records = {A, B}
 
 ## Transaction boundary và contention point
 
-Contention point là row `inventory_item.sku = BOOK-42`. Mỗi attempt thực hiện:
+Điểm tranh chấp (contention point) là dòng `inventory_item.sku = BOOK-42`. Mỗi lần thử thực hiện:
 
 ```text
-load current version -> validate stock -> decrement -> insert reservation -> flush/commit
+đọc version hiện tại -> kiểm tra stock -> giảm số lượng -> thêm reservation -> flush/commit
 ```
 
-Optimistic conflict xảy ra tại versioned UPDATE, không phải lúc Java entity được
-mutate. Retry coordinator phải nằm ngoài transaction attempt:
+Optimistic conflict xảy ra tại câu lệnh UPDATE có chứa version, không phải lúc Java entity bị thay đổi. Coordinator điều phối retry phải nằm ngoài transaction của lần thử:
 
 ```text
-correct: Retry coordinator -> Tx attempt 1 -> rollback
-                           -> Tx attempt 2 -> reload -> commit
+Đúng: Retry coordinator -> Tx attempt 1 -> rollback
+                        -> Tx attempt 2 -> tải lại -> commit
 
-broken:  One Tx -> attempt 1 fails -> attempt 2 reuses doomed Tx
+Sai:  Một Tx chung -> attempt 1 lỗi -> attempt 2 dùng lại Tx đã hỏng (doomed Tx)
 ```
 
 ## Expected và actual
 
-| | Failed attempt | Retry attempt | Caller/final state |
+| | Lần thử bị lỗi | Lần thử retry | Phía gọi (caller) / trạng thái cuối |
 | --- | --- | --- | --- |
-| Expected | Rollback và close context | New Tx, reload version 8 | Commit B; stock 0 |
-| Broken | Exception bị catch trong Tx | Reuse rollback-only/context cũ | Late failure; B không commit |
+| Kỳ vọng (Expected) | Rollback và đóng context | Transaction mới, tải lại version 8 | Commit B; stock 0 |
+| Lỗi (Broken) | Ngoại lệ bị catch trong Tx | Dùng lại rollback-only/context cũ | Lỗi trả về muộn; B không commit |
 
-Nếu flush chỉ xảy ra ở outer commit, method-local catch còn không nhìn thấy
-conflict; exception xuất hiện sau khi loop đã return.
+Nếu flush chỉ xảy ra ở bước commit bên ngoài, khối catch cục bộ trong phương thức còn không nhìn thấy xung đột; ngoại lệ xuất hiện sau khi vòng lặp đã trả về.
 
 ## Thuật ngữ cần biết
 
 | Thuật ngữ | Giải thích |
 | --- | --- |
-| doomed transaction | Transaction đã rollback-only hoặc không còn usable để commit |
-| attempt boundary | Physical transaction bao quanh đúng một execution attempt |
-| retry ordering | Thứ tự retry interceptor và transaction interceptor |
-| fresh snapshot | State reload trong persistence context/transaction mới |
-| optimistic conflict | Versioned UPDATE ảnh hưởng 0 rows |
-| bounded backoff | Delay có giới hạn, attempt limit và thường có jitter |
-| retryable failure | Failure tạm thời được policy cho phép chạy lại |
-| business revalidation | Kiểm tra lại stock/rule trên state mới |
+| doomed transaction | Transaction đã bị đánh dấu rollback-only hoặc không còn khả dụng để commit |
+| attempt boundary | Physical transaction bao quanh đúng một lần thử thực thi |
+| retry ordering | Thứ tự giữa retry interceptor và transaction interceptor |
+| fresh snapshot | Trạng thái được tải lại trong persistence context/transaction mới |
+| optimistic conflict | Câu lệnh UPDATE có chứa version ảnh hưởng đến 0 dòng |
+| bounded backoff | Thời gian chờ có giới hạn, có số lần thử tối đa và thường có độ trễ ngẫu nhiên (jitter) |
+| retryable failure | Lỗi tạm thời được policy cho phép chạy lại |
+| business revalidation | Kiểm tra lại dữ liệu stock/quy tắc nghiệp vụ trên trạng thái mới |
 
 ## Điều hướng
 
-- [Broken retry placement](broken-code.md)
-- [Doomed transaction analysis](analysis.md)
-- [New transaction per attempt](solutions.md)
-- [Deterministic optimistic-conflict experiments](experiments.md)
+- [Vị trí đặt retry bị lỗi](broken-code.md)
+- [Phân tích doomed transaction](analysis.md)
+- [Transaction mới cho mỗi lần thử](solutions.md)
+- [Các thử nghiệm optimistic-conflict tất định](experiments.md)
 - [Optimistic locking](../../concepts/optimistic-locking.md)
 - [Spring transaction boundaries](../../concepts/spring-transaction-boundaries.md)
 - [Deadlock and safe retry](../../concepts/deadlocks-and-retries.md)
@@ -103,23 +95,19 @@ conflict; exception xuất hiện sau khi loop đã return.
 
 ## Hậu quả production
 
-- Retry counter tăng nhưng không attempt nào có thể commit.
-- Caller nhận `UnexpectedRollbackException`/persistence error muộn.
-- Stale entity làm business validation dùng dữ liệu cũ.
-- Hot key tạo retry amplification và database load.
-- External side effect có thể lặp dù database attempt rollback.
-- Advisor ordering khác giữa configurations làm behavior khó đoán.
+- Bộ đếm retry tăng nhưng không có lần thử nào có thể commit.
+- Phía gọi nhận `UnexpectedRollbackException` hoặc lỗi persistence muộn.
+- Thực thể lỗi thời (stale entity) làm quá trình kiểm tra nghiệp vụ dùng dữ liệu cũ.
+- Dữ liệu bị truy cập nhiều (hot key) tạo ra retry khuyếch đại và tăng tải database.
+- Side effect bên ngoài có thể bị lặp lại dù database attempt bị rollback.
+- Thứ tự advisor khác nhau giữa các cấu hình làm hành vi khó đoán.
 
 ## Hướng sửa khuyến nghị
 
-Dùng non-transactional retry coordinator gọi một proxied `reserveOnce()` trên bean
-khác. Mỗi call `reserveOnce()` dùng `@Transactional`, để conflict thoát ra, rollback
-hoàn tất, rồi coordinator mới backoff và thử lại.
+Dùng non-transactional retry coordinator để gọi một phương thức `reserveOnce()` đã được proxy trên một bean khác. Mỗi lời gọi `reserveOnce()` sử dụng `@Transactional`, để xung đột thoát ra ngoài, quá trình rollback hoàn tất, rồi coordinator mới chờ một khoảng backoff và thử lại.
 
-Phân loại exception cụ thể, giới hạn attempts/deadline, reload aggregate và không
-đặt remote side effect trong retryable transaction.
+Phân loại ngoại lệ cụ thể, giới hạn số lần thử/thời gian, tải lại aggregate và không đặt remote side effect trong một transaction có thể retry.
 
 ## Phạm vi
 
-Case tập trung vào retry mechanics. Việc một business command có idempotent và an
-toàn để retry hay không vẫn phải được quyết định trong domain case tương ứng.
+Trường hợp này tập trung vào cơ chế retry. Việc một command nghiệp vụ có tính lũy đẳng (idempotent) và an toàn để retry hay không vẫn phải được quyết định trong từng trường hợp cụ thể của domain.

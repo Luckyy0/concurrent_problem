@@ -1,6 +1,6 @@
-# Code Bể Trầm Trọng — Ngộ Nhận `SERIALIZABLE` Là Tấm Bùa Bất Tử (luôn thành công)
+# Phân Tích Mã Nguồn Lỗi: Ảo Tưởng Về SERIALIZABLE (Broken assumptions)
 
-## 1. Dọn Khung Bàn Nháp (Schema tối thiểu)
+## 1. Khởi tạo cấu trúc bảng (Schema)
 
 ```sql
 create table merchant_limit (
@@ -25,23 +25,11 @@ create table limit_command_decision (
     requested_amount numeric(19, 2) not null,
     outcome varchar(16) not null check (outcome in ('ACCEPTED', 'REJECTED'))
 );
-
-insert into merchant_limit(merchant_id, limit_amount)
-values (7, 100.00);
-
-insert into credit_reservation(
-    reservation_id, command_id, merchant_id, amount, status
-)
-values (
-    '00000000-0000-0000-0000-000000000060',
-    '10000000-0000-0000-0000-000000000060',
-    7, 60.00, 'ACTIVE'
-);
 ```
 
-Cái Index này kéo cho cái mắt soi access (predicate) rõ chữ nét thực tiễn hơn xíu. Cơ mà bộ SSI vẫn có quyền lấy áo lưới page/relation bọc `SIReadLock` rải xuống bất cứ lúc nào tuỳ tâm cái execution plan của nó nha; Viết Code CẤM có đi đánh đu dựa dẫm vào ba cái vỏ bọc mỏng manh (lock granularity) thay đổi xoành xoạch này!
+Chỉ mục (Index) trên `merchant_id` và `status` hỗ trợ tối ưu hóa truy vấn. Hệ thống SSI sẽ áp dụng khóa điều kiện (predicate lock - `SIReadLock`) theo phân tích kế hoạch truy vấn (execution plan), không cố định ở mức dòng (tuple) hay trang (page).
 
-## 2. Kho Dữ Liệu Rờ Số (Repository đọc predicate)
+## 2. Truy vấn điều kiện bằng Repository (Predicate Repository)
 
 ```java
 package example.limit;
@@ -64,21 +52,9 @@ public interface CreditReservationRepository
 }
 ```
 
-Mấy cái Repository ruột thịt đi kèm:
+Các chức năng Factory trong Entities (`CreditReservation.accepted(...)`, `LimitCommandDecision.accepted/rejected(...)`) có nhiệm vụ sinh đối tượng, đồng thời đảm bảo bảo toàn mã `commandId`.
 
-```java
-public interface MerchantLimitRepository
-        extends JpaRepository<MerchantLimit, Long> {
-}
-
-public interface LimitCommandDecisionRepository
-        extends JpaRepository<LimitCommandDecision, UUID> {
-}
-```
-
-Phần Entity cứ ráp trúng khuôn đúc DDL là bao xài. Chỗ `CreditReservation.accepted(...)` với `LimitCommandDecision.accepted/rejected(...)` thực ra chỉ là ba cái lò nặn Factory nén nhào cục entity mới toanh nhưng vẫn ngậm khư khư cái mã `commandId` cũ thôi hà.
-
-## 3. Khứa Cởi Trần Phá Lưới (Attempt có isolation đúng nhưng thiếu failure contract)
+## 3. Quản lý Giao dịch thiếu Kế hoạch Lỗi (Incomplete isolation approach)
 
 ```java
 package example.limit;
@@ -96,9 +72,9 @@ public class BrokenSerializableLimitService {
     private final LimitCommandDecisionRepository decisions;
 
     public BrokenSerializableLimitService(
-            MerchantLimitRepository limits,
-            CreditReservationRepository reservations,
-            LimitCommandDecisionRepository decisions
+        MerchantLimitRepository limits,
+        CreditReservationRepository reservations,
+        LimitCommandDecisionRepository decisions
     ) {
         this.limits = limits;
         this.reservations = reservations;
@@ -132,13 +108,9 @@ public class BrokenSerializableLimitService {
 }
 ```
 
-Hàm này mà chạy cô đơn 1 mình thì ra quyết định (decision) chuẩn men lắm. Kẹt cái là tụi API/Caller cứ đinh ninh nhắm mắt tin tưởng cái lò này LUÔN nhả cục `LimitDecision` thơm tho béo ngậy! Nếu nhét 2 mũi khoan rặn (attempts) cùng cắm song song, cái nhát súng `40001` có thể xé gió bật ra ngay ở chỗ query, xịt trào lúc flush hoặc ngay đáy búa đập cuối transaction commit, mặc dù cái bụng ruột hàm (method body) nó rặn đẻ ra mẻ return value rồi á!
+Đoạn mã này cấu hình `@Transactional(isolation = Isolation.SERIALIZABLE)`. Điều này đúng đắn về mặt cơ sở dữ liệu, nhưng bỏ qua kịch bản khi xung đột xảy ra. Trong điều kiện tương tranh cao, lệnh gọi có thể gây ra ngoại lệ `40001`. Lỗi này không phát sinh một cách đồng bộ trong quá trình thực thi hàm (method body), mà có thể phát sinh khi Spring Proxy gọi lệnh `commit()`. Do vậy, lớp ứng dụng (caller) nhận được ngoại lệ, và giao dịch bị hủy bỏ (rollback), dẫn đến sự gián đoạn của hệ thống nghiệp vụ. Việc thiếu cơ chế bắt lỗi và thử lại (retry contract) khiến tính năng này không hoàn chỉnh.
 
-Bữa mà exception bật trúng điểm commit ấy, mày có lấy rổ `try/catch` úp chụp bao bọc cái cục `flush()` lọt bên trong method thì đéo đời nào vớt được ẻm! Bởi tụi Transaction Interceptor Đứng Mâm Mũ Tầng Ngoại mới là bọn nắm đinh búa chốt nhịp commit cuối cùng.
-
-> **Sếp chốt lại:** Giăng cái mác nhãn isolation thì có thể dán bùa trúng đó, nhưng ván use-case của mày vỡ nát Bét Sứ Correctness nếu éo vạch sẵn giao kèo đứt đuôi (failure contract): Thằng nào chết Rollback ra sao, Kéo Đấm Lại (retry) chỗ nào, Mức Nào Kiệt Thở Ngáp Gãy (exhaustion) Phải Buông!
-
-## 4. Cái Mõm Loa HTTP Đóng Khét Lỗi Database (Controller làm rò lỗi kỹ thuật)
+## 4. Xử lý Lỗi tại tầng API (Broken Controller)
 
 ```java
 @RestController
@@ -146,9 +118,7 @@ public class LimitController {
 
     private final BrokenSerializableLimitService service;
 
-    public LimitController(BrokenSerializableLimitService service) {
-        this.service = service;
-    }
+    // ... constructor ...
 
     @PostMapping("/merchants/{merchantId}/reservations")
     ResponseEntity<LimitDecision> reserve(
@@ -160,31 +130,18 @@ public class LimitController {
 }
 ```
 
-Nộp Lệnh chọt ngáp rớt bịch trái đạn thối HTTP 500 mặc kệ PostgreSQL bọc lưới rollback êm ru tuốt lọt rạch kẽ (rollback sạch). Client ăn đòn sập thì nổi khùng nhắm mắt đẻ command ID MỚI ráng chọt lại (retry), thế là cấy trùng lắp Operation rác (duplicate operation) làm giòi bọ lỗi gãy kẹp nhau (conflict rate) tăng nổ nóc!
+Khi lỗi `40001` không được xử lý ở tầng Service, nó sẽ lan truyền lên Controller, tạo ra lỗi HTTP 500. Phản ứng thông thường của Client là tạo một Request mới với mã lệnh mới (new Command ID), dẫn đến nguy cơ nhân đôi dữ liệu.
 
-## 5. Rặn Sai Rốn Ục Lại Quanh Cái Đáy Mâm Vỡ (Retry sai trong cùng transaction)
+## 5. Lỗi thử lại trong cùng Transaction (Broken loop retry)
 
 ```java
-package example.limit;
-
-import jakarta.persistence.EntityManager;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Isolation;
-import org.springframework.transaction.annotation.Transactional;
-
 @Service
 public class BrokenLoopRetryService {
 
     private final SerializableSteps steps;
     private final EntityManager entityManager;
 
-    public BrokenLoopRetryService(
-            SerializableSteps steps,
-            EntityManager entityManager
-    ) {
-        this.steps = steps;
-        this.entityManager = entityManager;
-    }
+    // ... constructor ...
 
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public LimitDecision reserve(ReserveLimitCommand command) {
@@ -196,7 +153,8 @@ public class BrokenLoopRetryService {
                     throw failure;
                 }
                 entityManager.clear();
-                // TÈ TÈ TÈ Sai Bét: Cuộn database transaction và bảng snapshot cũ rích rỉ máu vẫn đang nằm thở hóp failed kìa nhóc.
+                // LỖI NGHIÊM TRỌNG: Giao dịch vật lý bên ngoài đang ở trạng thái lỗi (Failed State).
+                // Mọi truy vấn tiếp theo trong vòng lặp này sẽ sinh lỗi 25P02.
             }
         }
         throw new LimitContentionException(command.commandId());
@@ -204,11 +162,9 @@ public class BrokenLoopRetryService {
 }
 ```
 
-Bị táng cục `40001` vỡ đầu, ván cờ PostgreSQL transaction chìm ngỉm lụt chìm Failed state. Bất cứ phát đâm Query tiếp theo nào cũng dính rạch ngực trét bùa ức `25P02` cho tịt đứt tới khi nào hít lệnh `ROLLBACK` mới ngáp được. Vung chổi `EntityManager.clear()` nó chỉ phẩy nhẹ quét đám rác bọt Java entities thôi (detach); Đéo hề có dụ nhổ gốc Rollback connection, đéo xé nháp Bàn Snapshot cờ mới toanh, càng không hốt cứt bôi xóa được mẻ Đòn Phạt Oái Oan Chóp External Side Effect Bọc Lại (side effect)!
+Giao dịch đã chịu lỗi `40001` không thể tiếp tục thực thi các truy vấn SQL. Gọi `entityManager.clear()` chỉ xóa dữ liệu trong bộ nhớ Java, không giải quyết trạng thái hỏng của Giao dịch cơ sở dữ liệu. Việc thử lại bắt buộc phải được thực hiện trong một Transaction mới hoàn toàn.
 
-Dẫu mày có mưu chước lôi chốt giăng neo savepoint ra đỡ, Bọn Già Làng PostgreSQL nó vẫn ép mày cởi áo trần đấm rạch Rã Trọn Giao Dịch Sạch Mẽ (retry complete transaction) Đẻ Lại Từ Đầu cho cục u serialization failure; Retry mót chẻ mảnh mụn (fragment) thì Cứt Trôi Đi Sao Trôi Hết Căn Logic Rặn Ra Đứa Ngậm Chốt SQL và Mớ Số Má kia!
-
-## 6. Lộn Rễ Nấm Bám `@Retryable` Trùm Đầu Chung Nhánh Tụt Vòng `@Transactional`
+## 6. Lỗi sử dụng cấu hình `@Retryable` không chính xác
 
 ```java
 @Retryable(
@@ -221,64 +177,56 @@ public LimitDecision reserve(ReserveLimitCommand command) {
 }
 ```
 
-Đeo gông ngửa 3 vố dọng đầu:
+Việc kết hợp hai annotation này tiềm ẩn rủi ro về mặt thứ tự thực thi (advisor order) của Spring AOP. Nếu lớp `@Transactional` bọc bên ngoài lớp `@Retryable`, các vòng thử lại (retry attempts) sẽ chạy bên trong cùng một giao dịch thất bại. Ngoài ra, việc dùng `RuntimeException.class` để kích hoạt thử lại là quá rộng (bao gồm cả lỗi logic lập trình). Cần tách biệt rõ ràng lớp điều phối (Coordinator) và lớp thực thi giao dịch.
 
-1. Trùm mền `RuntimeException.class` là nó bọc bắt vác rặn Lại (retry) Cả lũ Ngáo Hút Phọt Input Lỗi Bừa Bãi Hay Gãy Code Ngu Nhỏ Dãi (validation/programming failures) cmnl!
-2. Cái lũ Kháo Trọng Áo Giáp Lệnh (Retry và transaction advisors) đè nhau nằm ngợp tròng trên Đỉnh 1 Cây Proxy khiến Ngõ Cửa Ranh Giới Boundary Trắng Tay Lệ Thuộc Bừa Vào Bọn Advisor Chồng Thứ Tự Rúc (ordering/configuration).
-3. Đéo vạch Mức Tuột Trào Deadline Hủy Ván Tổng Bọn (overall deadline), Đéo Hút Lệnh Chia Phân Loa SQLSTATE Chuẩn Lép Chẻ Đinh Cắm Khóa Chốt (durable command replay) Thét Lại Ngáp!
-
-Nếu tấm Lệnh Bọc Transaction bao trùm đít nhét Lệnh Bóp Rặn (retry advice) ngộp bên trong, mấy đợt Tái Chạy Khẽ Dọng Chết Nghẹt (attempts sau) Cứ Trượt Thẳng lọt vào trong bọc mâm chung Máu Trào Vỡ Đuôi Doomed cmn ròi. TÁCH NÁT Trạm Mở Gọi Coordinator Văng Ra Dời Đóng Bọn Bóp Thợ Worker beans Thành Tuyến Ranh Giới (boundary) Cho Trắng Sáng Mặt Mày Và Đâm Test Mượt Hơn Nhé Cưng.
-
-## 7. Trò Áo Giáp Chọc Hút Sóng Mù Tự Trọng Rốn Tự Khóa (Self-invocation làm mất isolation)
+## 7. Lỗi thiết kế ranh giới Proxy (Self-invocation loss of isolation)
 
 ```java
 @Service
 public class BrokenFacade {
 
     public LimitDecision reserve(ReserveLimitCommand command) {
-        return serializableAttempt(command); // KÉO RỐN THÉT TỰ CHỌC LÙI this.serializableAttempt(...)
+        return serializableAttempt(command); // Gọi nội bộ (Self-invocation)
     }
 
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public LimitDecision serializableAttempt(ReserveLimitCommand command) {
-        // read → decide → write
+        // ... logic ...
     }
 }
 ```
 
-Trò Hô Gọi Tiếng Hú Rừng Trong Nội Bộ lủng đéo thể xé tròng Mặt Kính Spring Proxy. Nếu Đéo mang Mâm Transaction ở Bìa Vòng Ngoài bao ốp, Lũ Trọc Ngoáy Repository Calls có thể rách lở bừa bãi lôi ra các transactions cọc cạch đục rời nhau vọt xéo (hoặc ngậm rốn default `READ COMMITTED`); Cón Nếu Mà Đã Mang Mặt Lót Áo Cũ Outer Transaction Ổn Ôm Đã Có Ròi, Mớ Chữ Bọc Mác Annotation Bịt Trong (inner) BẤT LỰC Ép Độ Độn Isolation Kép Gồ Bật Trồi Kín Rìa Mặt Bệ (không nâng effective isolation)!
+Trong Spring, gọi trực tiếp một phương thức `@Transactional` bên trong cùng một đối tượng (this.serializableAttempt) sẽ bỏ qua hoàn toàn cơ chế Proxy. Lệnh thiết lập `SERIALIZABLE` sẽ không được truyền tải xuống cơ sở dữ liệu, khiến giao dịch chạy với mức cô lập mặc định (thường là `READ COMMITTED`), phá vỡ tính đúng đắn của logic.
 
-## 8. Loa Phóng Tin Gửi Khách Gãy Vỡ Nát Trước Lọc Commit (External side effect)
+## 8. Lỗi rò rỉ hiệu ứng phụ (External side effects before commit)
 
 ```java
 if (allowed) {
     reservations.save(CreditReservation.accepted(command));
-    notificationClient.sendAccepted(command.commandId()); // Chết Đóng Định Cứt Trào không rollback được Lôi Lại Đâu!!!
+    notificationClient.sendAccepted(command.commandId()); // LỖI KIẾN TRÚC
     return LimitDecision.accepted(command.commandId());
 }
 ```
 
-Tụi Máy Xăm SSI Chốt Xéo Phọt Đạn Sụp Nhót Lúc Điểm Búa Khép Giao Dịch Dồn Ngược Ngực Commit SAU KHI Cánh Cửa Chữ Loa Khách Hàng (notification) Xé Mạch Bay Tung Quét. Bấm Nút Đấm Lại Cụ Dọng Nhát Khứa Thông Điệp Kẹp Gọi Lần Hai Nhồi Trùng Hoặc Bỗng Nhiên Lão Cú Chốt Cuối Khước Nặn Đỉnh Mới Phọt Rớt Máng Ra Vỡ Mặt `REJECTED`, Thế là Khứa Ôm Một Quả Bom Tréo Mép Giữa Đít Database Lọt Rọt Dưới Ục Khách External system Nhé!
+Gửi thông báo (Notification) thông qua hệ thống ngoại vi trước thời điểm Commit là một vi phạm nguyên tắc giao dịch. Nếu cơ sở dữ liệu từ chối giao dịch với mã lỗi `40001`, hệ thống ngoại vi đã nhận được một thông tin sai lệch không thể vãn hồi. Phải sử dụng mô hình Transactional Outbox.
 
-## 9. Sân Khấu Kéo Xếp Mô Hình Kẹp Hiện Trường (Điều kiện để tái hiện)
+## 9. Điều kiện để tái hiện lỗi (Preconditions for reproduction)
 
-1. Gieo Hạt (Seed) mốc limit `100` và bọc active chốt đổ ngòi trót lọt `60`.
-2. Kép T1/T2 Kéo Lưới physical transactions riêng Ốp Kép Cách Ly Áo Bọc `serializable` Đều Đồng Bọn.
-3. Cả 2 Phe Dính Ngậm Hút Vực stable snapshot Lút Ốc Cuộc Phán Dứt Bảng `SUM=60` TRƯỚC LÚC Nặng Lệnh Ghi Nhét (insert) Lọt Lòng Cửa Nhé!
-4. Kẹp Thét Khứa C1/C2 Treo Đinh command/reservation IDs Riêng Giấu Trắng!
-5. Bật Hàng Rào Chắn Trận (Barrier mở) Để Cả 2 Lên Đạn Ục (insert) Rồi Sút Kéo Búa Tịt Ngáp Commit!
-6. Bãi Test Đào Bọc Om Trọn Rổ Exception Tuốt Vòng Viền Chẻ Kín Transaction, kể cả lúc móc sụt `commit()`.
-7. Dọng Kho Thực PostgreSQL Chân Lực Ngạo Nghễ Mới Vắt Kéo Hàng Qua Testcontainers Nhé; Trò Con Nít H2 Nó Đéo Có Sân Phơi SSI/`SIReadLock` Cứt Chó Gì Rặn Soi Đâu!
+1. Môi trường có dữ liệu mốc: limit `100`, active `60`.
+2. Hai kết nối thực thi `SERIALIZABLE` độc lập.
+3. Cả hai luồng hoàn tất việc đọc giá trị tổng `SUM=60` trước khi luồng nào đó tiến hành lưu dữ liệu.
+4. Mỗi luồng cấp phát một Command ID riêng.
+5. Cố gắng thiết lập lệnh `commit()` song song.
+6. Thử nghiệm trên cơ sở dữ liệu PostgreSQL thực tế bằng Testcontainers (tránh dùng H2, do H2 không hỗ trợ mô phỏng chính xác SSI).
 
-## 10. Mớ Khứa Bó Thuốc Gãy Xương Dán Mù Éo Đủ Lệ (Các cách sửa chưa đủ)
+## 10. Các biện pháp khắc phục chưa đủ chuẩn (Incomplete mitigations)
 
-- Chỉ Hét Đẩy Lên Cấp Kéo Cứng Isolation Mù Mờ Bỏ Rọt Lơ Xéo Mạng Cục `40001` Bơm Xịt.
-- Nhét Rặn Retry Ở Đoạn Thằng Nháp Cuối Tít Góc Rạch Statement Đéo Lột Sạch Giao Trọn Vẹn Dịch Cục Mới Rút (whole transaction).
-- Sớt Máng Mót Liếm Đỉnh Bụng Màng Entities / Mảng Khóa Ngáp Snapshot Tụ Lấy Lên Từ Rác Ải Failed Cũ (failed attempt).
-- Ói Dồn Rặn Cáo Lặp Mãi Mép Nháp Vô Hạn Hay Vừa Đập Gãy Lại Khởi Đạp Ụp (ngay lập tức) Thiếu Máng Rụt Nháp Random Jitter Trễ Trút Nhịp.
-- Cứ Vấp `DataAccessException` Ngậm Oải Lại Kéo Retry Bất Chấp Sọc Bọn Sụp Mặt Nặn Lá Cứt Code Lỗi Cả Nhau.
-- Chế Phọt Cống Kéo Rạch Mã Đinh Command ID MỚI SỤT Bịch Khứa Áo Nháp Attempt Khắc Lệ Oác!
-- Đẩy Phọt Loa Nháp Gửi Lọt Rút Dây HTTP/message Hét Sắp Trước Lúc Kẽ Khách Ánh Commit MÀ Éo Cáp Lọt Phễu Bồn Tụ Hàng Trực Outbox!
-- Bịt Xẹo Áo Bọc Nốt JVM `synchronized` Rìa Mâm Đất Lọt Bụng Gáy Chắn Đơn Chút Éo Nhéo Cựa Mớ Kéo Hai Đội Hàng application instances 2 Phe Nắm Sừng Cổ Lock Khác Gãy Nhau!
-- Lếu Láo Ngậm Ngóng Suy Bừa: Đứa Ngã Chết Tội (victim) BAO GIỜ Chả Là Khứa Chạy Tới Theo Chân Sau Nhỉ Lều (bắt đầu sau)!
-- Hú Chóp Rờ Nắm Xoắn Khứa Đầu Dọng Mõm Test Assert Chỉ Nhăm Type Bọc Máng Áo Bệnh MÀ Éo Cạp Quét Tóm Kép Xem Con Số Final Total Vẫn Giữ Vững Họng Oanh Quyết Mép Outcome Đúng Đẹp Decisions!
+- Nâng mức cô lập lên `SERIALIZABLE` nhưng không có mã xử lý thử lại (retry block).
+- Triển khai thử lại bên trong phạm vi giao dịch.
+- Xử lý thử lại mà không tái truy vấn dữ liệu từ đầu (sử dụng lại Entity Cache cũ).
+- Thử lại vô hạn mà không có thời gian trễ ngẫu nhiên (jitter/backoff).
+- Thực thi Retry với mọi loại ngoại lệ (`DataAccessException`).
+- Tạo Command ID mới cho mỗi vòng thử lại thay vì tái sử dụng ID để đảm bảo tính lũy đẳng (Idempotency).
+- Duy trì gọi API bên thứ ba (HTTP call) bên trong ranh giới giao dịch đang chờ cấp khóa hoặc có khả năng rollback.
+- Sử dụng `synchronized` trên môi trường ứng dụng đa máy chủ (Multi-instance).
+- Phụ thuộc hoàn toàn vào ngoại lệ được ném ra để đánh giá thành công của luồng nghiệp vụ thay vì kiểm định tính chính xác của dữ liệu được lưu cuối cùng.

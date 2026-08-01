@@ -1,8 +1,8 @@
-# Hiện trường vụ án: Tội ác của việc "Cầm đèn chạy trước ô tô"
+# Phản Mẫu Thiết Kế (Anti-Patterns): Rủi Ro Từ Quá Trình "Đọc - Quyết Định - Ghi" Không Đồng Bộ
 
-## 1. Thiết kế Bảng (Schema tối thiểu)
+## 1. Cấu Trúc Lược Đồ (Schema Minimal)
 
-Giả sử chúng ta có 2 bảng để quản lý rạp phim:
+Xây dựng hệ thống quản lý đặt chỗ rạp phim với cấu trúc CSDL cơ bản:
 
 ```sql
 create table show_seat (
@@ -27,9 +27,9 @@ create table seat_hold (
 );
 ```
 
-Nhìn kỹ nhé: Bảng `seat_hold` có cột Unique để chặn khách nhấn đúp `command_id`, nhưng KHÔNG có Ràng Buộc (Constraint) nào cản 2 cái `hold_id` khác nhau cùng trỏ vào 1 cái ghế. Nghĩa là code Java phải tự đứng ra bảo vệ chiếc ghế này.
+Phân tích: Bảng `seat_hold` thiết lập Unique Constraint cho cột `command_id` để loại bỏ các yêu cầu lặp (Idempotency). Tuy nhiên, không có ràng buộc tương hỗ nào ngăn cản việc ghi nhận hai giao dịch cấp phát độc lập (`hold_id` khác biệt) hướng tới cùng một bản ghi tại `show_seat`. Hệ thống yêu cầu mã nguồn tầng Ứng dụng phải đảm nhận việc duy trì tính toàn vẹn này.
 
-## 2. Entity Ngây Thơ (Không có chống đạn)
+## 2. Mô Hình Thực Thể Đơn Thuần (Unprotected Entity)
 
 ```java
 @Entity
@@ -47,7 +47,7 @@ public class ShowSeat {
 
     protected ShowSeat() {}
 
-    // Hàm kiểm tra ghế còn trống không
+    // Phương thức kiểm định điều kiện cấp phát
     boolean isAvailable(Instant now) {
         return state == SeatState.AVAILABLE
                 || state == SeatState.HELD && !holdUntil.isAfter(now);
@@ -62,9 +62,9 @@ public class ShowSeat {
 }
 ```
 
-Không có `@Version` (Khóa Lạc Quan). Cũng chẳng có dòng nào đòi `FOR UPDATE` (Khóa Bi Quan). Chỉ là một Class Java ngoan hiền.
+Mô hình thực thể trên thiếu vắng sự hiện diện của cơ chế Khóa Lạc Quan (`@Version`) và không khai báo phương thức áp dụng Khóa Bi Quan. Nó hoàn toàn hoạt động như một lớp Java thông thường mà không có bất kỳ hàng rào bảo vệ tương tranh nào.
 
-## 3. Đoạn Code Gây Thảm Họa (Broken service)
+## 3. Kiến Trúc Dịch Vụ Mắc Lỗi Nghiêm Trọng (Broken Service)
 
 ```java
 @Service
@@ -85,17 +85,17 @@ public class BrokenSeatHoldService {
 
     @Transactional
     public HoldResult hold(HoldSeatCommand command) {
-        // Bước 1: Tải ghế lên bằng SELECT bình thường
+        // Bước 1: Truy xuất bản ghi thông qua lệnh SELECT tiêu chuẩn
         ShowSeat seat = seats.findById(command.seatId())
                 .orElseThrow(SeatNotFoundException::new);
 
         Instant now = clock.instant();
-        // Bước 2: Hỏi ghế "Còn trống không em?"
+        // Bước 2: Thẩm định nghiệp vụ (Kiểm tra trạng thái)
         if (!seat.isAvailable(now)) {
             return HoldResult.alreadyHeld(seat.getHoldId());
         }
 
-        // Bước 3: Còn trống thì anh Xí chỗ nhé!
+        // Bước 3: Thay đổi trạng thái đối tượng
         UUID holdId = UUID.randomUUID();
         seat.hold(holdId, command.customerId(), now.plusSeconds(120));
         holds.save(SeatHold.active(holdId, command, now));
@@ -105,73 +105,74 @@ public class BrokenSeatHoldService {
 }
 ```
 
-Đoạn code này đọc cứ như một bài thơ, logic cực kỳ trơn tru... nếu chạy 1 mình 1 ngựa. Khổ nỗi nó dùng `SELECT` chay (không Khóa) ở Bước 1.
+Kiến trúc này thoạt nhìn đảm bảo nguyên tắc xử lý tuần tự (Atomicity) đối với các lệnh cập nhật, nhưng lại mắc lỗi hệ thống nghiêm trọng tại Bước 1 khi tiến hành truy xuất bản ghi mà không cấp phát Khóa (`SELECT` thuần).
 
-## 4. Thiên Thời Địa Lợi Cho Lỗi Nổ Ra
+## 4. Hội Tụ Các Yếu Tố Kích Hoạt Lỗi
 
-- Dưới gầm đang xài `READ COMMITTED`.
-- Ghế `(42, A-10)` đang rảnh `AVAILABLE`.
-- Anh A và Chị B cùng nhào vô bấm Đặt Ghế bằng 2 Request riêng biệt.
-- Cả hai câu `SELECT` đều chạy xong trước khi có lệnh Xả (`flush`) ghi vào DB.
-- Không hề có Khóa gì bảo vệ (Không `@Version`, không Constraint).
+- Mức cách ly của CSDL mặc định là `READ COMMITTED`.
+- Tài nguyên ghế `(42, A-10)` duy trì trạng thái `AVAILABLE`.
+- Hai yêu cầu đặt chỗ từ phía gọi A và phía gọi B được phân luồng xử lý song song.
+- Cả hai thao tác đọc dữ liệu (`SELECT`) diễn ra hoàn tất trước khi quá trình xả lệnh Ghi (Flush) tác động tới CSDL.
+- Hoàn toàn vắng bóng các cơ chế khóa hỗ trợ.
 
-Đến lúc xả lệnh UPDATE xuống DB, tụi nó sẽ bị DB bắt xếp hàng tuần tự. Nhưng xui cái là lúc đó não bộ của Java đã chốt: Cả A và B ĐỀU ĐƯỢC CHẤP NHẬN trên App mất rồi!
+Tại thời điểm lệnh `UPDATE` được gửi đi, cơ chế Khóa Dòng nội tại của PostgreSQL sẽ thiết lập việc xử lý tuần tự. Tuy nhiên, luồng Logic tại Tầng Ứng Dụng đã hoàn thành khâu đánh giá và xác nhận thành công cho CẢ HAI giao dịch dựa trên cùng một trạng thái trong quá khứ.
 
-## 5. Thảm Cảnh 1 Ghế 2 Chủ
+## 5. Hiện Tượng Phân Bổ Trùng Lặp (Double Booking)
 
-| Bước | Máy của A | Máy của B |
+| Quá Trình Thực Thi | Luồng Giao Dịch A | Luồng Giao Dịch B |
 | --- | --- | --- |
-| 1 | Mở Giao Dịch | |
-| 2 | Nhìn thấy `AVAILABLE` | |
-| 3 | | Mở Giao Dịch |
-| 4 | | Cũng thấy `AVAILABLE` |
-| 5 | Lập tờ Đăng Ký cho A | Lập tờ Đăng Ký cho B |
-| 6 | Sửa tên chủ ghế thành A | |
-| 7 | Chốt sổ (Commit) | |
-| 8 | | Sửa tên chủ ghế thành B (ĐÈ LÊN A) rồi Chốt sổ! |
+| 1 | Khởi tạo Giao dịch | |
+| 2 | Truy xuất trạng thái `AVAILABLE` | |
+| 3 | | Khởi tạo Giao dịch |
+| 4 | | Nhận trạng thái `AVAILABLE` (Từ Snapshot) |
+| 5 | Ghi nhận yêu cầu cấp phát (Memory) | Ghi nhận yêu cầu cấp phát (Memory) |
+| 6 | Gửi lệnh lưu trạng thái (A) | |
+| 7 | Cấp nhận Commit | |
+| 8 | | Gửi lệnh lưu trạng thái (B) - GHI ĐÈ KẾT QUẢ CỦA A |
+| 9 | | Cấp nhận Commit |
 
-Kết quả: Bảng `seat_hold` đẻ ra 2 tờ Đăng Ký (đều ACTIVE) rành rành. Bảng `show_seat` thì chỉ lưu tên B. A đến rạp và bị đuổi về dù App đã báo thành công. Cảm ơn chức năng Row Lock ngầm của UPDATE, nó chỉ cản đè Data chứ KHÔNG quay lại chạy hàm `isAvailable()` cho B!
+Hậu quả hệ thống: Bảng lịch sử `seat_hold` chứa hai bản ghi cấp phát độc lập (Active). Bảng tham chiếu `show_seat` bị ghi đè bởi Giao dịch xử lý cuối cùng (Phía gọi B). Giao dịch của phía gọi A bị loại bỏ trên hệ thống lưu trữ mặc dù đã nhận phản hồi Thành công từ API. PostgreSQL Row Lock chỉ đóng vai trò phân xử thứ tự Ghi Đè, không cung cấp tính năng tái xác thực điều kiện nghiệp vụ (`isAvailable()`).
 
-> **Bài học xương máu:** Khóa lúc Ghi là QUÁ MUỘN; vì phán quyết (Business decision) đã được đưa ra dựa trên cái "Hình chụp Dĩ vãng" từ 2 câu đọc không Khóa trước đó rồi.
+> **Nguyên tắc kỹ thuật:** Cấp phát Khóa tại thời điểm cập nhật (Ghi) là hành động chậm trễ vô giá trị, bởi phán quyết nghiệp vụ đã được ấn định dựa trên tập dữ liệu lịch sử (Stale Snapshot) từ pha Đọc ban đầu.
 
-## 6. Sai lầm 1 — Ảo tưởng sức mạnh của `@Transactional`
+## 6. Phản Mẫu 1 — Nhận Thức Sai Lệch Về Ranh Giới `@Transactional`
 
 ```java
 @Transactional
 public HoldResult hold(HoldSeatCommand command) {
     ShowSeat seat = seats.findById(command.seatId()).orElseThrow();
-    // Thiếu FOR UPDATE.
+    // Bỏ quên mệnh đề FOR UPDATE tại khâu nạp dữ liệu.
     return decideAndWrite(seat, command);
 }
 ```
 
-`@Transactional` chỉ làm mỗi việc: Ép các lệnh Ghi (Write) phải đi chung 1 xuồng, chìm cùng chìm, nổi cùng nổi. Chứ nó KHÔNG HỀ biến lệnh `SELECT` thành lệnh Khóa, và cản không cho kẻ khác đọc dữ liệu cũ.
+Annotation `@Transactional` quản trị ranh giới Commit/Rollback, đảm bảo các tác vụ Ghi gắn kết với nhau (All-or-nothing). Nó KHÔNG tự động chuyển đổi lệnh truy xuất `SELECT` thành lệnh Yêu Cầu Khóa, do đó không cản trở các giao dịch khác tiếp cận trạng thái dữ liệu cũ.
 
-## 7. Sai lầm 2 — Xin Khóa trong cái Hẻm, rồi mang data ra Đường Lớn xài
+## 7. Phản Mẫu 2 — Tách Rời Pha Xin Khóa Khỏi Chu Kỳ Xử Lý (Premature Lock Release)
 
 ```java
 public HoldResult hold(HoldSeatCommand command) {
-    // Xin FOR UPDATE trong Repository
+    // Yêu cầu FOR UPDATE tại tầng Repository
     ShowSeat seat = seats.findForUpdate(command.seatId()).orElseThrow();
-    // Ra đến đây là HẾT Giao Dịch của Repository, Khóa đã BỊ VỨT SỌT RÁC!
-    return mutateInAnotherTransaction(seat, command);
+    // Kết thúc phạm vi Giao dịch của Repository, Khóa lập tức bị Hủy!
+    return mutateInAnotherTransaction(seat, command); // Xử lý trên Giao dịch độc lập
 }
 ```
 
-Khóa sống chết theo Giao Dịch DB. Giao Dịch đứt thì Khóa mất hiệu lực. Nếu Giao Dịch chết trước khi bạn đưa ra phán quyết và cập nhật, thì cái Khóa đó hoàn toàn Vô Dụng.
+Khóa bảo vệ gắn liền với vòng đời Giao dịch vật lý. Khi quá trình gọi Repository trả về kết quả, Giao dịch ngắn hạn bị đóng, kéo theo sự giải phóng Khóa. Việc thẩm định và cập nhật tại một Giao dịch kế tiếp sẽ phải đối mặt với trạng thái không an toàn.
 
-## 8. Sai lầm 3 — Đọc đồ ôi thiu rồi mới chạy đi Xin Khóa
+## 8. Phản Mẫu 3 — Quy Trình Tái Thẩm Định Trên Dữ Liệu Cũ
 
 ```java
 @Transactional
 public HoldResult hold(HoldSeatCommand command) {
-    // 1. Tải lên 1 cục data ôi thiu
+    // 1. Tải bản sao Snapshot không bảo vệ
     ShowSeat stale = seats.findById(command.seatId()).orElseThrow();
 
-    // 2. Chạy hàm xin Khóa (nhưng vứt data Mới vào sọt rác)
+    // 2. Yêu cầu Khóa (Bỏ qua phiên bản Mới nhất trả về)
     seats.findForUpdate(command.seatId());
 
-    // 3. Phán quyết dựa trên... cục data ôi thiu ở bước 1
+    // 3. Tiến hành đánh giá điều kiện dựa trên phiên bản Snapshot ban đầu
     if (stale.isAvailable(clock.instant())) {
         return decideAndWrite(stale, command);
     }
@@ -179,9 +180,9 @@ public HoldResult hold(HoldSeatCommand command) {
 }
 ```
 
-Xin khóa xong thì phải lấy cái Object Sạch Sẽ Mới Tinh đó mà dùng! Đừng giả định là gọi hàm Khóa xong thì cái Object cũ mèm `stale` kia tự động được gột rửa (refresh).
+Yêu cầu Cấp Khóa (`FOR UPDATE`) đồng nghĩa với việc tái nhận bản cập nhật mới nhất. Tiến trình cần tiến hành Revalidation (tái thẩm định) trên chính Đối Tượng Nhận Về Từ Lệnh Khóa, không tiếp tục khai thác thông số trên phiên bản chưa được cập nhật (`stale`).
 
-## 9. Sai lầm 4 — Bắt Lỗi (Catch) Timeout rồi Cố Đấm Ăn Xôi
+## 9. Phản Mẫu 4 — Bắt Bỏ Qua Ngoại Lệ Của Giao Dịch Hỏng (Illegal State Recovery)
 
 ```java
 @Transactional
@@ -190,7 +191,7 @@ public HoldResult hold(HoldSeatCommand command) {
         return decideAndWrite(seats.findForUpdate(command.seatId()).orElseThrow(),
                 command);
     } catch (PessimisticLockException ex) {
-        // DB đã cắm cờ Phá Sản mà vẫn ráng chạy tiếp
+        // Giao dịch đã bị CSDL đánh dấu Hủy (Rollback-only), vẫn cố gắng truy vấn tiếp
         return holds.findByCommandId(command.commandId())
                 .map(HoldResult::replayed)
                 .orElseGet(HoldResult::busy);
@@ -198,38 +199,38 @@ public HoldResult hold(HoldSeatCommand command) {
 }
 ```
 
-Một khi DB đã chửi vì Timeout hoặc Lỗi Khóa, cái Giao Dịch đó coi như ĐÃ Ô UẾ (aborted state). Gọi lệnh DB gì tiếp trong đó cũng nổ lỗi bung bét. Phải buông xuôi cho nó thoát ra ngoài Proxy (để Rollback) rồi tính sau!
+Khi phát sinh lỗi Timeout hoặc xung đột Khóa từ CSDL, Giao dịch đang chạy bị chuyển trạng thái sang `aborted`. Mọi tương tác truy vấn phát sinh thêm đều sẽ ném ngoại lệ (lỗi dây chuyền). Lập trình viên phải thoát khối lệnh và cho phép Spring hoàn tất quá trình Rollback trước khi xử lý tiếp.
 
-## 10. Sai lầm 5 — Vừa giữ Khóa, vừa gọi điện thoại buôn chuyện (Remote call)
+## 10. Phản Mẫu 5 — Nguy Cơ Bóp Nghẹt Hệ Thống Do Tích Hợp Cuộc Gọi Ngoại Vi (Lock Convoy via Remote Call)
 
 ```java
 @Transactional
 public HoldResult holdAndCharge(HoldSeatCommand command) {
     ShowSeat seat = seats.findForUpdate(command.seatId()).orElseThrow();
-    // Đang ôm cái Khóa mà rảnh rỗi gọi API thanh toán (mất xừ nó 5 giây)
+    // Giao dịch đang nắm Khóa độc quyền, nhưng bị đình trệ bởi tiến trình External I/O
     PaymentReply reply = paymentClient.authorize(command.payment());
     return updateSeatAfterReply(seat, command, reply);
 }
 ```
 
-Bao nhiêu thằng khác đang đứng chờ Khóa mòn mỏi. Gọi API lỡ nó lag thì cả ngàn Connection đi tong, tạo thành một "Bãi xe kẹt cứng" (lock convoy).
+Cấp Khóa nhưng tạm ngừng thực thi (Blocking I/O) sẽ dồn ứ các giao dịch cạnh tranh tại cửa ngõ CSDL. Sự gia tăng độ trễ mạng dẫn đến việc bòn rút tài nguyên Connection Pool, gây ra tình trạng khóa liên hoàn (Lock convoy) và sụp đổ dịch vụ.
 
-## 11. Sai lầm 6 — Khóa nhiều ghế lộn xộn không Xếp Hàng
+## 11. Phản Mẫu 6 — Thiếu Đồng Bộ Thứ Tự Khóa (Deadlock Vulnerability)
 
 ```java
 @Transactional
 public void holdPair(List<ShowSeatId> requestedOrder) {
     for (ShowSeatId id : requestedOrder) {
-        // Khóa A-10 xong qua khóa A-11
+        // Khóa từng tài nguyên tùy ý theo thứ tự đầu vào
         ShowSeat seat = seats.findForUpdate(id).orElseThrow();
         validate(seat);
     }
 }
 ```
 
-Khách mua `[A-10, A-11]`. Khách khác truyền `[A-11, A-10]` -> Kẹt cứng ngắc (Deadlock). Phải luôn SORT (sắp xếp) danh sách ghế theo một trật tự duy nhất trước khi chạy Vòng Lặp xin Khóa.
+Luồng A truy vấn `[A-10, A-11]`, Luồng B truy vấn `[A-11, A-10]` → Phát sinh bẫy kẹt cứng (Deadlock). Các bộ tham số đầu vào đa phần tử bắt buộc phải trải qua tiến trình Sắp Xếp (Sort) thành một trình tự chuẩn nhất (VD: Sắp xếp theo ID định danh) trước khi đi vào vòng lặp Yêu Cầu Khóa.
 
-## 12. Sai lầm 7 — Xài "Khóa Nội Bộ" `synchronized`
+## 12. Phản Mẫu 7 — Áp Dụng Khóa Mức Ngôn Ngữ Tại Hệ Thống Phân Tán
 
 ```java
 public synchronized HoldResult hold(HoldSeatCommand command) {
@@ -237,14 +238,13 @@ public synchronized HoldResult hold(HoldSeatCommand command) {
 }
 ```
 
-Từ khóa này xịn, nhưng chỉ có tác dụng trong MỘT cái Máy ảo Java (JVM). Khách gọi vào Máy 1, nó chặn được. Khách gọi vào Máy 2, máy 2 chả biết gì. Chạy Đa Máy Chủ là toang!
+Khung tham chiếu rào cản `synchronized` giới hạn kiểm soát luồng hoạt động trong nội bộ một JVM (Java Virtual Machine) duy nhất. Mô hình đa máy chủ phân tán (Clustered servers) khiến cơ chế này mất khả năng ngăn chặn hiện tượng đụng độ dữ liệu vật lý tại CSDL.
 
-## 13. Sai lầm 8 — Xài "Bỏ Qua" `SKIP LOCKED` cho 1 cái Ghế Cụ Thể
+## 13. Phản Mẫu 8 — Tùy Biến Lệnh Bỏ Qua Đối Với Định Danh Cụ Thể (`SKIP LOCKED`)
 
-Giả sử khách đích danh đòi mua ghế `A-10`. Trùng hợp thằng khác đang giữ Khóa để xem. Nếu bạn xài `SKIP LOCKED`, DB lơ luôn cái `A-10` đó, hàm trả về kết quả Rỗng. API của bạn ngây ngô báo lại: "Cái ghế này KHÔNG TỒN TẠI!"
-Thật ngớ ngẩn. Trò này chỉ dành cho Bọn Worker tự động hốt hàng ngẫu nhiên thôi.
+Sử dụng cờ cấu hình `SKIP LOCKED` cho một tài nguyên (ID) cụ thể. Nếu tài nguyên này đang bị khóa bởi Giao dịch phụ trợ, CSDL sẽ trực tiếp bỏ qua và trả về kết quả rỗng (Empty result). API sẽ xử lý chuỗi logic và trả thông báo sai lệnh: "Bản ghi không tồn tại" (Not Found). Kỹ thuật này chỉ ứng dụng trong mô hình tiêu thụ đa thành phần (Tiến trình xử lý hàng đợi).
 
-## 14. Sai lầm 9 — Đòi Khóa một thứ KHÔNG TỒN TẠI
+## 14. Phản Mẫu 9 — Yêu Cầu Thiết Lập Khóa Cho Tập Thực Thể Rỗng (Phantom Locks)
 
 ```sql
 select *
@@ -253,23 +253,22 @@ where show_id = 42 and seat_no = 'A-99'
 for update;
 ```
 
-Ghế `A-99` làm gì có! Query về 0 dòng, DB chả khóa cái gì sất. Nếu mục đích của bạn là "Ngăn không cho ai đẻ ra cái ghế A-99", thì `FOR UPDATE` bó tay nhé. Phải xài các món võ khác như Constraint hoặc Rào chắn (guard row).
+Cú pháp không phát sinh ngoại lệ, nhưng kết quả trả về bằng 0 dòng dẫn đến CSDL không thiết lập bất kỳ Khóa Dòng nào. Phương thức `FOR UPDATE` không thể phòng chống hiện tượng một luồng khác thực thi lệnh `INSERT` để tạo mới bản ghi `A-99` (Xung đột Phantom Row). Yêu cầu này cần được xử lý thông qua Ràng Buộc Cơ Sở (Table Constraints).
 
-## 15. Bắt Bệnh Qua Triệu Chứng (Dấu hiệu)
+## 15. Dấu Hiệu Nhận Diện Sự Cố (Observability Signals)
 
-- Dữ liệu rác: Có 2 vé ACTIVE nhưng ghế chỉ ghi tên 1 người.
-- Bật Log SQL lên chỉ thấy câu `SELECT` trần trụi trước câu `UPDATE`.
-- Dấu hiệu đứng chờ (Wait) toàn rớt vào lúc `UPDATE/flush` thay vì lúc tải dữ liệu lên.
-- Quá trình "gọi mạng ngoài" lỡ lọt vào trong Giao Dịch làm Lỗi Kẹt Xe (`pg_stat_activity.wait_event_type = 'Lock'`) nhảy dựng đứng.
-- Log thấy báo lỗi 500 hầm bà lằng thay vì trả lỗi Kinh Doanh sạch sẽ.
-- Chạy 1 máy ảo không sao, bung nhiều máy (scale) thì nát.
+- Bất thường cấu trúc dữ liệu (Data Integrity): Bản ghi lịch sử và Bản ghi đại diện trạng thái không khớp quan hệ.
+- Luồng truy xuất: Phát hiện khối lệnh `SELECT` không mang theo cờ Khóa phân lập độc lập trước khối lệnh `UPDATE` trong Giao dịch.
+- Đặc tả hiệu năng: Chỉ số Wait-event tập trung vào chu kỳ Xả đồng bộ (Flush/Update) thay vì pha tải dữ liệu, chứng tỏ Khóa Dòng diễn ra ngầm định quá muộn.
+- Bùng nổ ngoại lệ nội bộ (Lỗi máy chủ nội bộ 500) đè lên các phản hồi mã lỗi Kinh doanh, báo hiệu lỗi Rollback không được bắt lỗi (Catch) chuẩn xác.
+- Vòng đời dịch vụ suy giảm trầm trọng (Latency degradation) khi cấp quyền hệ thống chạy dưới mô hình mở rộng số lượng App Nodes.
 
-## 16. Tóm Lại Đoạn Code Bị Bệnh Gì?
+## 16. Phân Định Lỗi Cấu Trúc (Core Resolution)
 
-Không phải là nó "thiếu Giao dịch", mà là nó **Thiếu Tính Liền Mạch (Atomicity)** của chuỗi hành động:
+Bản chất của các sự cố kể trên không phải do sự thiếu vắng của ranh giới Giao dịch, mà do sự phân rã **Tính Liền Mạch (Atomicity)** của chuỗi nghiệp vụ:
 
 ```text
-Đọc Trạng Thái Hiện Tại → Suy Nghĩ Phán Quyết → Làm Tờ Đăng Ký → Cập Nhật Lại Ghế
+Luồng Hỏng: Đọc Trạng Thái → Đánh Giá Nghiệp Vụ → Kiến Tạo Lịch Sử → Cập Nhật Tài Tài Nguyên
 ```
 
-Con đường đúng đắn là: Phải giật cái Khóa Độc Quyền Dưới DB (Authoritative Lock) **TRƯỚC KHI** đem não ra Suy Nghĩ, giữ khư khư nó cho đến khi Xả sạch sẽ xuống DB và Chốt sổ (Commit). Và nhớ cài đồng hồ hẹn giờ cho cái Khóa đó!
+Quy trình đúng đắn yêu cầu: Thiết lập Quyền Sở Hữu Độc Quyền (Authoritative Lock) tại CSDL **TRƯỚC KHI** khởi tạo tiến trình Đánh Giá Nghiệp Vụ, và duy trì tính toàn vẹn này liên tục cho tới quá trình Commit cuối cùng.

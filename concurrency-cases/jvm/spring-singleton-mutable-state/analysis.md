@@ -51,18 +51,18 @@ Actual:
 
 Hai quy tắc bắt buộc cùng bị phá:
 
-- sequence `42` được cấp hai lần vì một cập nhật đã bị ghi đè (`lost update`);
-- customer của T1 bị thay bằng dữ liệu của T2.
+- sequence `42` được cấp phát hai lần vì một cập nhật đã bị ghi đè (`lost update`);
+- dữ liệu khách hàng của T1 bị thay bằng dữ liệu của T2.
 
 > **Nói ngắn gọn:** hai request cùng đọc sequence cũ, sau đó cùng ghi một giá
-> trị mới; đồng thời request B thay thế customer đang được request A sử dụng.
+> trị mới; đồng thời request B thay thế dữ liệu khách hàng đang được request A sử dụng.
 
 ## Nguyên nhân theo từng lớp
 
 ### Vòng đời Spring bean
 
 `@Service` mặc định có singleton scope trong một `ApplicationContext`. Spring
-không tạo service mới cho từng HTTP request và cũng không buộc các lời gọi method
+không tạo service mới cho từng HTTP request và cũng không buộc các lời gọi phương thức
 phải chạy lần lượt. Việc bean được công bố an toàn sau khởi tạo không bảo vệ các
 field tiếp tục bị thay đổi trong lúc xử lý request.
 
@@ -74,9 +74,9 @@ xảy ra-trước giữa chúng.
 
 Hai lỗi độc lập:
 
-1. `++nextSequence` là non-atomic read-modify-write;
-2. `lastCustomerId` là request data được lưu trong shared field rồi đọc lại sau
-   một cửa sổ interleaving.
+1. `++nextSequence` là thao tác read-modify-write không nguyên tử;
+2. `lastCustomerId` là dữ liệu request được lưu trong field dùng chung rồi đọc lại sau
+   một khoảng xen kẽ (interleaving).
 
 Chuỗi thao tác gây lỗi chính xác là:
 
@@ -85,7 +85,7 @@ shared field write → interleaving → compound update/read shared field
 ```
 
 Vì vậy, nguyên nhân không chỉ là “có nhiều request cùng lúc”, mà là các request
-cùng sửa state qua một chuỗi không nguyên tử.
+cùng sửa trạng thái qua một chuỗi không nguyên tử.
 
 ### Spring transaction, Hibernate và database
 
@@ -96,16 +96,16 @@ khôi phục giá trị của field trong Java heap.
 
 ## Ảnh hưởng của commit, rollback, timeout và crash
 
-- **Commit/rollback:** không áp dụng cho local fields; không có transaction log
-  phục hồi chúng.
-- **Exception:** nếu method lỗi sau khi tăng sequence, sequence bị bỏ trống;
+- **Commit/rollback:** không áp dụng cho các field cục bộ; không có transaction log
+  để phục hồi chúng.
+- **Ngoại lệ (Exception):** nếu phương thức lỗi sau khi tăng sequence, sequence bị bỏ trống;
   không tự rollback.
-- **Timeout/retry:** client retry tạo một draft mới; đây không phải idempotent
-  workflow.
-- **Process crash/restart:** local counter trở về initial value và có thể tái sử
+- **Timeout/retry:** phía gọi (client) thử lại sẽ tạo một bản nháp mới; đây không phải là
+  luồng công việc an toàn khi lặp lại (idempotent workflow).
+- **Tiến trình gặp sự cố/khởi động lại:** bộ đếm cục bộ trở về giá trị ban đầu và có thể tái sử
   dụng sequence cũ.
 
-Các đặc tính này cho thấy local counter không phù hợp làm durable business ID.
+Các đặc tính này cho thấy bộ đếm cục bộ không phù hợp làm định danh nghiệp vụ bền vững.
 
 ## Khi có nhiều application instance
 
@@ -125,27 +125,27 @@ sequence. Cơ chế phối hợp cục bộ chỉ có hiệu lực trong JVM đa
 
 ### Hậu quả kỹ thuật
 
-- duplicate sequence và lost update;
-- cross-request data leakage;
-- log/correlation không đáng tin;
-- behavior thay đổi theo scheduler;
-- không có recovery contract sau crash.
+- trùng lặp sequence và mất cập nhật (lost update);
+- rò rỉ dữ liệu chéo giữa các request;
+- log và dữ liệu tương quan không đáng tin;
+- hành vi thay đổi theo bộ lập lịch (scheduler);
+- không có cam kết phục hồi sau sự cố.
 
 ### Hậu quả nghiệp vụ
 
-- customer nhận draft chứa identifier của customer khác;
-- downstream dedup/correlation có thể gộp nhầm operation;
-- audit và incident reconstruction sai;
-- rủi ro riêng tư nếu shared field chứa dữ liệu nhạy cảm.
+- khách hàng nhận bản nháp chứa định danh của khách hàng khác;
+- hệ thống phía sau (downstream) khi loại bỏ trùng lặp/tương quan có thể gộp sai thao tác;
+- kiểm toán và tái hiện sự cố sai;
+- rủi ro riêng tư nếu field dùng chung chứa dữ liệu nhạy cảm.
 
-## Vì sao lỗi khó tái hiện bằng unit test thường
+## Vì sao lỗi khó tái hiện bằng kiểm thử đơn vị thông thường
 
-Một unit test tuần tự luôn tạo ra thứ tự hoàn chỉnh:
+Một kiểm thử đơn vị (unit test) tuần tự luôn tạo ra thứ tự hoàn chỉnh:
 
 ```text
 call A hoàn tất → call B bắt đầu
 ```
 
-Test như vậy không tạo được cửa sổ giữa bước đọc và bước ghi. Regression test
+Test như vậy không tạo được cửa sổ giữa bước đọc và bước ghi. Kiểm thử hồi quy
 cần barrier hoặc latch để chủ động điều phối thứ tự xen kẽ; xem
 [phần kiểm thử](experiments.md).

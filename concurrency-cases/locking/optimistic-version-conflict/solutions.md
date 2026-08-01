@@ -1,19 +1,19 @@
-# Giải pháp Chuẩn mực: Dùng `@Version` và Hợp Đồng Ký Kết (Expected-version)
+# Kiến trúc khắc phục: Tích hợp `@Version` và cơ chế đối chiếu phiên bản kỳ vọng
 
-## 1. Nâng cấp Class Entity (Có cột Version)
+## 1. Tái cấu trúc lược đồ database và entity
 
-Đầu tiên, phải chạy kịch bản (migration) sửa Database:
+Tiến trình đầu tiên yêu cầu xây dựng tệp migration để cấu trúc lại database:
 
 ```sql
 alter table product_offer add column version bigint;
--- Nhét số 0 vào mấy dòng cũ cho khỏi lỗi
+-- Khởi tạo giá trị an toàn cho các bản ghi hiện hữu
 update product_offer set version = 0 where version is null;
 alter table product_offer alter column version set not null;
 ```
 
-(Nhớ là khi đang chuyển giao Code Cũ và Code Mới, ông Code Cũ nào viết SQL mà không tự tăng `version` là vỡ mồm cả lũ đấy nhé).
+(Lưu ý: Trong giai đoạn chuyển giao, tất cả các tác vụ xử lý SQL thủ công không chứa logic gia tăng `version` sẽ phá vỡ tính nhất quán của hệ thống.)
 
-Tiếp theo, cập nhật Class Entity:
+Cập nhật lớp entity:
 
 ```java
 @Entity
@@ -29,33 +29,33 @@ public class ProductOffer {
     @Column(nullable = false)
     private String title;
 
-    @Version // Bùa hộ mệnh đây rồi!
+    @Version // Khai báo cột kiểm soát khóa lạc quan
     @Column(nullable = false)
     private long version;
 
     protected ProductOffer() {
     }
 
-    // Chỉ viết hàm LẤY (get), TUYỆT ĐỐI KHÔNG VIẾT HÀM GÁN (set) cho version!
+    // Chỉ cung cấp phương thức getter, NGHIÊM CẤM khai báo phương thức setter cho version!
     public long version() {
         return version;
     }
 
     public void changePrice(BigDecimal newPrice) {
         if (newPrice == null || newPrice.signum() < 0) {
-            throw new IllegalArgumentException("Giá bị âm kìa ba");
+            throw new IllegalArgumentException("Tham số giá không hợp lệ");
         }
         price = newPrice;
     }
 }
 ```
 
-Từ giờ, việc tăng `version` hãy để Hibernate (Quản gia) tự lo.
+Trách nhiệm cập nhật chỉ số `version` được giao phó hoàn toàn cho hệ thống quản trị bền vững (Hibernate/JPA).
 
-## 2. Ép Client phải mang "Dữ liệu Kỳ vọng" (Expected Version) lên
+## 2. Thiết lập giao thức ràng buộc với phía gọi (DTO phiên bản kỳ vọng)
 
 ```java
-// Bắt buộc Client phải truyền lên cái version mà nó đang nhìn thấy
+// Yêu cầu payload từ phía gọi đính kèm phiên bản đối chiếu
 public record ChangeOfferPrice(
         long offerId,
         long expectedVersion,
@@ -65,7 +65,7 @@ public record ChangeOfferPrice(
 }
 ```
 
-Và đây là cách Service phòng thủ:
+Kiến trúc phòng thủ tại tầng dịch vụ:
 
 ```java
 @Service
@@ -84,29 +84,29 @@ public class OfferEditor {
                         new OfferNotFoundException(command.offerId())
                 );
 
-        // Chặn cửa sổ thứ 1 (Form của Client đã ôi thiu)
+        // Ngăn chặn rủi ro gián đoạn (trạng thái hiển thị tại phía gọi đã lỗi thời)
         if (offer.version() != command.expectedVersion()) {
             throw new StaleOfferEditException(
                     command.offerId(),
-                    command.expectedVersion(), // Client nghĩ là...
-                    offer.version()            // Nhưng DB lại đang là...
+                    command.expectedVersion(), // Phiên bản phía gọi truyền tải
+                    offer.version()            // Phiên bản thực tế tại database
             );
         }
 
         offer.changePrice(command.newPrice());
         offers.flush();
-        // Lệnh UPDATE sẽ có thêm cái đuôi WHERE version=? chặn Cửa sổ thứ 2
+        // Phương thức UPDATE sẽ tự động chứa truy vấn WHERE version=?
         return OfferView.from(offer);
     }
 }
 ```
 
-> **Nói ngắn gọn:** Bạn check `expectedVersion` để đỡ đạn cho việc "Client treo máy đi cafe". Còn `@Version` của Hibernate giúp đỡ đạn cho trường hợp "Hai Request lao vào DB cùng 1 mili-giây". Thiếu một trong hai là nát bét.
+> **Nguyên tắc cốt lõi:** So khớp `expectedVersion` để đối phó với hiện tượng độ trễ giao diện từ phía người dùng. Annotation `@Version` của Hibernate phụ trách giám sát sự tương tranh tính bằng mili-giây tại database. Cả hai lớp phòng thủ là bắt buộc.
 
-## 3. Quăng Exception cho Kẻ Thua Cuộc
+## 3. Quản trị ngoại lệ cạnh tranh thất bại
 
 ```sql
--- Dưới gầm DB nó chạy câu này
+-- Truy vấn sinh ra bởi hệ thống
 update product_offer
 set price = :price,
     title = :title,
@@ -115,25 +115,25 @@ where offer_id = :id
   and version = :version;
 ```
 
-Ai chạy chậm, trả về `0` dòng -> Hibernate lập tức quăng `OptimisticLockException` (Spring thường bọc lại thành `ObjectOptimisticLockingFailureException`). Cái Exception này bắt buộc phải văng ra khỏi ranh giới hàm (thoát transaction) để Giao Dịch được dọn dẹp sạch sẽ (rollback).
+Khi luồng chậm hơn thực thi, số bản ghi trả về bằng `0`, Hibernate kích hoạt ngoại lệ `OptimisticLockException` (được Spring bao bọc trong `ObjectOptimisticLockingFailureException`). Sự kiện này phải được truyền ngược lại ra ngoài ranh giới transaction để tiến hành giải phóng tài nguyên (rollback).
 
-## 4. Báo cho Client bằng mã Lỗi chuẩn (API mapping)
+## 4. Ánh xạ ngoại lệ sang quy chuẩn API
 
 ```java
 @RestControllerAdvice
 public class OfferConflictAdvice {
 
-    // Bắt một lượt cả 2 loại Lỗi Đụng Độ
+    // Thu thập toàn bộ các trường hợp xung đột trạng thái
     @ExceptionHandler({
             StaleOfferEditException.class,
             ObjectOptimisticLockingFailureException.class
     })
     ResponseEntity<ProblemDetail> conflict(RuntimeException failure) {
         ProblemDetail problem = ProblemDetail.forStatus(
-                HttpStatus.PRECONDITION_FAILED // Trả mã 412
+                HttpStatus.PRECONDITION_FAILED // Mã tiêu chuẩn 412
         );
-        problem.setTitle("Có người nhanh tay sửa mất rồi!");
-        problem.setProperty("reloadRequired", true); // Báo Client tải lại màn hình
+        problem.setTitle("Phiên bản dữ liệu không hợp lệ. Bản ghi đã bị sửa đổi.");
+        problem.setProperty("reloadRequired", true); // Tín hiệu định hướng phía gọi
         return ResponseEntity
                 .status(HttpStatus.PRECONDITION_FAILED)
                 .body(problem);
@@ -141,52 +141,52 @@ public class OfferConflictAdvice {
 }
 ```
 
-Đừng bao giờ nhổ toẹt cái Object ôi thiu trả về như thể là thao tác đã thành công nhé! Nếu Client xài Header `If-Match` thì trả mã `412 Precondition Failed` là đẹp nhất. Mã `409 Conflict` cũng hợp lý tùy Gu của công ty.
+Tuyệt đối tránh việc trả về cấu trúc đối tượng (DTO/entity) bị lỗi thời dưới dạng HTTP `200 Success`. Sử dụng tiêu chuẩn `412 Precondition Failed` kết hợp ETag (If-Match) hoặc mã `409 Conflict` tùy thuộc vào thiết kế API.
 
-## 5. Ranh giới Xả (Flush) và Chốt (Commit)
+## 5. Ranh giới đồng bộ và xác nhận (flush và commit)
 
-Gọi `flush()` ngay trong hàm giúp bạn tóm được Exception sớm. Nhưng nhớ là hàm đó chạy xong, chui ra đến cửa cái Proxy thì DB mới thực sự gọi lệnh Chốt (Commit). Việc `catch` lỗi Đụng Độ bắt buộc phải nằm ở vòng ngoài cùng (Controller hoặc Advice), chứ ĐỪNG thọc tay `catch` bên trong Transaction và cố chấp chạy tiếp.
+Triển khai `flush()` chủ động trong phạm vi phương thức giúp phân giải ngoại lệ sớm nhất. Tuy nhiên, hành động commit chỉ được điều phối tại vùng biên ngoài cùng của Spring proxy. Tiến trình bắt lỗi (try-catch) phải được bố trí tại các lớp cấp cao (controller/advice), không can thiệp sâu vào bên trong transaction đã phát sinh xung đột.
 
-## 6. Tránh xài `merge` với DTO ngoài đường (Detached merge)
+## 6. Hạn chế phụ thuộc vào `merge` trên thực thể tách rời
 
-Thay vì bốc nguyên cái cục DTO của Client ép thành Entity rồi ném vào hàm `merge()`:
+Việc truyền DTO trực tiếp thành dạng entity tách rời và gọi `merge()` gây ra các nhược điểm sau:
 
-- Rất dễ dính đòn "Cập nhật lố" (mass assignment - Client gửi bậy id/role cũng bị sửa).
-- Vô tình đụng tới những Object con lằng nhằng (cascade).
-- Lỗi khó bắt hơn vì Hibernate delay việc kiểm tra.
+- Phát sinh rủi ro cập nhật dữ liệu ngoài ý muốn (mass assignment).
+- Tương tác không kiểm soát tới các thực thể con phụ thuộc (phụ thuộc lan truyền).
+- Bỏ qua hoặc làm chậm nhịp độ kiểm tra version.
 
-Hãy Mapping bằng tay (DTO -> Managed Entity đang nằm trên RAM) và so sánh Version rành rọt. Viết code dài hơn 3 dòng nhưng đổi lại Giấc ngủ ngon.
+Chiến lược chuẩn xác là ánh xạ thủ công từ DTO của phía gọi lên thực thể được quản lý vừa được tải từ database, đồng thời kiểm tra version thủ công. Thiết kế này bảo đảm tính an toàn tối đa.
 
-## 7. Pháp Sư chơi hệ SQL thuần (Bulk/native writers)
+## 7. Yêu cầu cấu trúc dành cho truy vấn SQL thuần / cập nhật hàng loạt
 
-Bắt buộc phải xài SQL chay à? Cứ việc, nhưng phải tuân thủ Luật Chơi:
+Khi áp dụng phương thức thao tác không qua ORM:
 
 ```sql
 update product_offer
 set price = :newPrice,
-    version = version + 1 -- Phải tự cộng!
+    version = version + 1 -- Bắt buộc tích hợp thuật toán gia tăng phiên bản
 where offer_id = :id
-  and version = :expectedVersion; -- Phải tự Check!
+  and version = :expectedVersion; -- Đính kèm mệnh đề giám sát
 ```
 
-Chạy xong nhớ tự bắt `affected rows == 0` rồi dội Exception. Khuyến cáo không nên chạy mấy lệnh kiểu này song song với các luồng xài JPA thông thường nếu không Test kỹ.
+Hệ thống phải tự định nghĩa phương thức xác thực `affected rows == 0` và khởi chạy exception giả lập. Lập trình viên cần giới hạn kỹ thuật này trong hệ thống hỗn hợp nếu không có quy trình integration test nghiêm ngặt.
 
-## 8. CẤM tự động Thử Lại (Auto-retry) Hành vi của User
+## 8. Nguyên tắc cấm tự động thử lại đối với thay đổi từ người dùng
 
-Quy trình vàng cho Màn hình nhập liệu (User edit):
+Quy trình chuẩn cho chức năng chỉnh sửa từ người dùng:
 
 ```text
-Kẻ đến trước (Winner) → Chốt sổ thành công (commit), trả về version mới.
-Kẻ đến sau (Loser)  → Dọn dẹp phế tích (rollback), báo lỗi bắt User tự F5 tải lại form.
+Transaction đến trước (chiến thắng) → Hoàn tất commit, trả về phiên bản hệ thống mới.
+Transaction chậm (thua cuộc)  → Rollback toàn bộ, truyền thông báo yêu cầu phía gọi hợp nhất / tải lại trang.
 ```
 
-Trừ khi bạn cập nhật mấy cái thứ như "Đếm View", "Cộng Trừ Điểm Tích Lũy" (thứ mà kết quả không phụ thuộc vào trạng thái cũ), thì mới được phép thiết kế vòng lặp Retry tự động. (Muốn code Retry an toàn, đọc thêm `LOCK-002`).
+Ngoại trừ các thao tác mang tính chất bù trừ không phụ thuộc trạng thái cũ (ví dụ: thống kê số lượng truy cập, thay đổi khoảng giá trị - chỉnh sửa tương đối), mọi thao tác cập nhật giá trị tuyệt đối không được cấp quyền chạy vòng lặp retry. (Tham khảo phân tích tự động thử lại tại `LOCK-002`).
 
-## 9. Những Binh Khí Khác (Phương án thay thế)
+## 9. Đánh giá các biện pháp thay thế
 
-### Cập nhật chèn điều kiện (Conditional compare-and-set)
+### Cập nhật so sánh và gán có điều kiện (CAS)
 
-Nếu không xài Entity Manager của JPA:
+Dành cho hệ thống không áp dụng JPA:
 
 ```sql
 update product_offer
@@ -194,52 +194,52 @@ set price = :price,
     version = version + 1
 where offer_id = :id
   and version = :expectedVersion
-returning version; -- Lấy luôn version mới nhét vào log
+returning version; -- Trích xuất phiên bản mới nhất
 ```
 
-Nó hoàn toàn tương đương Khóa Lạc Quan, chỉ khác là bạn phải tự gõ SQL.
+Hoạt động theo nguyên tắc đồng nhất với khóa lạc quan nhưng thực thi trên hạ tầng SQL trực tiếp.
 
-### Khóa Bi Quan `FOR UPDATE`
+### Khóa bi quan `FOR UPDATE`
 
-Nghĩa là "Khóa ngay từ lúc Đọc". Kẻ đến sau sẽ bị Block treo máy đợi kẻ trước làm xong. Dùng trò này bạn vẫn phải bắt Client truyền cái `expected version` lên để biết nó có bấm form cũ hay không. Dùng cẩn thận coi chừng quá giờ (timeout) và Khóa chéo (deadlock).
+Thực thi cấp phát khóa đồng bộ ngay tại thời điểm đọc (khóa đọc). Transaction tiếp cận sau phải đi vào hàng chờ giải phóng. Bắt buộc kết hợp với phiên bản kỳ vọng từ phía gọi. Giải pháp này gây nguy cơ thắt cổ chai và deadlock ở quy mô cao.
 
-### Cập nhật "Tương đối" (Atomic domain SQL)
+### Cập nhật tương đối bằng toán tử nguyên tử
 
-Thay vì SET thẳng giá = 90, bạn cập nhật kiểu "Tăng giá cũ thêm 5%" (`price = price * 1.05`). Cách này rất đỉnh cao cho một số Logic đặc thù, nhưng không xài được cho các màn hình Admin Form nhập liệu.
+Thay vì thiết lập cấu trúc thay thế "Giá = 90", cấu trúc mệnh đề "Giá = Giá cũ + 5%" (`price = price * 1.05`). Phương pháp đặc thù phù hợp cho logic tài chính nhưng hạn chế đối với quản trị dữ liệu đầu vào từ biểu mẫu.
 
-### Chế độ `SERIALIZABLE`
+### Mức độ cách ly `SERIALIZABLE`
 
-Bật chế độ này thì DB lo hết rủi ro. Tuy nhiên, hiệu năng sẽ bị bóp nghẹt và code của bạn lúc nào cũng phải chực chờ DB dội lỗi `40001` (Serialization Failure) để... chạy lại toàn bộ luồng từ đầu.
+Môi trường database quản lý toàn bộ xung đột và giải quyết các bài toán hiện tượng phantom/read skew. Đánh đổi bằng hiệu suất giảm sút nghiêm trọng và buộc hệ thống luôn trong trạng thái tiếp nhận ngoại lệ `40001` (lỗi tuần tự hóa) để tự tái chạy các tác vụ liên đới.
 
-## 10. Bảng Sinh Tử (Failure behavior)
+## 10. Ma trận xử lý hành vi lỗi
 
-| Tình Huống | Ở dưới Database | Trên API / Ứng Dụng |
+| Biến cố transaction | Xử lý tại database | Xử lý tại ứng dụng / API |
 | --- | --- | --- |
-| Version khớp ngon lành | Chỉnh `1` dòng, version tăng | Gửi Success + kèm Version Mới Nhất |
-| Client mang data thiu | SQL UPDATE bị chặn không chạy | Trả mã `412/409`, xúi Client F5 đi |
-| Đua nhau sát nút (Race) | Chỉnh `0` dòng, Rollback ráo | Báo Lỗi Xung đột Lạc Quan |
-| Quá giờ chờ (Timeout) | Rollback Giao Dịch | Báo Lỗi Kỹ Thuật (Đừng xúi Client F5) |
-| Thằng Sửa đụng Thằng Xóa | Chỉnh `0` dòng | Báo lỗi Không Tìm Thấy (Not Found) / Conflict |
-| Máy chủ sập trước lúc chốt | DB dọn dẹp (Rollback) | Lệnh chưa vào, có thể thử lại |
-| Sập sau chốt, chưa kịp báo | Lệnh đã vô DB | Phải có Mã Request ID để tra cứu xem xong chưa |
+| Đối chiếu phiên bản thành công | Thay đổi `1` bản ghi, version tự tăng | Phản hồi thành công đi kèm version cập nhật |
+| Yêu cầu từ phía gọi lỗi thời | Truy vấn UPDATE bị từ chối | Ánh xạ HTTP `412/409`, yêu cầu đồng bộ dữ liệu |
+| Tình trạng tương tranh | Sửa đổi `0` dòng, transaction rollback | Báo cáo xung đột lạc quan |
+| Giới hạn thời gian (timeout) | Hủy ngang transaction | Ghi nhận lỗi hệ thống cục bộ |
+| Đụng độ thao tác xóa | Sửa đổi `0` dòng | Ghi nhận cấu trúc lỗi dữ liệu không tìm thấy |
+| Trục trặc máy chủ trước commit | PostgreSQL thu hồi thay đổi | Báo cáo giao dịch chưa hoàn tất |
+| Trục trặc máy chủ sau commit | Dữ liệu tích hợp an toàn | Cần ID tính lũy đẳng (idempotency) hỗ trợ tra cứu tiến trình |
 
-## 11. Bảng Cân Nhắc Lợi Hại (Trade-off)
+## 11. Bảng ma trận đánh đổi kiến trúc
 
-| Binh Khí | Sự Đúng Đắn | Mức Kẹt Xe (Contention) | Độ Trễ (Latency) | Khả năng chạy Đa Server |
+| Kỹ thuật bảo mật | Tính toàn vẹn | Khả năng tranh chấp | Độ trễ (latency) | Khả năng mở rộng nhiều instance |
 | --- | --- | --- | --- | --- |
-| **`@Version` (Lạc Quan)** | Phát hiện Ghi Đè cực tốt | **Đọc thoải mái không Lock** | Nổ lỗi vào phút chót | Ngon lành |
-| SQL Có Điều Kiện (CAS) | Tương đương @Version | Nhẹ nhàng y chang | Nổ lỗi ở từng câu lệnh | Ngon lành |
-| Khóa Bi Quan `FOR UPDATE` | Ép người ta xếp hàng | **Gây kẹt xe, dội bom DB** | Phải đứng chờ (Wait) | Ngon lành |
-| Khóa Nhốt `synchronized` | Chỉ lừa trẻ con | Ai gọi trúng máy mình thì đợi | Không bảo vệ được DB | **Tạch** |
+| **`@Version` (Khóa lạc quan)** | Phát hiện ghi đè tối đa | **Không áp đặt khóa khi đọc** | Phát sinh lỗi tại pha commit | Hiệu quả cao |
+| So khớp thuần SQL (CAS) | Tương đồng `@Version` | Tương đồng `@Version` | Phát sinh lỗi trong truy vấn con | Hiệu quả cao |
+| `FOR UPDATE` (Khóa bi quan) | Hàng đợi đồng bộ cao | **Gây rủi ro quá tải / thắt cổ chai** | Dễ dàng sinh trễ luồng xử lý | Hiệu quả cao |
+| Khóa cục bộ (`synchronized`) | Vô nghĩa | Khóa luồng tại một tiến trình đơn | N/A | **Thất bại toàn diện** |
 
-## 12. Bùa Chú Trước Khi Lên Môi Trường Thật (Checklist Production)
+## 12. Danh mục kiểm tra cho môi trường thực tế
 
-- [ ] Cột Version dưới DB đã gắn cờ `NOT NULL`, Class Entity dùng đúng `@Version`, và KHÔNG có hàm gán (setter).
-- [ ] API đã bắt Client nộp thuế (truyền lên cái Expected Version / ETag).
-- [ ] Soi thử câu SQL chạy ra thấy có cái đuôi kiểm tra và cộng Version.
-- [ ] Các thanh niên viết SQL chay (batch/native) đã bị gõ đầu phải nhét logic tăng Version vào code của chúng nó.
-- [ ] Block try/catch Xung Đột nằm LỚP NGOÀI CÙNG, chứ không dính dáng gì đến cái Giao Dịch đã sập hầm.
-- [ ] Không có cái tính năng ngu xuẩn nào tự động Retry bắt Code thay mặt User gõ phím.
-- [ ] Gửi Response Thành Công chỉ khi Database gật đầu cái rụp (Commit).
-- [ ] Mấy cái Đồ Thị (Metrics) log lỗi không được chứa High-Cardinality (ví dụ: cấm log mã sản phẩm vào Label của Prometheus làm nổ RAM).
-- [ ] Code Test chạy bằng PostgreSQL thật (Testcontainers) và moi được Dữ liệu cuối cùng ra đối chiếu.
+- [ ] Thuộc tính version cấp phát cờ `NOT NULL`, loại bỏ hàm setter khỏi entity.
+- [ ] Thiết kế kiến trúc API tiếp nhận giá trị phiên bản kỳ vọng (ETag).
+- [ ] Phân tích log SQL xác minh khối lượng truy vấn chứa mệnh đề `AND version=?`.
+- [ ] Tệp tin script/batch ngoại vi được tích hợp logic tự động cập nhật phiên bản.
+- [ ] Khối bắt lỗi `try/catch` dành cho tranh chấp định vị ngoài ranh giới transaction ảo.
+- [ ] Nghiêm cấm ứng dụng hệ thống thử lại tự động trên các biểu mẫu dữ liệu nhập của người dùng.
+- [ ] Phản hồi API thành công (HTTP 2xx) chỉ khả thi nếu database hoàn thành pha commit.
+- [ ] Không cấp phát các định dạng thông tin có tính duy nhất cao (high-cardinality) vào công cụ đo chỉ số metrics.
+- [ ] Bộ bài kiểm thử integration được cấu hình thông qua container database vật lý thay thế H2.

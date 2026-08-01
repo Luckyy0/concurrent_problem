@@ -1,18 +1,18 @@
-# Giải Pháp Tối Thượng: Đánh Nhanh Rút Gọn, Chờ Có Giới Hạn và Xác Nhận Lại
+# Giải Pháp Thiết Kế: Ranh Giới Giao Dịch, Giới Hạn Chờ Và Tái Thẩm Định
 
-## 1. Mục tiêu tối thượng (Mục tiêu thiết kế)
+## 1. Tiêu Chuẩn Kiến Trúc Tối Ưu (Design Principles)
 
-Để code chạy mượt mà không dẫm đạp lên nhau, con đường chân lý phải thỏa mãn 7 điều răn sau:
+Kiến trúc xử lý tương tranh dựa trên cơ chế Khóa Bi Quan cần đảm bảo 7 nguyên lý toàn vẹn:
 
-1. **Giật Khóa Dưới DB** trước khi bắt não Suy Nghĩ phán quyết.
-2. Lệnh Xin Khóa và Lệnh Lưu Dữ Liệu phải nằm **chung 1 Giao Dịch (Transaction)**.
-3. Kẻ đi sau (waiter) vớ được Khóa thì phải **Đọc lại Dữ Liệu Mới** (Revalidate) chứ không xài đồ cũ.
-4. Kẹt Khóa thì phải **có Hẹn Giờ** (Bounded wait), quá giờ là tự hủy, không để treo máy.
-5. Tuyệt đối **KHÔNG gọi API ngoài** (Remote I/O) khi đang ôm Khóa.
-6. Mua nhiều ghế phải **Xếp Hàng từ bé đến lớn** (Stable order) để chống kẹt chéo (Deadlock).
-7. Bấm lưu đúp 2 lần (Duplicate command) và Tranh nhau 1 ghế (Contention) là 2 bài toán hoàn toàn khác nhau, phải trị riêng!
+1. **Khóa Độc Quyền (Lock Acquisition):** Khởi tạo `FOR UPDATE` trước khi chuyển hướng luồng xử lý nghiệp vụ.
+2. **Nguyên Tắc Kèm Cặp (Atomicity):** Pha Đọc Khóa và Ghi Dữ Liquy bắt buộc phải hoạt động bên trong 1 Giao dịch duy nhất.
+3. **Tái Thẩm Định (Revalidation):** Tiến trình tiếp nhận Khóa (Waiter) phải truy xuất dữ liệu từ Snapshot mới nhất sau khi tiếp quản.
+4. **Giới Hạn Chờ Kẹt (Bounded Wait):** Bắt buộc cấu hình ngưỡng Timeout CSDL (`lock_timeout`) để triệt tiêu hiện tượng treo hệ thống.
+5. **Cấm Kết Nối Ngoại Vi (No Remote I/O):** Loại bỏ mọi thao tác gọi API ngoài biên phạm vi Giao dịch đang giữ Khóa.
+6. **Thứ Tự Sắp Xếp Đơn Điệu (Stable Lock Ordering):** Sắp xếp chuỗi tham số (Ví dụ: Định danh tăng dần) để loại trừ triệt để Khóa Chéo (Deadlock).
+7. **Phân Tách Xử Lý Trùng (Idempotency):** Áp dụng giải pháp Cấu trúc Ràng buộc riêng biệt cho các yêu cầu lặp (Duplicate Request), tách bạch với xung đột Cạnh tranh.
 
-## 2. Lưới Phòng Ngự Cuối Cùng Dưới DB (Schema & Defense in Depth)
+## 2. Thiết Lập Ràng Buộc Cơ Sở (Schema Defense in Depth)
 
 ```sql
 create table show_seat (
@@ -49,16 +49,17 @@ create table seat_hold (
     check (status in ('ACTIVE', 'EXPIRED', 'CANCELLED', 'CONVERTED'))
 );
 
+-- Ràng buộc cốt lõi ngăn ngừa trạng thái Cấp Phát Trùng
 create unique index uq_seat_hold_one_active
     on seat_hold (show_id, seat_no)
     where status = 'ACTIVE';
 ```
 
-Cái `Unique Index` kia chính là "Bùa Hộ Mệnh". Lỡ may code Java quên xin Khóa, thằng nào chạy update chậm hơn sẽ bị DB vả vỡ mặt (Technical conflict). Nhưng đừng ỷ lại vào nó, vì nó quăng lỗi "DB nổ" chứ không phải lỗi "Ghế đã bán" lịch sự đâu! Kẻ thua cuộc (loser) chết muộn quá, trong khi con đường Xin Khóa xịn xò sẽ giúp ta đọc được Dữ liệu mới và trả về `ALREADY_HELD` nhẹ nhàng hơn.
+Chỉ mục `Unique Index` đóng vai trò phòng ngự tuyến cuối (Technical conflict). Nếu một lỗi phần mềm bỏ qua bước Yêu Cầu Khóa, CSDL vật lý sẽ tự động đình chỉ tiến trình. Việc này hạn chế khả năng kiểm soát mã lỗi định hướng người dùng (`ALREADY_HELD`), do vậy cơ chế Yêu Cầu Khóa (Lock) vẫn là lớp bảo vệ thiết yếu số 1.
 
-Ghế đã giữ quá hạn (Expired hold) phải được quét dọn về KHÔNG ACTIVE ngay trong cái Transaction đó trước khi chèn thêm vé giữ ghế mới.
+Yêu cầu giữ chỗ quá hạn (Expired hold) cần được cập nhật trạng thái `EXPIRED` trước khi hệ thống chấp thuận chèn dữ liệu giữ chỗ mới cho cùng tài nguyên.
 
-## 3. Class Java Chống Đạn (Aggregate state)
+## 3. Kiến Trúc Thực Thể Hợp Nhất (Aggregate State)
 
 ```java
 @Entity
@@ -86,7 +87,7 @@ public class ShowSeat {
 
     void releaseExpiredHold() {
         if (state != SeatState.HELD) {
-            throw new IllegalStateException("seat is not held");
+            throw new IllegalStateException("Cấu trúc sai lệch: Bản ghi chưa được cấp phát");
         }
         state = SeatState.AVAILABLE;
         holdId = null;
@@ -96,7 +97,7 @@ public class ShowSeat {
 
     void hold(UUID newHoldId, long customerId, Instant until) {
         if (state != SeatState.AVAILABLE) {
-            throw new IllegalStateException("seat is not available");
+            throw new IllegalStateException("Cấu trúc sai lệch: Bản ghi không khả dụng");
         }
         state = SeatState.HELD;
         holdId = newHoldId;
@@ -110,20 +111,20 @@ public class ShowSeat {
 }
 ```
 
-Nhắc lại: KHÔNG CẦN `@Version` (Khóa Lạc Quan) để cách làm Bi Quan này hoạt động. Việc nhét bừa `@Version` vào "cho chắc ăn" chả giải quyết được gì ngoài việc làm cho hệ thống thêm rối rắm (vì mọi code viết ra đều phải bắt được lỗi Lạc Quan). Khóa Bi Quan tự nó đã đủ mạnh rồi!
+Ghi chú: Việc áp dụng đồng thời Khóa Lạc Quan (`@Version`) trong hệ thống này là dư thừa. Cơ chế Khóa Bi Quan đã cung cấp lớp cô lập đủ mức an toàn, việc bổ sung thuộc tính Version chỉ gia tăng chi phí vận hành (Overhead) mà không mang lại giá trị tương xứng.
 
-## 4. Xin Khóa Qua Spring Data JPA (Locking repository)
+## 4. Tích Hợp Repository Mức JPA (Locking Repository)
 
 ```java
 public interface ShowSeatRepository
         extends JpaRepository<ShowSeat, ShowSeatId> {
 
-    // Chiêu thức 1: Xin khóa 1 ghế (JPA tự sinh FOR UPDATE)
+    // Kỹ thuật 1: Áp dụng Khóa đối với dữ liệu Đơn Bản Ghi
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select s from ShowSeat s where s.id = :id")
     Optional<ShowSeat> findForUpdate(@Param("id") ShowSeatId id);
 
-    // Chiêu thức 2: Xin khóa NHIỀU GHẾ (Viết SQL thuần để ép Sort chống kẹt)
+    // Kỹ thuật 2: Xử lý Đa Bản Ghi (SQL Thuần kèm cấu trúc Mệnh Lệnh Sắp Xếp)
     @Query(value = """
             select *
             from show_seat
@@ -139,13 +140,12 @@ public interface ShowSeatRepository
 }
 ```
 
-Lệnh `findForUpdate` chạy ghế đơn dùng JPA `PESSIMISTIC_WRITE` cực tiện. Với query hốt nhiều dòng, ta viết hẳn SQL thuần có chữ `ORDER BY ... FOR UPDATE` cho rõ ràng, dễ log ra mà theo dõi. Danh sách ghế đầu vào cũng phải loại bỏ trùng lặp đi nhé.
+Sử dụng `PESSIMISTIC_WRITE` cho bản ghi đơn. Đối với tập bản ghi, sử dụng `ORDER BY ... FOR UPDATE` trong cấu trúc Native Query để triệt tiêu nguy cơ Deadlock.
+Truy vấn này bắt buộc phải thi hành trong một khung Giao dịch (Transaction) đang hoạt động. Việc thiếu vắng cấu trúc Transaction sẽ vô hiệu hóa hoàn toàn cơ chế Khóa.
 
-Lệnh này BẮT BUỘC phải nằm bên trong 1 Giao Dịch (Transaction) đang chạy. Đừng có gắn `@Transactional` hời hợt ở mức Repository, lấy data ra là Khóa bị tuột mất tiêu luôn đấy!
+## 5. Cấu Hình Giới Hạn Thời Gian Chờ (Lock Timeout)
 
-## 5. Hẹn Giờ Bom Nổ Dưới Postgres (`lock_timeout`)
-
-JPA có cái thẻ cấu hình Timeout, nhưng nó chạy hên xui tùy Driver/Provider. Để chắc cú với PostgreSQL, ta phang thẳng câu lệnh này:
+Nhằm đảm bảo cơ chế giới hạn thời gian (Timeout) được vận hành ổn định trên nền tảng PostgreSQL (không phụ thuộc vào Provider), hệ thống sử dụng cấu hình cục bộ thông qua Native Query:
 
 ```java
 @Component
@@ -159,10 +159,10 @@ public class PostgreSqlLockTimeout {
     public void apply(Duration timeout) {
         long millis = timeout.toMillis();
         if (millis < 1 || millis > 5_000) {
-            throw new IllegalArgumentException("lock timeout out of range");
+            throw new IllegalArgumentException("Khung thời gian Timeout ngoài giới hạn an toàn");
         }
 
-        // Cài đồng hồ đếm ngược cho cái Giao Dịch hiện tại
+        // Thiết lập Timeout giới hạn trong phiên Giao dịch hiện hành
         entityManager.createNativeQuery("""
                 select set_config('lock_timeout', :value, true)
                 """)
@@ -172,9 +172,9 @@ public class PostgreSqlLockTimeout {
 }
 ```
 
-Tham số `true` cực kỳ quan trọng: Nó bảo DB "chỉ cài đồng hồ cho cái Giao dịch hiện tại thôi, Giao dịch khác kệ nó". Con số Timeout phải là tham số thiết lập sẵn đàng hoàng, đừng lấy linh tinh từ Payload của User ném xuống.
+Thuộc tính `true` (IS_LOCAL) quy định mức độ áp dụng của thiết lập này chỉ dành riêng cho ngữ cảnh Giao dịch đang được kết nối. Tham số Timeout cần được định nghĩa hệ thống (Hardcoded/Config), không mở cho phía gọi can thiệp.
 
-## 6. Người Hùng Đứng Mũi Chịu Sào (Transactional worker)
+## 6. Thiết Kế Proxy Điều Phối Giao Dịch (Transactional Worker)
 
 ```java
 @Service
@@ -204,14 +204,14 @@ public class SeatHoldTx {
             isolation = Isolation.READ_COMMITTED
     )
     public HoldResult execute(HoldSeatCommand command) {
-        // 1. Gài bom 750 mili-giây
+        // 1. Áp dụng cơ chế Timeout giới hạn (Ví dụ: 750ms)
         lockTimeout.apply(Duration.ofMillis(750));
 
-        // 2. Phá cửa xin Khóa! (Nếu kẹt sẽ phải đứng chờ ở đây)
+        // 2. Yêu cầu Cấp Khóa Độc Quyền (Chuyển sang trạng thái Wait nếu đụng độ)
         ShowSeat seat = seats.findForUpdate(command.seatId())
                 .orElseThrow(SeatNotFoundException::new);
 
-        // 3. Đọc được Data Mới rồi, chống Spam Click trước:
+        // 3. Tái Thẩm Định: Chống tấn công Lặp Lệnh (Idempotency Check)
         Optional<SeatHold> replay =
                 holds.findByCommandId(command.commandId());
         if (replay.isPresent()) {
@@ -222,13 +222,13 @@ public class SeatHoldTx {
 
         Instant now = clock.instant();
         
-        // 4. Nếu vé cũ đã Hết Hạn -> Đá văng thằng cũ ra
+        // 4. Giải phóng Trạng Thái Giữ Chỗ Đã Hết Hạn
         if (seat.hasExpiredHold(now)) {
             holds.expire(seat.currentHoldId(), now);
             seat.releaseExpiredHold();
         }
 
-        // 5. Nếu ghế đang bận (người đi trước đã ăn mất) -> Buông tay
+        // 5. Kiểm định Điều Kiện (Báo lỗi nếu đã bị Cấp Phát)
         if (seat.isHeldAndNotExpired(now)) {
             return HoldResult.alreadyHeld(seat.currentHoldId());
         }
@@ -236,29 +236,28 @@ public class SeatHoldTx {
             return HoldResult.sold();
         }
 
-        // 6. Ghế trống! Lên đỉnh thôi!
+        // 6. Thực thi quy trình Cập Nhật Trạng Thái
         UUID holdId = UUID.randomUUID();
         Instant holdUntil = now.plus(Duration.ofMinutes(2));
 
         seat.hold(holdId, command.customerId(), holdUntil);
         holds.save(SeatHold.active(holdId, command, holdUntil, now));
         
-        entityManager.flush(); // Đẩy xuống DB test thử Bùa Hộ Mệnh
+        // Đồng bộ hệ thống nhằm phát hiện tức thì các Ràng buộc Database
+        entityManager.flush(); 
 
         return HoldResult.held(holdId, holdUntil);
     }
 }
 ```
 
-Nhìn kỹ nhé: Entity được Tải Lên và Xin Khóa trong CÙNG MỘT HƠI THỞ (Persistence context). Nếu lỡ kẹt Khóa phải chờ, lúc chui vào được thì dữ liệu cũng được Đọc Mới (Revalidate). Gọi `flush()` để dụ cho các Lỗi DB bung bét ra ngay trong ruột cái hàm này, đừng để ra khỏi Proxy mới nổ.
+Kiến trúc liên kết quá trình cấp phát và tái thẩm định (Revalidate) thành một khối chặt chẽ (Persistence context). Yêu cầu gọi `flush()` ngay lập tức để đẩy độ trễ ngoại lệ (Exception Catch) về phạm vi nội hàm.
 
-Nếu kẻ gọi nó có sẵn Transaction dài ngoằng, từ khóa `REQUIRED` sẽ giật ngược cái Khóa này ra ăn vạ. Vì vậy, tốt nhất cái lớp ở ngoài API (Coordinator) KHÔNG ĐƯỢC PHÉP mở Transaction nào cả.
+Tham số `Propagation.REQUIRED` yêu cầu không được mở rộng Giao dịch tại phía gọi bên ngoài (Coordinator), để bảo đảm Vòng đời Giao dịch là nhỏ nhất.
 
-> **Nói ngắn gọn:** Annotation nhét ở Repository chỉ thiêng khi cái Service gọi nó tạo 1 cái Transaction trùm ôm trọn từ lúc Đọc Khóa đến lúc Lưu Xong (Commit).
+## 7. Xử Lý Phân Loại Ngoại Lệ (Exception Mapping)
 
-## 7. Người Dọn Rác (Coordinator map lỗi)
-
-Một khi bị Postgres chửi vì Lố Giờ hoặc Kẹt Cứng, cái Transaction coi như nát. Thằng `SeatHoldTx` cứ thế vứt lỗi thẳng ra ngoài cho Spring Rollback. Đứng ngoài hứng rác là ông Coordinator này:
+Tiến trình điều phối vòng ngoài hứng chịu các sự cố từ khối Giao dịch nội tại, tiến hành ánh xạ lỗi (Map) tới hệ thống HTTP:
 
 ```java
 @Component
@@ -275,17 +274,17 @@ public class SeatHoldCoordinator {
     }
 
     public HoldResult hold(HoldSeatCommand command) {
-        // Cấm tuyệt đối mở Transaction từ ngoài này!
+        // Áp đặt ràng buộc: Không thực thi dưới khung Giao dịch đã tồn tại
         if (TransactionSynchronizationManager.isActualTransactionActive()) {
             throw new IllegalStateException(
-                    "seat hold coordinator must run outside a transaction"
+                    "Cấu trúc sai lệch: Coordinator không được bao bọc bởi Transaction"
             );
         }
 
         try {
             return worker.execute(command);
         } catch (RuntimeException failure) {
-            // Lính chết thì dịch lỗi DB thành lỗi Kinh doanh lịch sự:
+            // Chuyển đổi trạng thái Lỗi Vật Lý sang Lỗi Dịch Vụ
             return classifier.classify(failure)
                     .map(kind -> HoldResult.busy(kind.name()))
                     .orElseThrow(() -> failure);
@@ -312,31 +311,29 @@ public class LockFailureClassifier {
 }
 ```
 
-Tuyệt đối đừng điên khùng biến mọi cái `RuntimeException` thành lỗi "Busy" giả trân. Bị đứt cáp DB hay Code Ngốc (Programming error) thì vẫn phải quăng lỗi 500 chửi sấp mặt! 
+Nguyên tắc hệ thống: Chỉ tiến hành ánh xạ (Catch & Map) đối với lỗi Liên quan Tới Khóa. Các lỗi phát sinh không mong muốn khác (Network Drop, System Crash) bắt buộc phải trả về mã lỗi 500 (Server Error). Việc lập lịch Thử lại (Retry) với lỗi `55P03` phải áp dụng các chiến lược Back-off độc lập tương đương bài toán `LOCK-002`.
 
-Và đừng nghĩ Retry lỗi `55P03` là khôn. Nếu muốn Retry, bạn phải code cơ chế Retry y chang cái vụ Khóa Lạc Quan `LOCK-002`: Reload mới, Backoff hở thời gian, Limit số lần đàng hoàng!
+## 8. Cấu Trúc Truy Vấn Nguyên Thủy Tương Đương
 
-## 8. Túm Lại Đoạn SQL Thực Chạy Trông Ra Sao?
-
-Nếu chạy suôn sẻ, dòng SQL dưới DB sẽ như thế này:
+Quy trình hoạt động thông qua lệnh SQL vật lý dưới tầng CSDL:
 
 ```sql
 begin;
--- Bấm giờ:
+-- Khởi tạo Timeout cục bộ:
 select set_config('lock_timeout', '750ms', true);
 
--- Đòi Khóa:
+-- Thiết lập Khóa Độc Quyền (Row Lock):
 select *
 from show_seat
 where show_id = 42 and seat_no = 'A-10'
 for update;
 
--- Suy nghĩ, nếu cũ quá hạn thì Hủy:
+-- Nếu vượt quá thời gian Hold, hệ thống Hủy yêu cầu cũ:
 update seat_hold
 set status = 'EXPIRED'
 where hold_id = :oldHoldId and status = 'ACTIVE';
 
--- Tạo vé mới:
+-- Chèn dữ liệu cấp phát mới (Cơ chế Unique Constraint kích hoạt):
 insert into seat_hold (
     hold_id, command_id, show_id, seat_no, customer_id,
     status, request_fingerprint, created_at
@@ -345,7 +342,7 @@ insert into seat_hold (
     'ACTIVE', :fingerprint, now()
 );
 
--- Cập nhật ghế mới:
+-- Cập nhật bản ghi đối chiếu (Root Entity):
 update show_seat
 set state = 'HELD',
     hold_id = :holdId,
@@ -353,17 +350,15 @@ set state = 'HELD',
     hold_until = :holdUntil
 where show_id = 42 and seat_no = 'A-10';
 
-commit; -- Chốt sổ nhả Khóa!
+commit; -- Kết thúc chu kỳ, Giải phóng Khóa
 ```
 
-Xin Khóa ngay lệnh Đọc. Cái Bùa Hộ Mệnh Unique Index sẽ phát huy tác dụng chém đầu khi Insert/Flush. Cả khối Logic dính chùm vào 1 Giao Dịch duy nhất.
-
-## 9. Mua Nhiều Ghế Cùng Lúc Thì Sao? (Multi-seat)
+## 9. Xử Lý Tương Tranh Nhóm (Lô Nhiều Ghế)
 
 ```java
 @Transactional(isolation = Isolation.READ_COMMITTED)
 public GroupHoldResult holdTogether(GroupHoldCommand command) {
-    // 1. Sắp Xếp Danh Sách Ghế Từ A -> Z!!!
+    // 1. Áp đặt thuật toán Sắp Xếp đơn điệu (Deterministic Sorting)
     List<String> canonicalSeatNos = command.seatNos().stream()
             .distinct()
             .sorted()
@@ -371,7 +366,7 @@ public GroupHoldResult holdTogether(GroupHoldCommand command) {
 
     lockTimeout.apply(Duration.ofMillis(750));
     
-    // 2. Chọt 1 phát ăn n Khóa! (Nhờ cái ORDER BY trong hàm nativeQuery)
+    // 2. Yêu cầu Khóa toàn cụm theo thứ tự đã ấn định (ORDER BY)
     List<ShowSeat> locked = seats.findAllForUpdateOrdered(
             command.showId(),
             canonicalSeatNos
@@ -384,64 +379,60 @@ public GroupHoldResult holdTogether(GroupHoldCommand command) {
         return GroupHoldResult.unavailable();
     }
 
-    // Ghi đè vào các row bị khóa, chèn audit, rồi flush.
+    // 3. Tiến hành Lưu Trữ đồng loạt
     return createGroupHold(command, locked);
 }
 ```
 
-Viết 1 câu SQL gom chùm có lệnh `ORDER BY` dễ kiểm soát hơn là móc vòng lặp for chọt từng dòng. Mọi ngóc ngách code từ Mua, Bán, Hủy, Đổi đều phải dùng cái trật tự Sort ghế `canonicalSeatNos` này. Thằng khóa A->B, thằng khóa B->A là cắn chéo (Deadlock) nổ tung đầu.
+Tích hợp cấu trúc `ORDER BY` vào truy vấn để bảo vệ hệ thống khỏi hiện tượng Deadlock do nghịch đảo tuần tự Khóa. Mọi tác vụ nghiệp vụ phát sinh sau (Hủy, Chuyển Nhượng) đều phải tuân thủ chuẩn Sắp xếp Dữ Liệu `canonicalSeatNos`.
 
-## 10. Chuyện Gọi API Thanh Toán (Remote workflow)
+## 10. Nguyên Tắc Phân Rã Xử Lý Tiền Tệ (Remote Payment Workflow)
 
-TUYỆT ĐỐI KHÔNG ôm Khóa DB đi gọi API Thanh toán! Hãy tách nó ra:
-1. Giao Dịch Ngắn: Xin Khóa -> Đánh dấu Ghế HELD trong 10 phút, ném Event -> Nhả Khóa.
-2. Xử lý Trôi dạt bên ngoài Transaction: Gọi API Thanh toán (Thoải mái lag 5 giây 10 giây).
-3. Giao Dịch Ngắn Khác: Thanh toán xong -> Xin Khóa lại -> Kiểm tra xem ta có còn là Chủ Ghế không -> Đổi Ghế thành SOLD -> Nhả Khóa.
-4. Một thằng Robot (Worker) quét rác dọn các ghế HELD quá giờ về EXPIRED.
+Nghiêm cấm đưa tác vụ Thanh Toán Hóa Đơn (Payment I/O) vào bên trong biên giới Khóa Dòng. Quy trình tiêu chuẩn:
+1. Giao dịch Tạm thời: Khóa Ghế → Đánh dấu trạng thái HELD tạm giữ (Ví dụ 10 phút) → Thoát và Nhả Khóa.
+2. Tác vụ Độc lập (Asynchronous): Gửi yêu cầu HTTP đến Payment Gateway (Có thể trễ hệ thống 5-10s).
+3. Giao dịch Xác nhận: Nhận phản hồi thanh toán → Xin Lại Khóa Dòng → Kiểm định Ghế vẫn thuộc sở hữu HELD của User → Chuyển `SOLD` → Nhả Khóa.
+4. Worker Dọn Dẹp: Tác vụ ngầm quét các ghế có trạng thái HELD quá hạn và chuyển về `EXPIRED`.
 
-Thời gian giữ ghế (Timed hold) là câu chuyện của Kinh doanh (10 phút), Đừng gán nó thành cái Database Row Lock chặn họng ngâm suốt 2 phút!
+Không được phép đồng nhất "Thời hạn chờ quyết định của User" (10 phút) với "Vòng Đời Của Row Lock dưới CSDL" (2 phút).
 
-## 11. Bảng Xử Lý Thảm Họa (Failure contract)
+## 11. Bảng Chỉ Số Rủi Ro Môi Trường (Failure Matrix)
 
-| Bị Gì? | DB Phải Làm Gì | Trả về App thế nào |
+| Biến Cố Phát Sinh | Hệ Quả Dưới CSDL | Cách Thức API Phản Hồi |
 | --- | --- | --- |
-| Ghế đã HELD | Đọc xong lơ đi (No-op) | Báo `ALREADY_HELD` lịch sự |
-| Nổ `55P03` (Chờ lố giờ) | Rollback cháy máy | Báo `BUSY`, khách tự bấm lại |
-| Nổ `40P01` (Deadlock xui xẻo) | Rollback cháy máy | Báo `BUSY`, thử chọc lại nếu an toàn |
-| Khách bấm lộn đúp 2 lần cùng lệnh | Lơ đi, chả làm gì | Trả về kết quả HELD cũ |
-| Khách bấm lộn 2 lần khác dấu vân tay | Rollback | Chửi `IDEMPOTENCY_MISMATCH` |
-| Dính Lưới `uq_seat_hold_one_active` | Rollback cháy máy | Điều tra ngay, có thằng code quên Xin Khóa! |
-| App sụp nguồn trước khi Commit | Postgres Rollback | App sống lại húp command id chơi tiếp |
-| App sụp nguồn sau khi Commit | DB Đã Ghi Chặt | Húp command id tự chấn chỉnh lại |
+| Tài nguyên đã `HELD` | Không thao tác dữ liệu | Phản hồi từ chối `ALREADY_HELD` |
+| Báo lỗi `55P03` (Timeout) | Rollback Giao Dịch | Báo lỗi quá tải `BUSY` |
+| Báo lỗi `40P01` (Deadlock) | Rollback Giao Dịch | Báo lỗi quá tải `BUSY`, cấu hình Retry nhẹ |
+| Yêu cầu trùng (Command_ID) | Hủy thao tác nội tại | Phản hồi lịch sử cấp phát cũ |
+| Yêu cầu đính kèm sai thông tin | Rollback (Lỗi Logic) | Báo mã `IDEMPOTENCY_MISMATCH` |
+| Lỗi Cấp Phát Trùng Diện Rộng | Rollback (Constraint) | Báo lỗi Sự Cố Kỹ Thuật (Hệ thống thiết kế lỗi) |
+| Ứng dụng Crash trước Commit | Tự Hủy (Auto Rollback) | Cho phép ứng dụng tái xử lý sau khi hồi phục |
+| Ứng dụng Crash sau Commit | Dữ liệu bền vững | Tiến hành truy vấn hệ thống dựa trên ID |
 
-## 12. Chọn Khí Giới Nào? (Alternatives & So sánh định tính)
+## 12. Phân Tích Phương Án Chọn Lựa (Architectural Alternatives)
 
-| Vũ Khí | Kẻ thua cuộc | Điểm Trừ | Mức độ rủi ro Deadlock | 
+| Công Cụ | Nhược Điểm Đối Với Tiến Trình Chờ | Nguy Cơ Tiềm Ẩn Cần Thiết Tránh | Rủi Trạng Deadlock | 
 | --- | --- | --- | --- | 
-| Khóa Bi Quan `FOR UPDATE` | Đứng xếp hàng đợi | Dồn cục nếu Transaction dài; kẹt xe ghế Hot | Có, nếu khóa nhiều dòng lộn xộn |
-| `FOR UPDATE NOWAIT` | Bị sút văng liền | App chửi Lỗi BUSY liên tục (Poor UX) | Thấp hơn 1 chút |
-| Update chay (`where state=AVAILABLE`) | Sửa trả về 0 dòng | Khó code khi quy trình Hủy vé, Ghi Audit lằng nhằng | Thấp cho 1 dòng |
-| Khóa Lạc Quan (`@Version`) | Sút văng lúc Flush | Hao tài nguyên Não nghĩ, vứt kết quả uổng phí | Thấp |
-| Index Unique | Dính lưới Insert | Rất ngon làm bùa hộ mệnh, không thay thế logic | Thấp |
-| `SERIALIZABLE` / Giữ bằng Dòng Giả | Chết ngắc | Xài khi ghế chưa được tạo ra | Tránh |
-| Khóa ngoài JVM/ZooKeeper | Khóc nhè nội bộ | Không chơi được kiểu nhiều máy chủ; Dual-write đau đầu | Chỉ local |
+| `FOR UPDATE` | Áp lực xếp hàng chờ đồng bộ | Dồn cục hệ thống nếu Transaction xử lý chậm | Yêu cầu sắp xếp đa bản ghi |
+| `FOR UPDATE NOWAIT` | Loại bỏ ngay tức khắc | Làm tăng lượng Lỗi Trả về (Trải nghiệm người dùng kém) | Thấp |
+| Condition Update | Phức tạp trong Audit/Lịch sử | Không áp dụng được cho cấu trúc đa Entity phức tạp | Rất thấp |
+| Khóa Lạc Quan (`@Version`) | Từ chối ở khâu cuối cùng (Flush) | Tốn chi phí xử lý nghiệp vụ dư thừa | Cực thấp |
+| Khóa Phân Tán (ZooKeeper/Redis) | Chỉ phù hợp môi trường ngoại vi | Phức tạp (Dual-write), thiếu đồng bộ vật lý | Đặc thù |
 
-## 13. Khuyên Thật Lòng
+## 13. Khuyến Nghị Sử Dụng Kỹ Thuật (Final Verdict)
 
-Hãy xài `PESSIMISTIC_WRITE` khi bạn biết RÕ cái Dòng Dữ Liệu đó Tồn Tại, và logic "Suy nghĩ phán quyết" của bạn dài dằng dặc cần bảo kê trước khi sửa đổi.
-Phải chốt kèo thật nhanh (Short Transaction), gài mìn hẹn giờ (`lock_timeout`), Đọc đồ mới sau khi giữ Khóa, Đóng gói lỗi kỹ thuật đẩy ra ngoài, và Sắp Xếp thứ tự khi khóa nhiều dòng.
+Ưu tiên áp dụng `PESSIMISTIC_WRITE` (Khóa Dòng Độc Quyền) cho các kịch bản nhắm đích danh một bản ghi vật lý cố định. Phương pháp này yêu cầu tuân thủ cấu trúc Transaction ngắn hạn (Short-lived), triển khai Timeout, xử lý Revalidate tại thời điểm tiếp nhận, và cơ chế sắp xếp (Sort) cho các nhóm tài nguyên.
 
-Nếu cái ghế đó Hot đến mức xếp hàng dồn cục dài lê thê làm banh Server (như săn vé BlackPink), thì chớ dại mà đi tăng Timeout! Hãy dùng trò "Cổng Kiểm Soát" (Admission control) hay các chiêu thức Độc Lập để giải quyết, đó không phải việc của cái Row Lock này!
+Không cố gắng mở rộng Timeout để đối phó với hiện tượng Hotspots (Sự kiện quá tải). Khi hệ thống tắc nghẽn ở mức cực đại (Ví dụ: Flash Sale), cần phân rã kiến trúc sang các mô hình Hàng đợi (Queue), thay vì lạm dụng khả năng chịu đựng của Connection Pool.
 
-## 14. Bảng Kiểm Tra Sức Khỏe Cuối Cùng (Production checklist)
+## 14. Bộ Tiêu Chuẩn Triển Khai (Production Checklist)
 
-- [ ] Lệnh Khóa có đúng là trỏ thẳng vào cái Dòng Tồn Tại, chỉ mặt điểm tên chưa?
-- [ ] Lệnh Khóa có phải là lệnh Đọc ĐẦU TIÊN để lấy dữ liệu làm Não Suy Nghĩ không?
-- [ ] Hàm được gọi thông qua Spring Proxy và chạy trong đúng 1 Giao Dịch ngắn hủn chưa?
-- [ ] Đã bật Log SQL kiểm chứng xem có chữ `FOR UPDATE` xịn xò sinh ra trên PostgreSQL chưa?
-- [ ] `lock_timeout` (DB) có được cấu hình KHỎE (nhỏ) hơn Deadline chung của App không?
-- [ ] Lỗi Timeout / Deadlock bị quăng ra có được để cho DB Rollback bung bét rồi App mới lượm lại bắt lỗi không?
-- [ ] Chắc chắn KHÔNG GỌI MẠNG hay làm tác vụ ì ạch trong lúc ôm Khóa chứ?
-- [ ] Mua nhiều vé cùng lúc đã được hàm `.sorted()` sắp xếp y chang nhau cho mọi chức năng chưa?
-- [ ] Có xài cột Unique Fingerprint để chống vụ Khách Bấm Đúp liên tọi chưa?
-- [ ] Đã dựng đồ thị bóc tách đếm: Lỗi văng Timeout, Lỗi văng Deadlock, Số giây đợi Khóa, Số giây xử lý Khóa rõ ràng chưa?
+- [ ] Lệnh `FOR UPDATE` phải được chỉ định cho các bản ghi xác thực tồn tại (ID).
+- [ ] Lệnh Khóa là tác vụ đầu tiên tiếp cận dữ liệu để ngăn chặn ảo giác (Stale read).
+- [ ] Khối logic nằm trọn trong một phương thức Spring Proxy kích hoạt `@Transactional`.
+- [ ] Xác minh tệp Log SQL có ghi nhận mệnh đề `FOR UPDATE` trong truy vấn.
+- [ ] Cấu hình `lock_timeout` cục bộ thấp hơn đáng kể so với Request Timeout tổng thể.
+- [ ] Tắt mọi tác vụ giao tiếp I/O qua mạng trong biên độ Giao dịch chứa Khóa.
+- [ ] Mã định danh cần được sắp xếp (Sorted) trước khi Yêu cầu Cấp đa Khóa.
+- [ ] Triển khai Constraint Unique Fingerprint chống hiện tượng nhấp đúp của phía gọi.
+- [ ] Thiết lập hệ thống Monitor cho mã `55P03`, `40P01` và tài nguyên kết nối Idle.

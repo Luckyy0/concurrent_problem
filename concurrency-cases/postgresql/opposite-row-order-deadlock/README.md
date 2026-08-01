@@ -1,125 +1,127 @@
-# DB-008 — Kẹt Xe Database: Án Mạng Deadlock Vì Khóa Ngược Chiều (PostgreSQL deadlock do khóa row ngược thứ tự)
+# DB-008 — Deadlock Trong PostgreSQL Do Yêu Cầu Khóa Ngược Trật Tự (PostgreSQL opposite row-order deadlock)
 
-## 1. Tóm tắt (Bức tranh toàn cảnh)
+## 1. Tóm tắt (Overview)
 
-Tưởng tượng em có hai lệnh chuyển tiền chạy cùng lúc, giữa hai cái ví, nhưng mà đi ngược chiều nhau.
-Và mỗi Đứa chạy Giao Dịch (transaction) đều ôm khư khư cái ví Nguồn (source) trước, rồi mới ngó sang ví Đích (destination):
-
-```text
-Thằng T1: Chuyển từ ví A -> ví B. Chộp lấy ví A, đứng chờ ví B mở khóa.
-Thằng T2: Chuyển từ ví B -> ví A. Chộp lấy ví B, đứng chờ ví A mở khóa.
-```
-
-Đấy! Hai thằng đứng nhìn nhau say đắm!
-PostgreSQL nhìn thấy cảnh **Chờ Đợi Lẫn Nhau** (wait-for cycle) này ngứa mắt quá, bèn rút súng bắn bỏ một thằng (gọi là victim) để dẹp đường. Thằng đó sẽ văng cái lỗi SQLSTATE `40P01`. Thằng còn sót lại (may mắn) sẽ chạy tiếp sau khi xác của thằng kia bị dọn đi (rollback) và Khóa (lock) được nhả ra.
-
-Bài học này dạy em 3 Nguyên tắc Vàng:
+Tưởng tượng hệ thống xử lý hai lệnh chuyển tiền chạy đồng thời giữa hai tài khoản, nhưng theo chiều ngược nhau.
+Mỗi giao dịch (transaction) tiến hành khóa tài khoản nguồn (source) trước, sau đó mới yêu cầu khóa tài khoản đích (destination):
 
 ```text
-1. Mọi con đường code mà phải Khóa nhiều ví cùng lúc, THÌ BẮT BUỘC phải tuân theo 1 Thứ Tự Chuẩn (canonical order) thống nhất (ví dụ: So sánh ID, nhỏ khóa trước, lớn khóa sau).
-
-2. Đã gọi là chuyển tiền thì hễ Ghi nhận (commit) là phải trừ bên này và cộng bên kia. Có biến là xé bỏ (rollback) toàn bộ!
-
-3. Nếu muốn cho thằng bị bắn chết (victim) sống lại (retry), thì mỗi lần thử lại phải mở một Phiên Giao Dịch Mới Tinh (new transaction), tải lại toàn bộ trạng thái mới nhất, và thử lại số lần có hạn thôi!
+Giao dịch T1: Chuyển từ tài khoản A -> tài khoản B. Khóa tài khoản A, chờ khóa tài khoản B.
+Giao dịch T2: Chuyển từ tài khoản B -> tài khoản A. Khóa tài khoản B, chờ khóa tài khoản A.
 ```
 
-> **Nói ngắn gọn:** Chữ "Transaction" không phải bùa hộ mệnh chống Deadlock. Mọi Actor (nhân viên) phải khóa tài nguyên theo CÙNG 1 THỨ TỰ. Và cái trò Bấm Nút Làm Lại (retry) chỉ là lớp Cấp Cứu có giới hạn.
+Tình trạng này dẫn đến một vòng lặp chờ đợi lẫn nhau (wait-for cycle) hay còn gọi là Deadlock.
+Khi PostgreSQL phát hiện vòng lặp này thông qua cơ chế deadlock detector, nó sẽ buộc phải hủy (abort) một trong các giao dịch (gọi là victim) để giải phóng vòng chờ. Giao dịch bị hủy sẽ nhận lỗi SQLSTATE `40P01`. Giao dịch còn lại sẽ được tiếp tục thực thi sau khi giao dịch bị hủy giải phóng các khóa (locks) đang nắm giữ.
 
-## 2. Diễn viên và Đồ Dùng Chung (Actor và trạng thái dùng chung)
+Bài học này nhấn mạnh 3 nguyên tắc thiết kế quan trọng:
 
-Cái kho `account` là Cuốn Sổ Cái Quyền Lực (authoritative shared state):
+```text
+1. Khi hệ thống yêu cầu khóa nhiều tài nguyên cùng lúc, BẮT BUỘC phải tuân thủ một trật tự chuẩn (canonical order) thống nhất trên toàn hệ thống (ví dụ: so sánh ID, khóa ID nhỏ trước, ID lớn sau).
 
-| Cái Ví (Account) | Mã Số (ID) | Tiền ban đầu (Balance) |
+2. Trong các giao dịch tài chính, việc cập nhật số dư phải tuân thủ tính nguyên tử (atomicity). Bất kỳ lỗi nào xảy ra cũng phải dẫn đến thao tác rollback toàn bộ giao dịch.
+
+3. Khi xử lý lỗi deadlock thông qua cơ chế thử lại (retry), thao tác thử lại phải được thực hiện trong một giao dịch cơ sở dữ liệu hoàn toàn mới (new transaction). Cần cấu hình số lần thử lại tối đa (bounded retry) và tải lại trạng thái dữ liệu mới nhất.
+```
+
+> **Ghi chú quan trọng:** Annotation `@Transactional` không tự động ngăn chặn deadlock. Mọi luồng xử lý (worker) phải khóa tài nguyên theo CÙNG MỘT TRẬT TỰ. Cơ chế tự động thử lại (retry) chỉ là giải pháp phục hồi thứ cấp, không thể thay thế cho một thiết kế trật tự khóa chuẩn xác.
+
+## 2. Các thực thể và Trạng thái chia sẻ (Actors and shared state)
+
+Thực thể `account` đóng vai trò là trạng thái dùng chung (authoritative shared state):
+
+| Tài khoản (Account) | Mã Số (ID) | Số dư (Balance) |
 | --- | ---: | ---: |
 | A | `101` | `1_000` |
 | B | `202` | `1_000` |
 
-Hai luồng chuyển tiền chui qua 2 cái App khác nhau cùng lao vào xâu xé CSDL:
+Hai luồng chuyển tiền độc lập thực thi đồng thời:
 
-| Nhân Viên (Actor) | Lệnh Mệnh (Command) | Thao tác Chọc Gậy Bánh Xe (Thứ tự broken) |
+| Luồng (Actor) | Thao tác (Command) | Trình tự khóa gây lỗi (Broken order) |
 | --- | --- | --- |
-| Lính T1 trên App-1 | Chuyển `100` từ A sang B | Chộp khóa `101`, rồi thò tay khóa `202` |
-| Lính T2 trên App-2 | Chuyển `70` từ B sang A | Chộp khóa `202`, rồi thò tay khóa `101` |
+| Luồng T1 | Chuyển `100` từ A sang B | Khóa `101`, sau đó yêu cầu khóa `202` |
+| Luồng T2 | Chuyển `70` từ B sang A | Khóa `202`, sau đó yêu cầu khóa `101` |
 
-Điểm Chạm Trán xịt khói (`contention point`) chính là lúc Tụi nó gọi câu lệnh `SELECT ... FOR UPDATE` THỨ HAI.
-Bởi vì lúc này mỗi đứa ĐỀU ĐANG ÔM một Ổ Khóa Dòng (row-level lock) mà thằng kia đang khao khát.
+Điểm tranh chấp (contention point) xảy ra tại thời điểm các luồng gọi lệnh `SELECT ... FOR UPDATE` thứ hai.
+Tại thời điểm này, mỗi luồng đều đang giữ một khóa độc quyền cấp dòng (row-level lock) mà luồng kia đang cần.
 
-## 3. Ranh Giới Giao Dịch (Ranh giới transaction)
+## 3. Ranh giới giao dịch (Transaction boundary)
 
-Một lần thử nghiệm ĐÚNG CHUẨN chỉ được xài duy nhất MỘT gói Spring transaction:
+Một thao tác chuyển tiền tiêu chuẩn chỉ được thực hiện trong một giao dịch cơ sở dữ liệu duy nhất:
 
 ```text
-BẮT ĐẦU (BEGIN)
-  Khóa cái ví có Mã Số (ID) NHỎ HƠN
-  Khóa cái ví có Mã Số (ID) LỚN HƠN
-  Thẩm định xem thằng Chuyển còn đủ tiền không (trên dữ liệu vừa khóa)
-  Trừ tiền thằng Chuyển
-  Cộng tiền thằng Nhận
-  Đẩy dữ liệu (flush)
-CHỐT SỔ (COMMIT)
+BEGIN TRANSACTION
+  Khóa tài khoản có ID NHỎ HƠN
+  Khóa tài khoản có ID LỚN HƠN
+  Xác thực số dư của tài khoản chuyển (trên dữ liệu vừa khóa)
+  Trừ tiền tài khoản chuyển
+  Cộng tiền tài khoản nhận
+  Ghi nhận dữ liệu (flush)
+COMMIT TRANSACTION
 ```
 
-Nhớ nhé, cái mác `@Transactional` phải được gắn trên cái Hàm Xử Lý (worker bean). Thằng Trưởng Phòng Điều Phối Retry phải Đứng Ngoài Giao Dịch đó. Có vậy thì cái Tội Lỗi (exception) của lần chạy trước mới được xí xóa (rollback) sạch sẽ trước khi bắt đầu thử lại.
+Trong Spring Framework, annotation `@Transactional` nên được đặt tại lớp dịch vụ chịu trách nhiệm xử lý nghiệp vụ chính (worker bean). Lớp điều phối thử lại (retry coordinator) phải nằm NGOÀI giao dịch này. Cấu trúc này đảm bảo ngoại lệ của giao dịch trước đó kích hoạt rollback hoàn toàn trước khi phiên giao dịch thử lại được khởi tạo.
 
-Trong bài test này, mình giả định xài hàng mặc định của PostgreSQL là `READ COMMITTED`. Ở cái level này, mỗi phát `SELECT ... FOR UPDATE` sẽ bốc Dữ Liệu Tức Thời (statement snapshot) rồi Cắm Cọc Chờ Ổ Khóa Dòng. Ổ Khóa đó sẽ Được Ngậm cho tới khi Em Nhấn Nút `COMMIT` hoặc Bị Ép `ROLLBACK`, CHỨ KHÔNG PHẢI chạy xong cái Repository Method là nó nhả Khóa ra đâu nha!
+Bài kiểm thử này sử dụng mức cô lập (isolation level) mặc định của PostgreSQL là `READ COMMITTED`. Ở cấp độ này, lệnh `SELECT ... FOR UPDATE` sẽ truy xuất statement snapshot hiện tại và yêu cầu khóa cấp dòng. Khóa này được duy trì cho đến khi giao dịch kết thúc (commit hoặc rollback), không phải nhả ra ngay khi kết thúc phương thức repository.
 
-## 4. Luật Thép Bất Di Bất Dịch (Invariant và kết quả mong đợi)
+## 4. Các yêu cầu toàn vẹn (Invariants and expected outcomes)
 
-Ví dụ này tóm gọn cái Deadlock, không phải dạy viết App Ngân Hàng Hoành Tráng. Trong khuôn khổ bài này, em phải đảm bảo:
+Trong khuôn khổ của bài toán chuyển tiền cơ bản, hệ thống phải đảm bảo các quy tắc sau:
 
-- Tổng tiền của A và B vĩnh viễn là `2_000`;
-- Hễ báo chuyển thành công là Bắt Buộc Tiền bên A giảm và bên B tăng đúng số;
-- Thằng Nạn Nhân (deadlock victim) tuyệt đối KHÔNG ĐƯỢC để lại bãi rác Dữ Liệu dở dang;
-- Sau khi đánh lộn (và làm lại vài lần), hai Lệnh Chuyển tiền đều phải chạy Xong Hết, Hoặc báo Thất Bại Tức Tưởi (exhaustion);
-- CẤM TIỆT mấy trò Gửi Email/Bắn Sự Kiện ra ngoài Trước Khi `COMMIT`, trừ phi rành rẽ món Nhắn Tin Ngoài Hộp (outbox/idempotency).
+- Tổng số dư của A và B luôn bằng `2_000` tại mọi thời điểm.
+- Khi giao dịch thành công, số dư của A và B phải phản ánh chính xác số tiền đã chuyển.
+- Giao dịch bị hủy (deadlock victim) tuyệt đối KHÔNG ĐƯỢC để lại dữ liệu không nhất quán.
+- Sau quá trình xử lý (bao gồm các lần thử lại hợp lệ), cả hai lệnh chuyển tiền đều phải thành công, hoặc bị từ chối với lỗi rõ ràng (exhaustion).
+- Các tác vụ ngoại ứng (side effects) như gửi email, gọi API hệ thống khác không được thực hiện trước khi giao dịch COMMIT thành công (cần sử dụng các cơ chế như Outbox pattern hoặc Idempotency).
 
-Nếu code lởm (Broken implementation), em mong tụi nó tự xếp hàng (serialize)? Đừng nằm mơ, PostgreSQL sẽ Đấm Vỡ Mặt (abort) một thằng. Nếu code App nhắm mắt làm ngơ nuốt lỗi, chạy lại ngay trên cái Đống Đổ Nát (transaction cũ), hoặc dối trá báo Thành Công sớm, thì Luật Thép bị Phá Vỡ Tan Tành!
+Việc không tuân thủ quy tắc trật tự khóa có thể khiến PostgreSQL hủy bỏ (abort) một giao dịch. Nếu ứng dụng nuốt lỗi (swallow exception), thử lại bên trong giao dịch hiện tại đã bị hủy, hoặc trả về phản hồi sai, các yêu cầu toàn vẹn dữ liệu sẽ bị vi phạm nghiêm trọng.
 
-## 5. Từ Lóng Giang Hồ Phải Biết (Thuật ngữ cần biết)
+## 5. Thuật ngữ quan trọng (Terminology)
 
-| Từ Lóng | Giải nghĩa bình dân |
+| Thuật ngữ | Giải nghĩa |
 | --- | --- |
-| Kẹt Xe (deadlock) | Mấy Giao Dịch cắn đuôi chờ nhau thành 1 Vòng Tròn Luẩn Quẩn |
-| Lưới Chờ (wait-for graph) | Cái Sơ Đồ Vẽ Thằng Nào Đang Ngồi Chờ Thằng Nào |
-| Chuẩn Xếp Hàng (canonical lock order) | Luật Tôn Ti Trật Tự; Mã Số (ID) NHỎ được Mời Vô Phòng Khóa TRƯỚC |
-| Kẻ Chết Thay (victim) | Đứa bị DB Bắn Bỏ để dẹp Đường Kẹt Xe |
-| SQLSTATE `40P01` | Mã Báo Tử của PostgreSQL cho tội Kẹt Xe (`deadlock_detected`) |
-| Giao dịch đứt gánh (aborted transaction) | Lệnh không cho chạy tiếp nữa, ép phải Rollback |
-| Thử Lại Có Hạn (bounded retry) | Trò làm lại nhưng giới hạn Số Lần, Dãn Cách (backoff) và Có Mốc Hết Giờ |
-| Làm Lại Cuộc Đời (fresh attempt) | Chạy lại trên một Môi Trường Mới Tinh Tươm (transaction/persistence context mới) |
+| Deadlock (Bế tắc) | Tình trạng các giao dịch chờ đợi tài nguyên của nhau, tạo thành một vòng lặp không thể tự giải quyết. |
+| Wait-for graph | Đồ thị biểu diễn mối quan hệ chờ đợi khóa giữa các tiến trình trong cơ sở dữ liệu. |
+| Canonical lock order | Trình tự chuẩn mực và nhất quán khi khóa nhiều tài nguyên (ví dụ: luôn khóa tài nguyên có ID nhỏ nhất trước). |
+| Deadlock victim | Giao dịch bị hệ quản trị cơ sở dữ liệu (RDBMS) buộc phải hủy bỏ (abort) để phá vỡ vòng lặp chờ đợi. |
+| SQLSTATE `40P01` | Mã lỗi chuẩn của PostgreSQL khi phát hiện deadlock (`deadlock_detected`). |
+| Aborted transaction | Giao dịch không thể thực thi tiếp các lệnh SQL và bắt buộc phải thực hiện ROLLBACK. |
+| Bounded retry | Cơ chế thử lại giao dịch thất bại nhưng có giới hạn số lần, kết hợp với độ trễ (backoff). |
+| Fresh attempt | Khởi tạo một giao dịch vật lý hoàn toàn mới, làm sạch (clear) bộ đệm và tải lại dữ liệu từ đầu. |
 
-## 6. Bản Đồ Kho Báu (Điều hướng)
+## 6. Hướng dẫn tham khảo (Navigation)
 
-- [Broken Spring/JPA implementation](broken-code.md)
-- [Timeline, detector và rollback analysis](analysis.md)
-- [Canonical ordering và safe retry](solutions.md)
-- [PostgreSQL Testcontainers experiments](experiments.md)
-- [PostgreSQL locks và lock lifetime](../../concepts/postgresql-locks.md)
-- [Deadlock và retry an toàn](../../concepts/deadlocks-and-retries.md)
-- [Kiểm thử đồng thời](../../concepts/concurrency-testing.md)
+- [Mã nguồn lỗi sử dụng Spring/JPA](broken-code.md)
+- [Phân tích chu trình kẹt khóa và quá trình rollback](analysis.md)
+- [Giải pháp trật tự khóa chuẩn và thử lại an toàn](solutions.md)
+- [Các thực nghiệm với Testcontainers PostgreSQL](experiments.md)
+- [Tổng quan về cơ chế khóa trong PostgreSQL](../../concepts/postgresql-locks.md)
+- [Xử lý Deadlock và cơ chế Retry](../../concepts/deadlocks-and-retries.md)
+- [Nguyên tắc kiểm thử tương tranh](../../concepts/concurrency-testing.md)
 
-## 7. Thảm Họa Trên Chiến Trường (Hậu quả trong production)
+## 7. Tác động tới hệ thống Production (Production impact)
 
-- Khách hàng bị văng mã `40P01`, Mọi thứ bị Rollback, Ứng Dụng chạy Rề Rề (latency tăng).
-- Trẻ trâu Code Lại (retry) sai quy trình: Làm lại trên Cái Đống Rác của Giao Dịch cũ, Rác chất thành núi!
-- Viết Bơm Dữ Liệu liên tục không dãn cách (không backoff) sinh ra Cơn Bão Làm Lại (retry storm) Bắn Chết Tài Khoản Đang Nóng.
-- Kẻ đứng chờ Ngậm Hết Kết Nối (Connection), Làm Cạn Hồ Bơi Kết Nối trước khi Trái Tim (CPU) của DB kịp nhồi máu cơ tim.
-- Gửi Email Báo Chuyển Tiền cho Đã, Xong Giây Cuối Bị Rollback -> Tiền Không Giảm Mà Khách Thì Vỗ Tay Mừng Rỡ.
-- Đám Code Khắp Nơi Khóa Không Theo 1 Tôn Ti Trật Tự Nào -> Bắt Bug Kẹt Xe Khó Hơn Lên Trời!
-- Đẩy Lên Nhiều Máy Chủ (Scale-out) Càng Tăng Quân Ăn Cướp; Xài `synchronized` Rẻ Tiền Trong Code App ĐÉO THỂ BẢO VỆ Nổi Dữ Liệu Thật Sự Dưới DB.
+- Người dùng gặp lỗi hệ thống liên tục do mã lỗi `40P01`, làm tăng độ trễ (latency) của dịch vụ.
+- Thiết kế retry sai cách (ví dụ: thử lại trên persistence context hiện tại) có thể dẫn đến việc lưu trữ dữ liệu rác, gây sai lệch thông tin.
+- Việc thực hiện retry mà không có khoảng lùi (backoff) gây ra hiện tượng "retry storm", làm quá tải cơ sở dữ liệu.
+- Các giao dịch bị treo sẽ giữ kết nối JDBC trong thời gian dài, có khả năng làm cạn kiệt Connection Pool và khiến toàn bộ ứng dụng bị ngưng trệ.
+- Gửi thông báo thành công (ví dụ: email) trước khi cơ sở dữ liệu hoàn tất commit có thể gây ra tranh chấp thông tin nếu giao dịch sau đó bị rollback.
+- Mã nguồn thực hiện khóa tài nguyên không theo chuẩn khiến việc xác định nguyên nhân và khắc phục lỗi khóa chéo trên hệ thống phân tán trở nên vô cùng khó khăn.
+- Giải pháp sử dụng từ khóa `synchronized` trong Java không có tác dụng trong môi trường triển khai đa máy chủ (multi-instance).
 
-## 8. Đơn Thuốc Cứu Sinh (Hướng sửa khuyến nghị)
+## 8. Hướng dẫn khắc phục (Remediation steps)
 
-1. Cứ thấy Hai cái ID, là nhắm mắt Sắp Xếp: `firstId = min(fromId, toId)` và `secondId = max(fromId, toId)`.
-2. Mọi ngóc ngách Code, Bắt buộc Móc Khóa (`FOR UPDATE`) cái Nhỏ Trước, Lớn Sau.
-3. Ôm ĐỦ 2 CHÌA KHÓA rồi, lúc đó muốn đổi lại cái nào là Đích, Cái nào là Nguồn, Thẩm định Cỡ Nào Thì Tùy Tức.
-4. Rút Ngắn Vòng Đời Giao Dịch; CẤM GỌI API (Remote Service) Trong Lúc Đang Cầm Ổ Khóa DB.
-5. Nhận diện Mã Lỗi Báo Tử `40P01`; Khóc Lóc Dọn Dẹp (Rollback), Xong Kéo Chăn Làm Lại Giao Dịch Khác Với Số Lần Thử Giới Hạn.
-6. Canh Chỉnh Khóa Giờ Cẩn Thận (`lock_timeout`, `statement_timeout`) Cho Phù Hợp Độ Trễ Hệ Thống; Dùng Timeout ÉO PHẢI LÀ LẤP LIẾM Cho Việc Không Biết Xếp Hàng!
+1. Khi cần thao tác trên hai đối tượng cùng loại, luôn thực hiện sắp xếp ID: `firstId = min(fromId, toId)` và `secondId = max(fromId, toId)`.
+2. Yêu cầu khóa (`FOR UPDATE`) theo thứ tự đã sắp xếp: ID nhỏ trước, ID lớn sau.
+3. Chỉ sau khi đã thu thập đủ tất cả các khóa cần thiết, ứng dụng mới tiến hành xác minh logic kinh doanh và cập nhật dữ liệu.
+4. Tối thiểu hóa thời gian giữ khóa. Không thực hiện lệnh gọi I/O từ xa (như gọi API ngoài) trong phạm vi giao dịch cơ sở dữ liệu.
+5. Cần cấu trúc khối lệnh `try-catch` hoặc công cụ AOP phù hợp để nhận diện mã lỗi `40P01`, sau đó xử lý rollback và kích hoạt cơ chế retry trong một giao dịch mới với số lần giới hạn.
+6. Thiết lập các thông số thời gian chờ (`lock_timeout`, `statement_timeout`) một cách cẩn trọng để phù hợp với Service Level Objective (SLO). Chú ý rằng các tham số timeout này dùng để ngăn chặn hệ thống bị treo, không phải là phương pháp xử lý gốc rễ của việc thiết kế khóa sai trật tự.
 
-Xếp hàng Chuẩn (Canonical ordering) đập tan Cơn Kẹt Xe. Nhưng Vòng Đời Thử Lại (Bounded retry) vẫn vô cùng Quan Trọng Vì Code Thực Tế Nó Đẻ Ra Trăm Ngàn Bệnh Khác (Khóa Khóa Ngoại, Bảo Trì, Vòng Lặp 3 - 4 Bảng Đan Chéo).
+Trật tự khóa chuẩn (Canonical ordering) giải quyết vấn đề deadlock tại cơ sở dữ liệu. Tuy nhiên, một chiến lược thử lại (Bounded retry) an toàn vẫn cần thiết để đối phó với các lỗi ngẫu nhiên và tranh chấp khác (ví dụ: khóa khóa ngoại, bảo trì, vòng lặp phức tạp).
 
-## 9. Khu Vực Giới Hạn (Phạm vi)
+## 9. Phạm vi giới hạn (Scope)
 
-Bài này Sếp Chỉ Xoáy Sâu vào Vụ Kẹt Xe Ở PostgreSQL, Vụ DB Phán Tử Hình (victim abort) Và Cách Code Nút Thử Lại (transaction retry).
-Còn mấy trò Múa Phụ Vụ Phức Tạp Của Dân Kế Toán Ngân Hàng, Sổ Cái, Cầm Cố, Đấu Trừ thì đi đọc ở case `BANK-003`. Chơi Kẹt Xe Khóa Mềm Trong Máy Ảo Java thì đọc `JVM-007`. Còn Sợ Mức Lỗi `SERIALIZABLE` Và Bắn Ngoại Lệ SSI thì qua đọc `DB-009`.
+Tài liệu này tập trung phân tích hiện tượng khóa ngược trật tự dẫn đến deadlock ở PostgreSQL (`40P01`), hành vi hủy giao dịch (victim abort) của hệ quản trị cơ sở dữ liệu, và cách thức thiết kế vòng lặp retry an toàn.
+Các nghiệp vụ kế toán phức tạp hơn như Sổ cái (Ledger) hay hệ thống luân chuyển chứng từ sẽ được mô tả tại `BANK-003`.
+Vấn đề tranh chấp khóa phần mềm (JVM-level locking) được trình bày tại `JVM-007`.
+Việc xử lý lỗi phân lập tuần tự (Serialization anomaly) và SSI sẽ được hướng dẫn chi tiết tại `DB-009`.

@@ -1,4 +1,4 @@
-# Đoạn Code Thảm Họa: Quyết định dựa trên 2 lần đọc (Broken two-read refund decision)
+# Phân Tích Mã Nguồn Lỗi: Quyết định dựa trên hai lần đọc (Broken two-read refund decision)
 
 ## 1. Thực thể Chính sách Hiện Tại (Current policy entity)
 
@@ -44,9 +44,9 @@ public class MerchantRefundPolicy {
 }
 ```
 
-Cái `revision` ở đây chỉ là Đánh Số Phiên Bản Luật lệ kinh doanh thôi (business policy revision), chứ KHÔNG PHẢI là Bùa Hộ Mệnh `@Version` của JPA đâu nhé. Sếp B gọi hàm đổi Luật, cái case này ta không bàn tới vụ các sếp đấm nhau ghi đè (lost update).
+Thuộc tính `revision` ở đây đóng vai trò là phiên bản của quy tắc kinh doanh (business policy revision), không phải là annotation `@Version` của JPA dùng cho optimistic locking. Chúng ta không bàn đến trường hợp xung đột ghi (lost update) giữa các quản trị viên trong ngữ cảnh này.
 
-## 2. Truy vấn Lấy Lẻ Tẻ Luôn Bắn Lệnh SQL Xuống DB (Scalar projection luôn phát SQL)
+## 2. Truy vấn Projection luôn gọi SQL (Scalar projection)
 
 ```java
 public interface PolicyView {
@@ -72,7 +72,7 @@ public interface MerchantRefundPolicyRepository
 }
 ```
 
-Cách lấy lẻ tẻ (Projection scalar) kiểu này nó KHÔNG sinh ra một Object xịn (managed entity) được Hibernate chăn dắt. Mỗi lần bạn gọi `readPolicy()` là chắc chắn 100% nó quất thêm 1 câu lệnh SELECT tươi rói thẳng xuống DB, do đó PostgreSQL vui vẻ phát cho bạn thêm một tấm Ảnh mới (statement snapshot mới).
+Sử dụng native query với scalar projection sẽ không tạo ra một thực thể được quản lý (managed entity) bởi Hibernate. Mỗi lần gọi phương thức `readPolicy()`, hệ thống sẽ thực thi một lệnh SELECT trực tiếp xuống cơ sở dữ liệu. Điều này dẫn đến việc PostgreSQL cấp một statement snapshot mới cho mỗi lần gọi.
 
 ## 3. Thực thể Quyết Định Hoàn Tiền (Decision entity)
 
@@ -106,7 +106,7 @@ public class RefundDecision {
     private BigDecimal evaluatedLimit;
 
     @Column(name = "policy_revision", nullable = false)
-    private long policyRevision; // Sẽ nhét Phiên bản dỏm vào đây!
+    private long policyRevision; // Điểm tiềm ẩn lỗi bất nhất phiên bản
 
     protected RefundDecision() {
     }
@@ -135,9 +135,9 @@ public class RefundDecision {
 }
 ```
 
-Cái Khóa duy nhất (Unique) `command_id` nó chỉ cản được bọn rảnh bấm nút Gửi (submit) 2 lần thôi, chứ nó KHÔNG hề giữ cho cái Chính sách được vẹn toàn (policy consistency). Đây là 2 khái niệm khác biệt!
+Ràng buộc duy nhất (UniqueConstraint) trên `command_id` chỉ nhằm mục đích ngăn chặn xử lý trùng lặp (idempotency), nó KHÔNG đảm bảo tính toàn vẹn của phiên bản chính sách (policy consistency) được liên kết.
 
-## 4. Tầng Dịch Vụ Cùi Bắp (Broken service)
+## 4. Cấu trúc Tầng Dịch Vụ chứa lỗi (Broken service)
 
 ```java
 @Service
@@ -162,7 +162,7 @@ public class RefundDecisionService {
         UUID merchantId,
         BigDecimal amount
     ) {
-        // LẦN ĐỌC 1: Lấy Luật để Xét Duyệt
+        // LẦN ĐỌC 1: Lấy chính sách để xét duyệt
         PolicyView eligibility = policies.readPolicy(merchantId)
             .orElseThrow(PolicyNotFoundException::new);
 
@@ -171,20 +171,20 @@ public class RefundDecisionService {
             return RefundResult.manualReview();
         }
 
-        localRules.validate(amount); // Tính toán lằng nhằng tốn thời gian trong RAM
+        localRules.validate(amount); // Logic tính toán có thể kéo dài thời gian xử lý
 
-        // LẦN ĐỌC 2: Lại chạy lấy Luật để chép Sổ Audit
+        // LẦN ĐỌC 2: Đọc lại chính sách để ghi audit log
         PolicyView audit = policies.readPolicy(merchantId)
             .orElseThrow(PolicyNotFoundException::new);
 
-        // GHI SỔ: MANG RÂU ÔNG NỌ CẮM CẰM BÀ KIA
+        // GHI NHẬN: Mâu thuẫn dữ liệu giữa hai lần đọc
         RefundDecision saved = decisions.save(
             RefundDecision.approved(
                 commandId,
                 merchantId,
                 amount,
-                eligibility.getAutoRefundLimit(), // Lấy từ Lần Đọc 1
-                audit.getRevision()               // Ép uổng Lấy từ Lần Đọc 2
+                eligibility.getAutoRefundLimit(), // Lấy từ Lần đọc 1
+                audit.getRevision()               // Lấy từ Lần đọc 2
             )
         );
         return RefundResult.approved(saved.getId());
@@ -192,11 +192,11 @@ public class RefundDecisionService {
 }
 ```
 
-Đoạn Code này nhìn thì ngây ngô nhưng trên Đời Thực hay gặp lắm: Lần Đọc 2 thường mọc ra sau vài đợt sửa Code dọn dẹp (refactor) để lấy mấy cái Audit metadata "mới nhất", hoặc bị lồng đâu đó trong các hàm Helper. Bug chình ình ở cái khâu nhào trộn Quyết định (đã duyệt ở Lần 1) với con số Phiên bản chép Sổ (Lấy ở Lần 2).
+Cấu trúc mã này thường xuất hiện sau các đợt tái cấu trúc (refactor) khi lập trình viên muốn đảm bảo thông tin audit là "mới nhất". Lỗi phát sinh do việc kết hợp kết quả đánh giá từ Snapshot 1 với số phiên bản từ Snapshot 2 mà không có cơ chế kiểm tra tính đồng nhất.
 
-> **Nói ngắn gọn:** Cái áo choàng `@Transactional` chỉ bó các cục Ghi (commit/rollback) thành 1 cục, chứ `READ_COMMITTED` KHÔNG HỀ hứa hẹn rằng mọi cú SELECT trong nhà đó đều chụp chung một tấm ảnh (snapshot) đâu nhé!
+> **Ghi chú quan trọng:** Annotation `@Transactional` đảm bảo tính nguyên tử cho thao tác commit/rollback, nhưng với mức `READ_COMMITTED`, nó không đảm bảo các câu lệnh SELECT bên trong sẽ sử dụng chung một snapshot.
 
-## 5. Sếp B Tạt Ngang Đổi Luật (Concurrent policy update)
+## 5. Giao dịch cập nhật đồng thời (Concurrent policy update)
 
 ```java
 @Service
@@ -218,7 +218,7 @@ public class PolicyAdministrationService {
 }
 ```
 
-Lệnh Ghi của B bắn xuống SQL:
+Lệnh UPDATE được sinh ra:
 
 ```sql
 update merchant_refund_policy
@@ -228,9 +228,9 @@ update merchant_refund_policy
  where merchant_id = '...';
 ```
 
-Lệnh UPDATE này hốt cái Ổ Khóa Dòng (row lock) chờ B chốt. Trớ trêu thay Ông A chỉ toàn SELECT chay (plain SELECT) nên được CSDL phát cho Tấm Ảnh Cũ (committed version) để đọc cho rảnh nợ thay vì phải Xếp Hàng Đợi B chốt xong.
+Lệnh UPDATE này sẽ chiếm khóa cấp dòng (row lock) cho đến khi commit. Tuy nhiên, luồng xét duyệt sử dụng lệnh SELECT thông thường nên PostgreSQL sử dụng MVCC để trả về snapshot trước khi sửa đổi, tránh bị block và không phải chờ giao dịch cập nhật hoàn tất.
 
-## 6. Mổ Xẻ Đoạn SQL Tương Đương Dưới DB (SQL tương đương)
+## 6. Lệnh SQL tương đương (Equivalent SQL representation)
 
 ```sql
 begin isolation level read committed;
@@ -238,14 +238,14 @@ begin isolation level read committed;
 select auto_refund_limit, active, revision
 from merchant_refund_policy
 where merchant_id = :merchantId;
--- Thấy: 100.00, true, 7
+-- Kết quả trả về: 100.00, true, 7
 
--- << Bụp! Ông B (session B) lôi cổ sửa thành version 8 và chốt sổ ngay chỗ này >>
+-- << Giao dịch cập nhật (session B) cập nhật thành version 8 và commit tại đây >>
 
 select auto_refund_limit, active, revision
 from merchant_refund_policy
 where merchant_id = :merchantId;
--- Thấy MỚI TOANH: 50.00, true, 8
+-- Kết quả trả về từ snapshot mới: 50.00, true, 8
 
 insert into refund_decision(
     id,
@@ -262,55 +262,55 @@ values (
     :merchantId,
     80.00,
     'APPROVED',
-    100.00, -- Lấy từ Cú Đọc 1
-    8       -- Lấy từ Cú Đọc 2 (Tạo ra bằng chứng Giả Mạo!)
+    100.00, -- Lấy từ lệnh đọc 1
+    8       -- Lấy từ lệnh đọc 2 (Gây bất nhất dữ liệu)
 );
 
 commit;
 ```
 
-## 7. Cú Lừa Bộ Đệm Hibernate (JPA first-level cache có thể che anomaly)
+## 7. Hành vi của JPA First-Level Cache
 
-Lỡ như Code không xài Native query mà xài `findById()` bình thường 2 lần trong cùng một Giao Dịch, Hibernate thông minh sẽ ném lại cái Object Java cũ mèm nó còn lưu ở RAM mà không gọi SQL. Lúc đó Code sẽ thấy Phiên bản `7`, tưởng là xịn! Đó là hành vi của Bộ đệm (identity-map behavior), chứ không phải do Bức Ảnh `READ COMMITTED` xịn xò của PostgreSQL giúp bạn đâu!
+Nếu đoạn mã không sử dụng native query mà gọi phương thức `findById()` hai lần trong cùng một giao dịch, Hibernate sẽ trả về thực thể Java từ First-Level Cache (Identity Map) mà không thực thi SQL lần hai. Trong trường hợp đó, hệ thống sẽ tiếp tục sử dụng Phiên bản 7.
 
-Đừng mừng vội, lỡ bạn rớ vô các thao tác này thì DB sẽ rít lên và gọi SQL liền:
+Tuy nhiên, cơ chế cache sẽ bị bỏ qua và SQL được thực thi nếu:
 
-- Viết query lấy lẻ tẻ (scalar/native projection) như bài này.
-- Gọi `EntityManager.refresh(...)` ép tải lại.
-- Dọn sạch thùng rác `EntityManager.clear()` rồi mới Đọc.
-- Chọc vô lấy ở một Giao Dịch/Thread khác (persistence context khác).
-- Dùng Lệnh JDBC chay chen ngang Giao Dịch.
+- Sử dụng native query hoặc scalar projection (như trong ví dụ này).
+- Gọi `EntityManager.refresh(...)` để ép tải lại dữ liệu.
+- Gọi `EntityManager.clear()` trước khi đọc lần hai.
+- Thực hiện truy vấn trong một transaction/thread khác.
+- Sử dụng JDBC trực tiếp xen vào giữa giao dịch.
 
-Nguyên tắc: Đừng bao giờ biến cái Bộ đệm Cấp 1 (first-level cache) mỏng manh thành Cái Áo Giáp Bảo Vệ Lỗi Tranh Chấp (isolation contract)!
+Nguyên tắc: Không nên phụ thuộc vào First-Level Cache như một giải pháp bảo vệ dữ liệu khỏi các vấn đề tranh chấp tương tranh (concurrency anomalies).
 
-## 8. Điều Kiện Để Lỗi Nở Hoa (Preconditions tái hiện)
+## 8. Điều kiện tái hiện lỗi (Preconditions for reproduction)
 
-1. Cả A và B đều xài Giao Dịch / Kết nối (connections) độc lập riêng rẽ.
-2. Mức Cô Lập (Effective isolation) của A là PostgreSQL `READ COMMITTED` mặc định.
-3. Cả 2 Lần gọi Đọc của A chắc chắn phải kích hoạt 2 phát SELECT xuống CSDL.
-4. Ông B lanh chanh Chốt (commit) ngay giữa Phát SELECT 1 và Phát SELECT 2 của Ông A.
-5. Code của Ông A ôm khư khư kết quả xét duyệt từ Phiên bản 7.
-6. Khi ghi Sổ (INSERT), Code không thèm khóa (lock) cũng không thẩm định lại (validate) cái phiên bản Luật.
-7. Bạn không bọc bài Test này dưới 1 cái Giao Dịch Ảo (outer test transaction).
+1. Hai luồng xét duyệt và quản trị sử dụng các kết nối/giao dịch độc lập.
+2. Luồng xét duyệt hoạt động ở mức cô lập `READ COMMITTED`.
+3. Hai lần gọi hàm đọc của luồng xét duyệt thực sự kích hoạt hai lệnh SELECT độc lập xuống cơ sở dữ liệu.
+4. Luồng quản trị thực hiện commit ngay giữa hai lệnh SELECT của luồng xét duyệt.
+5. Logic xét duyệt lưu trữ kết quả đánh giá từ phiên bản cũ.
+6. Lệnh ghi (INSERT) không sử dụng khóa (lock) hoặc kiểm tra lại (validate) phiên bản.
+7. Unit Test không được bọc trong một outer transaction duy nhất (nếu có).
 
-## 9. Đừng Bôi Thuốc Đỏ Nửa Mùa (Những cách sửa chưa đủ)
+## 9. Các giải pháp chưa triệt để (Inadequate workarounds)
 
-### CHỈ đắp thêm bùa `@Transactional`
+### Chỉ bổ sung `@Transactional`
 
-Đã đắp từ đời nào rồi sếp ơi! Nhưng nó vẫn xài chế độ phát nhiều Tấm Ảnh (statement snapshots).
+Giao dịch đã được thiết lập, nhưng mức `READ_COMMITTED` vẫn áp dụng hành vi cấp statement snapshot riêng biệt.
 
-### CHỈ Bóp đi lần Đọc 2 (Xóa SELECT #2)
+### Loại bỏ lần đọc thứ hai
 
-Cách này giúp đưa ra 1 Cái Giấy Chép Sổ đồng nhất trong RAM (coherent in-memory decision), nhưng bạn phải chắc chắn là Lưu Đủ bằng chứng và thống nhất với Sếp: Luật Đã Sửa (concurrent update) thì Quyết Định cũ vác ra ghi vẫn hợp lệ nhé! (Kẻo đối soát chửi).
+Việc này giúp dữ liệu ghi nhận nhất quán trong bộ nhớ (coherent in-memory decision), nhưng cần đảm bảo yêu cầu nghiệp vụ chấp nhận việc lưu quyết định dựa trên chính sách cũ sau khi chính sách mới đã được cập nhật. 
 
-### Xài cái ổ khóa Ram Java `synchronized`
+### Sử dụng khóa `synchronized`
 
-Tuyệt chiêu vô dụng! Nó chỉ bịt mồm được mấy cái luồng (threads) chạy chung trên 1 cục Máy Chủ (JVM). Nếu Admin Sếp B đăng nhập từ Máy Chủ khác, hay chọc thẳng tool vô Database thì ổ khóa này phế võ công.
+Khóa này chỉ có tác dụng trong phạm vi một máy ảo Java (JVM). Trong môi trường phân tán với nhiều instance (hoặc khi quản trị viên cập nhật trực tiếp qua công cụ quản lý cơ sở dữ liệu), khóa cục bộ hoàn toàn vô hiệu.
 
-### Bắt Ép Ghi Sớm Bằng `flush()`
+### Sử dụng phương thức `flush()` sớm
 
-Lệnh Xả (Flush) cái INSERT xuống nó không làm cho Ảnh Chụp (policy snapshot) đứng yên, và cũng chẳng gắn thêm cái điều kiện rà soát (revision predicate) nào cho bạn đâu.
+Lệnh flush() không thay đổi hành vi của policy snapshot, cũng không tự động bổ sung điều kiện ràng buộc phiên bản vào lệnh INSERT.
 
-### Ráng Thử Lại Trong Cùng 1 Giao Dịch
+### Retry bên trong cùng một giao dịch
 
-Khi thất bại phải đẻ ra 1 Giao Dịch MỚI TINH tươm rồi làm lại. Nếu bạn lì lợm chạy Lệnh Đọc lại bên trong Cùng Giao Dịch (ví dụ xài `REPEATABLE READ`) thì nó vẫn quẳng lại cho bạn cái Bức Ảnh Cũ Mèm từ đợt chạy đầu tiên thôi!
+Khi xảy ra lỗi cần retry, tiến trình phải khởi tạo một giao dịch MỚI. Việc thực hiện truy vấn lại bên trong giao dịch hiện tại (đặc biệt nếu dùng `REPEATABLE READ`) sẽ tiếp tục trả về snapshot cũ từ thời điểm bắt đầu giao dịch, không giải quyết được vấn đề dữ liệu bị lỗi thời.

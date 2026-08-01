@@ -1,8 +1,8 @@
-# Giải pháp Code Chuẩn: Thử lại Có Chừng Mực (Bounded Retry) và Sạch Sẽ (Fresh Attempt)
+# Giải pháp kiến trúc: Thử lại có giới hạn và tái cập nhật tự động
 
-## 1. Người Lính Đánh Thuê (One-attempt worker)
+## 1. Phương thức xử lý một lần (One-attempt worker)
 
-Nhiệm vụ của anh lính này chỉ đơn giản là: Vào trong, làm việc 1 lần duy nhất, thất bại thì báo cáo. Không tự ý thử lại!
+Nhiệm vụ của phương thức xử lý (worker) là tiến hành thao tác trên database duy nhất một lần trong ngữ cảnh transaction độc lập. Mọi tác vụ thử lại không thuộc trách nhiệm của lớp này.
 
 ```java
 @Service
@@ -22,10 +22,10 @@ public class RewardCreditAttempt {
         this.outbox = outbox;
     }
 
-    // BẮT BUỘC tạo Giao dịch mới tinh cho mỗi lần gọi
+    // Bắt buộc yêu cầu mở transaction mới cho từng nỗ lực thử
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public CreditResult creditOnce(CreditCommand command) {
-        // Kiểm tra chống trùng trước tiên
+        // Kiểm tra tính lũy đẳng dựa trên định danh (Command ID)
         var existing = credits.findById(command.commandId());
         if (existing.isPresent()) {
             return CreditResult.replayed(existing.orElseThrow());
@@ -33,7 +33,7 @@ public class RewardCreditAttempt {
 
         RewardWallet wallet = wallets.findById(command.walletId())
                 .orElseThrow();
-        wallet.requireActive(); // Bóp nghẹt mấy cái Ví đã bị khóa
+        wallet.requireActive(); // Xác thực các quy tắc nghiệp vụ
         wallet.credit(command.points());
 
         credits.save(RewardCredit.from(command));
@@ -46,20 +46,20 @@ public class RewardCreditAttempt {
 }
 ```
 
-`REQUIRES_NEW` cực kỳ phù hợp ở đây vì Class Chỉ huy (bên ngoài) hoàn toàn không có Giao dịch. Mặc dù tốn kém thêm chút kết nối (connection cost) cho mỗi Giao dịch mới, nhưng đó là cái giá phải trả để hệ thống không bị dính chùm. (Lưu ý: Phải có rào cản chặn mấy Class khác vô tình bọc cái Chỉ huy lại).
+Việc sử dụng mức lan truyền `REQUIRES_NEW` giúp đóng gói mọi rủi ro xử lý. Phương pháp này tiêu tốn nhiều chi phí kết nối hơn do mỗi lần khởi tạo yêu cầu cung cấp connection mới, nhưng đảm bảo tính cô lập transaction giữa các nỗ lực xử lý, ngăn chặn việc ảnh hưởng tới tiến trình bên ngoài.
 
-## 2. Luật Thử Lại (Retry policy)
+## 2. Quy tắc thử lại
 
 ```java
 public record RetryBudget(
         int maxAttempts,
-        Duration initialBackoff, // Thời gian ngủ lần đầu
-        Duration maxBackoff      // Ngưỡng ngủ tối đa không được vượt qua
+        Duration initialBackoff, // Thời lượng chờ khởi điểm
+        Duration maxBackoff      // Ngưỡng chờ tối đa cho mỗi chu kỳ
 ) {
     public RetryBudget {
         if (maxAttempts < 1 || initialBackoff.isNegative()
                 || maxBackoff.compareTo(initialBackoff) < 0) {
-            throw new IllegalArgumentException("Ngân sách thử lại sai quy tắc!");
+            throw new IllegalArgumentException("Thông số cấp phát cấu hình không hợp lệ");
         }
     }
 }
@@ -70,7 +70,7 @@ public class OptimisticRetryPolicy {
     private final Clock clock;
     private final RetryBudget budget;
 
-    // Phải thỏa mãn cả 2 điều kiện: Còn ngân sách số lần VÀ chưa hết giờ
+    // Chính sách cho phép thực thi dựa trên nỗ lực và thời gian thực
     public boolean canRetry(int completedAttempts, Instant deadline) {
         return completedAttempts < budget.maxAttempts()
                 && clock.instant().isBefore(deadline);
@@ -78,14 +78,14 @@ public class OptimisticRetryPolicy {
 }
 ```
 
-> **Nhớ kỹ:** Giới hạn Số lần (attempts) là để cứu Database khỏi quá tải; còn Giới hạn Thời gian (deadline) là để API phản hồi cho User kịp lúc. Thiếu 1 trong 2 là toang!
+> **Nguyên tắc kỹ thuật:** Giới hạn số lần đóng vai trò ngăn chặn hệ thống bị kéo sập do quá tải database; trong khi giới hạn thời gian bảo đảm tiêu chuẩn của phía gọi. Việc thiếu bất kỳ rào cản nào đều dễ dẫn tới suy giảm hiệu năng.
 
-## 3. Ngủ ngẫu nhiên (Backoff có jitter) và Dễ viết Test
+## 3. Quản trị độ trễ và phân tách logic
 
-Phải tách biệt "Thuật toán tính giờ ngủ" và "Hành động ngủ" ra làm 2 cái riêng:
+Kiến trúc yêu cầu phân tách thuật toán "tính toán độ trễ" và tác vụ "ngưng hoạt động" thành hai phân hệ độc lập để dễ dàng triển khai unit test:
 
 ```java
-// Đồ xóc đĩa ngẫu nhiên
+// Giao diện cung cấp độ lệch hướng
 public interface JitterSource {
     long nextLong(long exclusiveUpperBound);
 }
@@ -96,7 +96,7 @@ public final class BackoffPlan {
     private final JitterSource jitter;
 
     public Duration delayAfter(int completedAttempt) {
-        // Hàm số mũ: 1, 2, 4, 8... tối đa mũ 10
+        // Công thức lũy thừa cấp số (2^N)
         long factor = 1L << Math.min(completedAttempt - 1, 10);
         long base = Math.min(
                 budget.maxBackoff().toMillis(),
@@ -105,7 +105,7 @@ public final class BackoffPlan {
                         factor
                 )
         );
-        // Trộn thêm "gia vị" thời gian ngẫu nhiên
+        // Tích hợp hệ số phân bổ ngẫu nhiên
         long extra = jitter.nextLong(Math.max(1, base / 2 + 1));
         return Duration.ofMillis(
                 Math.min(budget.maxBackoff().toMillis(), base + extra)
@@ -114,7 +114,7 @@ public final class BackoffPlan {
 }
 ```
 
-Hành động Ngủ phải Tôn trọng người khác (lỡ bị gọi ngắt ngang interrupt):
+Bộ điều phối ngưng hoạt động yêu cầu bảo toàn lệnh đóng từ hệ thống cha:
 
 ```java
 public interface RetryWaiter {
@@ -122,11 +122,11 @@ public interface RetryWaiter {
 }
 ```
 
-Trên Production bạn xài Scheduler hay Parking tùy ý, nhưng khi viết Test thì dùng đồ giả (Recording waiter) để test chạy vèo vèo không phải chờ `sleep`.
+Trong thực tế, bạn có thể triển khai `RetryWaiter` thông qua hệ thống lập lịch hoặc cơ chế khóa thread (`LockSupport.park`), nhưng đối với khả năng kiểm thử, thành phần này được thay thế bằng đối tượng giả lập.
 
-## 4. Kẻ Chỉ Huy Không Giao Dịch (Non-transactional coordinator)
+## 4. Lớp điều phối ngoại trừ transaction
 
-Đây mới là ngôi sao chính của chúng ta:
+Thành phần trọng yếu trong cơ chế quản lý xung đột:
 
 ```java
 @Service
@@ -139,7 +139,7 @@ public class RewardCreditCoordinator {
     private final Clock clock;
 
     public CreditResult credit(CreditCommand command, Instant deadline) {
-        // Đạp văng ra nếu thằng nào nhét Tui vào chung Transaction
+        // Ngăn cản lớp gọi bên ngoài thiết lập sai phân tách transaction
         if (TransactionSynchronizationManager
                 .isActualTransactionActive()) {
             throw new IllegalStateException(
@@ -149,27 +149,28 @@ public class RewardCreditCoordinator {
 
         for (int attempt = 1; ; attempt++) {
             try {
-                // Thả chó... à nhầm, thả Lính Đánh Thuê vào làm việc
+                // Triển khai xử lý thông qua proxy
                 return attempts.creditOnce(command);
             } catch (ObjectOptimisticLockingFailureException conflict) {
-                // Có Lỗi! Lấy Luật ra soi!
+                // Xác thực bộ quy tắc xử lý khi xảy ra ngoại lệ khóa lạc quan
                 if (!policy.canRetry(attempt, deadline)) {
-                    // Cạn kiệt ngân sách hoặc hết giờ, văng cờ trắng đầu hàng
+                    // Trạng thái cạn kiệt năng lực giải quyết
                     throw new WalletContentionException(
-                            command.commandId(),
-                            attempt,
-                            conflict
+                        command.commandId(),
+                        attempt,
+                        conflict
                     );
                 }
                 
-                // Xem xem thời gian tối đa còn lại là bao nhiêu
+                // Cập nhật phân bổ thời gian tối đa còn lại
                 Duration remaining = Duration.between(
                         clock.instant(),
                         deadline
                 );
-                // Chọn thời gian ngủ nhỏ nhất giữa Tính Toán và Thời Gian Còn Lại
+                // Giới hạn giá trị khoảng chờ không vượt quá quỹ thời gian khả dụng
                 Duration delay = min(backoff.delayAfter(attempt), remaining);
-                // Ôm gối đi ngủ ngoài phòng khách (Ngoài Transaction)
+                
+                // Thực thi tạm ngừng quá trình ngoài phạm vi transaction
                 waiter.waitFor(delay, deadline);
             }
         }
@@ -177,12 +178,12 @@ public class RewardCreditCoordinator {
 }
 ```
 
-Nhớ nhé, khối `catch` chạy lúc này là Proxy Giao Dịch đã bị tiêu hủy xong xuôi! Code Production xịn luôn bơm đồ vào bằng Constructor chứ không chơi `@Autowired` dơ dáy nha.
+Khi khối lệnh `catch` bắt được ngoại lệ, transaction của proxy thực thi đã hoàn thành khâu tiêu hủy bộ đệm (rollback). Thiết kế này tuân thủ tiêu chuẩn tiêm phụ thuộc với thông số truyền vào bằng hàm khởi tạo.
 
-## 5. Cuộc đua Bấm Đúp (Duplicate command race)
+## 5. Xử lý tương tranh khi phát sinh trùng định danh
 
-Hai yêu cầu y hệt nhau lọt vào 2 luồng. Khóa chính `reward_credit_pkey` sẽ phán quyết thằng nào đi sau bị nổ (unique failure). 
-Tuy nhiên, lỗi Unique này không được tính là lỗi Khóa Lạc Quan nên vòng lặp sẽ bị bẻ gãy. Class bên ngoài sẽ bắt được, mở thêm một Giao Dịch "Chỉ Đọc" cực nhanh để lôi kết quả cũ ra gửi trả về (replay):
+Khi cấu hình chống trùng bằng khóa chính, hệ thống sẽ bảo vệ database: hai tác vụ đồng bộ thực thi cùng lệnh sẽ kết thúc với lỗi vi phạm ràng buộc duy nhất. Ngoại lệ này độc lập với việc đụng độ cấu hình phiên bản.
+Hệ thống xử lý ngoại lệ này thông qua việc phân luồng và truy hồi lại bằng tiến trình chỉ đọc để tăng tốc độ phản hồi:
 
 ```java
 @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
@@ -193,19 +194,19 @@ public CreditResult requireCommitted(UUID commandId) {
 }
 ```
 
-Lỗi Trùng Lặp Khóa (Duplicate) hoàn toàn khác với Lỗi Đụng Độ Dữ Liệu (Optimistic Retry), đừng gộp chung nhé!
+> Cần phân định rõ lỗi phát sinh do đụng độ khóa lạc quan và lỗi sinh ra do trùng thông số định danh.
 
-## 6. Xài hàng có sẵn của Spring (`@Retryable`)
+## 6. Tiềm năng tích hợp `@Retryable` trong Spring
 
-Bạn hoàn toàn có thể dùng `@Retryable` của Spring thay vì tự viết Vòng Lặp. NHƯNG hãy cẩn thận:
+Thay thế vòng lặp truyền thống bằng Spring Retry Framework có ưu điểm nhất định. Các nguyên tắc bắt buộc khi sử dụng:
 
-- Bắt buộc phải đặt `@Retryable` ở Class Chỉ Huy bên ngoài, còn thằng Lính bên trong vẫn mang `@Transactional(REQUIRES_NEW)`. Tuyệt đối không đặt hai Annotation này chung 1 chỗ!
-- Phải lọc riêng Exception.
-- Rất khó để kiểm soát cái `overall deadline` (hết hạn tổng). Lời khuyên là tách Bean riêng như cách trên dễ Audit và bảo trì hơn.
+- Annotation `@Retryable` CHỈ được phép khai báo tại lớp điều phối (bên ngoài ngữ cảnh transaction), còn lớp xử lý phải giữ nguyên `@Transactional(REQUIRES_NEW)`.
+- Thiết lập cụ thể tham số `include` để tránh bắt nhầm các lỗi từ chối nghiệp vụ.
+- Việc quản lý thời gian tổng thể của Spring Retry có mức độ tích hợp phức tạp, đòi hỏi khả năng bảo trì hệ thống chặt chẽ so với việc cấu trúc bean thủ công.
 
-## 7. Giải pháp xài `TransactionTemplate` (Code chay)
+## 7. Giải pháp áp dụng chức năng bậc thấp (`TransactionTemplate`)
 
-Nếu lười chia thành 2 Class, bạn xài Code chay cũng được:
+Bạn có thể tích hợp ranh giới thực thi mà không phụ thuộc vào proxy annotation của Spring:
 
 ```java
 var tx = new TransactionTemplate(transactionManager);
@@ -215,29 +216,28 @@ tx.setPropagationBehavior(
 
 for (int attempt = 1; ; attempt++) {
     try {
-        // Cục execute này sẽ mở và đóng Giao dịch gọn gàng
+        // Mọi quy trình mở - đóng transaction được xử lý tự động trong khối lệnh lambda
         return tx.execute(status -> work.credit(command));
     } catch (ObjectOptimisticLockingFailureException conflict) {
-        // Lúc nhảy xuống đây thì Giao dịch đã chết ngủ yên rồi
-        // Áp dụng luật/deadline/backoff y như trên
+        // Bộ nhớ và database connection đã được giải phóng
+        // Áp dụng độ trễ/chính sách kiểm duyệt tương tự như mô hình lớp tách biệt
     }
 }
 ```
 
-**Nhớ:** Không được nhét (cache) Entity ôi thiu từ bên ngoài vào trong `execute`.
+Khuyến cáo quan trọng: Không bảo lưu dữ liệu thực thể cũ đưa vào tham số của `TransactionTemplate`.
 
-## 8. Hợp đồng "Cạn Kiệt Sinh Lực" (Exhaustion contract)
+## 8. Chuẩn phản hồi khi cạn kiệt nỗ lực
 
-Một khi đã báo lỗi Kiệt Sức, bạn phải trả thẳng về phía Client:
+Khi xảy ra lỗi do hệ thống hết khả năng chịu đựng:
 
-- API đồng bộ: Táng mã `409 Conflict` hoặc `503 Service Unavailable`. Có thể gửi kèm `Retry-After` (thử lại sau chừng đó giây).
-- API bất đồng bộ: Nhét vào Hàng đợi (Queue) chờ cứu xét sau (workflow riêng).
-- Tuyệt đối không xạo chó báo "Success 200" nếu bảng `reward_credit` chưa có dữ liệu.
-- Cho phép người dùng hoặc App tự tra cứu trạng thái bằng Mã `command ID` nếu mọi chuyện không rõ ràng.
+- **Đồng bộ hóa API:** Cung cấp mã lỗi HTTP phù hợp như `409 Conflict` hoặc `503 Service Unavailable`, có thể đi kèm tiêu đề `Retry-After`.
+- **Bất đồng bộ:** Đẩy thông tin đối tượng không thành công vào hàng đợi ngoại lệ cục bộ phục vụ quá trình dò quét.
+- **Tuyệt đối không:** Chuyển đổi mã lỗi hệ thống kỹ thuật để gửi mã thành công HTTP `200 Success`. Phía gọi phải nắm bắt chính xác về trạng thái để hỗ trợ đồng bộ theo phương thức lũy đẳng.
 
-## 9. Các Phương Án Khác khi Đụng Độ Quá Gắt
+## 9. Các phương án xử lý cạnh tranh hiệu quả khác
 
-### Phép màu Cộng Trừ Nguyên Tử (Atomic delta)
+### Cập nhật delta nguyên tử
 
 ```sql
 update reward_wallet
@@ -245,46 +245,46 @@ set points = points + :delta
 where wallet_id = :id;
 ```
 
-Chỉ cần update cộng/trừ thẳng vào DB mà khỏi cần quan tâm Version! Thường dùng cho các bộ đếm đơn giản. Nhưng nhớ là cái bảng Lưu lịch sử (idempotency) vẫn phải nằm chung một Transaction đó nha.
+Kiến trúc thay đổi trên cấp độ database phù hợp cho những bài toán đếm định lượng đơn lẻ. Database sử dụng trạng thái mới nhất cho mỗi lần tác động mà không đòi hỏi cập nhật dựa vào phiên bản. Chi tiết ứng dụng được tham chiếu ở bài `LOCK-004`. Bảng lịch sử thao tác vẫn phải nằm trong phạm vi của một transaction.
 
-### Khóa Bi Quan (Pessimistic lock)
+### Khóa bi quan (`FOR UPDATE`)
 
-Khóa mõm luôn dòng dữ liệu. Giảm bớt số lần đập đầu thử lại vô ích, nhưng đổi lại làm đám luồng chờ chực tắc đường (wait/connection occupancy), dễ dính Tử Trận (Deadlock). Khó ăn lắm!
+Tiến hành cấp phát cơ chế ngắt tạm thời trong xử lý song song, hỗ trợ chặn số lượng lặp thử lại không cần thiết nhưng gây ra việc nghẽn kết nối và nguy cơ deadlock. Chỉ nên ưu tiên khi quy trình thay đổi yêu cầu lấy dữ liệu kết hợp qua nhiều bảng cùng lúc. (Chi tiết tham khảo `LOCK-003`).
 
-### Hàng đợi riêng biệt (Per-key queue/ownership)
+### Cơ cấu hàng đợi thông điệp theo khóa
 
-Giảm được đua đòi chen lấn, nhưng phải thiết kế hệ thống xếp hàng rất phức tạp (đọc, lưu, sập nguồn...). Hãy đọc qua `LOCK-005` để xem cách chọn hệ thống.
+Chuyển mô hình tải đa thread thành mô hình cập nhật chuỗi đơn theo khóa. Cải thiện năng lực xử lý bằng việc không cho phép xung đột cục bộ xảy ra, nhưng thiết kế đòi hỏi hệ thống định tuyến phức tạp và tính năng lưu vết hàng đợi linh động. (Tham khảo phân tích `LOCK-005`).
 
-## 10. Ma Trận Giải Quyết Thất Bại
+## 10. Bảng đánh giá quyết định thử lại
 
-| Hậu quả | Có thử lại không? | Tình trạng hiện tại |
+| Kịch bản lỗi hệ thống | Áp dụng thử lại? | Tình trạng phân giải tài nguyên |
 | --- | --- | --- |
-| Đụng độ Khóa Lạc Quan | **Có** (Nếu còn ngân sách/thời gian) | Lần thử trước đã bị Hủy bỏ |
-| Bấm đúp trùng mã Lệnh | Làm phát Đọc mới (Fresh replay) | Trả về 1 lịch sử cũ |
-| Ví bị cấm/Sai logic | **Không** | Báo lỗi Doanh Nghiệp (Domain rejection) |
-| Cạn kiệt lần thử / Hết giờ | **Không** | Văng lỗi Quá tải/Tranh chấp |
-| Khách tắt trình duyệt (Cancel) | **Không** | Truyền tiếp lệnh Cancel |
-| Chốt xong nhưng mất mạng | Nhờ Client gửi lại `command ID` | Có khả năng DB đã được lưu (commit) |
-| Bắn Event đi nơi khác | Phải dùng Outbox | Chỉ xuất ra SAU KHI chốt sổ |
+| Xung đột khóa lạc quan | **Có** (Dựa vào hạn mức/thời gian) | Transaction trước đã được rollback an toàn |
+| Yêu cầu trùng lặp định danh | Cập nhật truy hồi | Trả kết quả của sự kiện lịch sử thành công trước |
+| Quy tắc nghiệp vụ cấm thao tác | **Không** | Trả về lỗi từ chối nghiệp vụ |
+| Cạn kiệt nỗ lực | **Không** | Trả về lỗi khả dụng hệ thống |
+| Hủy từ phía gọi | **Không** | Đồng bộ hủy toàn bộ quá trình liên đới |
+| Commit thành công nhưng rớt phản hồi | Áp dụng phản hồi qua payload | Dữ liệu được xác nhận đã commit trên database |
+| Điều hướng thông điệp ngoại vi | Mô hình hộp thư | CHỈ gửi thông điệp khi commit được xác nhận |
 
-## 11. Đánh Đổi Chọn Lựa (Trade-off)
+## 11. Bảng cân nhắc so sánh kiến trúc
 
-| Chiến thuật | Tính Chính Xác | Tải hệ thống lúc Đụng độ | Độ Trễ (Latency) | Độ Phức Tạp |
+| Chiến lược | Bảo toàn dữ liệu | Hệ quả tải trọng | Tác động độ trễ | Độ khó triển khai |
 | --- | --- | --- | --- | --- |
-| Thử lại có chừng mực (Bài này) | Mạnh + Chống Trùng Lặp | Bão khuếch đại tải | Cao do rớt/ngủ chờ | Trung bình |
-| Cộng Trừ Nguyên Tử (Atomic) | Mạnh cho cộng trừ | Rất ít Request rác | Thấp | Thấp |
-| Khóa Bi Quan | Mạnh | Hàng dài kẹt cứng | Dễ bị quá giờ | Trung bình |
-| Hàng đợi (Queue) | Tùy cơ chế vận chuyển | Chạy mượt mà tuần tự | Phải tốn thời gian xếp hàng | **Cao** |
+| Thử lại có giới hạn | Cao, hỗ trợ chống lặp lại | Tăng tải trọng cao | Cao | Trung bình |
+| Cập nhật delta nguyên tử | Phù hợp với tính tương đối | Giảm thiểu cạnh tranh | Thấp | Thấp |
+| Khóa bi quan | Tuyệt đối | Cản trở việc truy xuất | Gia tăng lỗi quá tải | Trung bình |
+| Kiến trúc hàng đợi thông điệp theo khóa | Dựa vào hệ sinh thái broker | Xử lý đa thread mượt mà | Phụ thuộc tốc độ luân chuyển | **Đòi hỏi cao** |
 
-## 12. Danh sách Check-list (Hãy tự soi lại Code của mình)
+## 12. Danh sách kiểm tra triển khai
 
-- [ ] Kẻ Chỉ huy không ôm Transaction; Tách riêng Lính Đánh Thuê bọc Proxy.
-- [ ] Lần thử trước phải chết hẳn (Rollback hoàn tất) rồi mới được đi Ngủ.
-- [ ] Lần thử sau phải bốc (load lại) 1 bản Entity sạch sẽ và kiểm tra lại luật từ đầu.
-- [ ] Code chặn Cả số lần tối đa (attempt cap) lẫn Tổng Thời Gian (overall deadline).
-- [ ] Đi ngủ tính giờ theo Hàm số Mũ có trộn Số Ngẫu Nhiên (jitter), biết tôn trọng lệnh Cancel.
-- [ ] Giữ nguyên 1 Mã Lệnh (Command ID) từ đầu tới cuối, chốt cùng Transaction với cái Ví.
-- [ ] Chỉ cho phép bế lỗi Khóa Lạc Quan (Optimistic conflict) đi thử lại.
-- [ ] Kiệt sức là lỗi bận rộn, không được giả vờ thành công.
-- [ ] Có Metric giám sát cẩn thận Tỷ lệ đâm (attempts/success), đụng độ, Hết Giờ và Áp lực Hồ Bơi (pool).
-- [ ] Ví mà hot quá lâu thì phải đổi sang Queue/Bi quan chứ đừng có ngu ngục tăng `maxAttempts` lên nữa!
+- [ ] Thành phần bộ điều phối đảm bảo độc lập với database transaction (`@Transactional`). Lớp xử lý nội hàm áp dụng bọc xử lý riêng.
+- [ ] Transaction phải hoàn tất tiến trình hủy (rollback) giải phóng trước khi cơ chế chờ kích hoạt.
+- [ ] Trong transaction mới, ứng dụng phải truy xuất lại thực thể để lấy dữ liệu mới nhất.
+- [ ] Hệ thống thiết lập đầy đủ ranh giới tối đa giới hạn về lần thử và thời gian giải quyết đóng gói.
+- [ ] Hàm trì hoãn bảo đảm áp dụng tính chất độ lệch ngẫu nhiên nhằm phân tán quá trình đánh thức thread. Hỗ trợ ngắt từ tiến trình máy chủ.
+- [ ] Đơn hàng gắn kết cùng mã lệnh từ phía gọi làm nền tảng định danh lũy đẳng.
+- [ ] Chỉ những mã lỗi có tính chất tranh chấp tài nguyên (khóa lạc quan) mới thỏa mãn lệnh tạo vòng lặp thử lại.
+- [ ] Việc cạn kiệt được ghi nhận là một lỗi kỹ thuật (nghiêm cấm trả phản hồi mô phỏng thành công 200).
+- [ ] Trạng thái thực tế triển khai các biểu đồ đo metric: Số lần thao tác, khối lượng chờ, xung đột hệ thống, timeout và mức độ sử dụng pool.
+- [ ] Khi biểu đồ tranh chấp có dấu hiệu chuyển tiếp liên tục quá giới hạn xử lý: Đề xuất chuyển cấu trúc thành cập nhật nguyên tử hoặc hàng đợi thông điệp thay vì cố chấp nới lỏng thông số số lần thử.

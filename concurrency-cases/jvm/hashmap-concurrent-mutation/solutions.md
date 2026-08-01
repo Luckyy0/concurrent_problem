@@ -1,9 +1,8 @@
-# Giải pháp, code đã sửa và các đánh đổi
+# Giải Pháp Kiến Trúc Tối Ưu và Ma Trận Đánh Đổi
 
-## Giải pháp 1: immutable snapshot qua AtomicReference
+## 1. Phương Án Lõi: Bản Chụp Bất Biến Qua AtomicReference (Immutable Snapshot)
 
-Đây là lựa chọn khuyến nghị khi request đọc thường xuyên còn refresh thay toàn bộ
-bảng rule. Snapshot gói cả generation và map để hai phần được công bố cùng nhau.
+Chiến thuật thượng tôn cho hệ thống Bào Đọc (Read-heavy) và Yêu cầu Tái thiết Toàn Bảng. Cấu trúc đóng gói đồng nhất Metadata (Generation) và Dữ liệu Map làm một Khối Nguyên Tử.
 
 ```java
 package com.example.routing;
@@ -15,6 +14,7 @@ public record RoutingSnapshot(
         Map<String, PaymentRoute> routes
 ) {
     public RoutingSnapshot {
+        // Tái tạo Bản sao Phòng thủ Bất Biến (Defensive Copy)
         routes = Map.copyOf(routes);
     }
 
@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public class PaymentRoutingRegistry {
 
     private final RoutingConfigClient configClient;
+    // Điểm Hiệu Lực Trung Tâm (Linearization Point)
     private final AtomicReference<RoutingSnapshot> current =
             new AtomicReference<>(RoutingSnapshot.empty());
 
@@ -45,6 +46,7 @@ public class PaymentRoutingRegistry {
     }
 
     public Optional<PaymentRoute> selectRoute(String merchantId) {
+        // Bào đọc: Lấy Tham chiếu Duy nhất, Phục vụ Toàn Hành Trình
         RoutingSnapshot snapshot = current.get();
         return Optional.ofNullable(snapshot.routes().get(merchantId));
     }
@@ -56,16 +58,18 @@ public class PaymentRoutingRegistry {
     @Scheduled(fixedDelayString = "${routing.refresh-delay:PT30S}")
     public void refresh() {
         RoutingSnapshot loaded = configClient.loadSnapshot();
-        validate(loaded);
+        validate(loaded); // Tường Lửa Thẩm định Dữ liệu Rác
         publishIfNewer(loaded);
     }
 
     boolean publishIfNewer(RoutingSnapshot loaded) {
         while (true) {
             RoutingSnapshot observed = current.get();
+            // Cự Tuyệt Tàn Nhẫn Kẻ Lỗi Thời
             if (loaded.generation() <= observed.generation()) {
                 return false;
             }
+            // Mệnh lệnh Xuất Bản Nguyên Tử
             if (current.compareAndSet(observed, loaded)) {
                 return true;
             }
@@ -74,47 +78,29 @@ public class PaymentRoutingRegistry {
 
     private void validate(RoutingSnapshot snapshot) {
         if (snapshot.routes().isEmpty()) {
-            throw new IllegalArgumentException("routing snapshot must not be empty");
+            throw new IllegalArgumentException("Khước từ Bản Chụp Trống Rỗng");
         }
         boolean mixedGeneration = snapshot.routes().values().stream()
                 .anyMatch(route -> route.generation() != snapshot.generation());
         if (mixedGeneration) {
-            throw new IllegalArgumentException("route generation mismatch");
+            throw new IllegalArgumentException("Khước từ Thế Hệ Lai Tạp");
         }
     }
 }
 ```
 
-`RoutingConfigClient.loadSnapshot()` phải trả object đã dựng đầy đủ. Constructor
-của `RoutingSnapshot` tạo defensive copy bằng `Map.copyOf`; `PaymentRoute` là
-immutable `record` nên không có mutation phía sau snapshot.
+### Cơ Trí Tối Thượng Của Khối Bất Biến
+- Quyền Năng `current.get()`: Đoạt tham chiếu đúng 1 lần cho mọi Đọc/Truy Xuất, Cắt đứt hoàn toàn nguy cơ dính dáng Dữ Liệu Thay Đổi.
+- Giao Điểm Nguyên Tử kiến tạo Tường Lửa Khả Kiến (Safe Publication) tuyệt đối.
+- Tuyến Ghi bị tước bỏ khả năng Phá Hủy (Mutate) Dữ liệu đã Lên Sóng.
+- Lệnh So-Sánh-Và-Gán (CAS) là Lưới Đánh Chặn xung đột của Đa Tuyến Ghi. Kẻ Mang Thế Hệ Cũ Bị Tiêu Diệt Ngay Tức Khắc.
+- Tuyến Đọc lướt qua Hàng Đợi, Khước từ Áp lực Nghẽn Đóng Băng trong lúc Client Gánh Dữ Liệu.
 
-### Vì sao invariant được bảo vệ
+> **Nguyên tắc kỹ thuật:** Nhà thầu (Writer) đúc bê tông toàn bộ Công trình ở Phân xưởng, rồi thay biển Hiệu ngay trong Đêm (CAS). Người dân (Request) vĩnh viễn không bao giờ phải chịu trận Bụi bặm của quá trình Xây Dựng Cấu Trúc.
 
-- Reader gọi `current.get()` đúng một lần cho mỗi operation.
-- Atomic read/write tạo visibility và safe publication.
-- Writer không mutate snapshot đã công bố.
-- Compare-and-set là nơi phát hiện conflict giữa hai writer.
-- Writer có generation cũ hơn thua ngay và không retry vô hạn.
-- Reader không block trong lúc config service đang tải dữ liệu.
+## 2. Phương Án Trọng Tài Độc Nhất: Bản Chụp Bất Biến Volatile
 
-> **Nói ngắn gọn:** writer chuẩn bị cả bảng ở hậu trường rồi đổi biển chỉ dẫn một
-> lần; request không bao giờ nhìn thấy quá trình lắp ráp.
-
-### Xử lý lỗi và timeout
-
-Config client phải có connect/read timeout. Nếu load hoặc validate thất bại,
-`publishIfNewer` chưa chạy nên snapshot cũ vẫn phục vụ request. Retry thuộc refresh
-workflow và cần backoff; không retry ngay trong request path.
-
-Nếu nhiều writer cùng tải, compare-and-set có thể thất bại vì writer khác đã
-publish. Vòng lặp đọc lại generation: snapshot cũ hơn dừng, snapshot mới hơn thử
-CAS lần nữa.
-
-## Giải pháp 2: volatile immutable snapshot
-
-Khi chỉ có một writer hoặc không cần CAS để bảo vệ generation tăng đơn điệu, một
-field `volatile` đơn giản hơn:
+Rút gọn cấu trúc khi Hệ thống Tuyên thệ chỉ Duy trì Độc Tôn 1 Tuyến Ghi, Triệt tiêu Cấu trúc CAS phức tạp.
 
 ```java
 @Service
@@ -129,26 +115,17 @@ public class VolatileSnapshotRoutingRegistry {
 
     public void refresh(RoutingSnapshot loaded) {
         RoutingSnapshot validated = validateAndCopy(loaded);
-        current = validated;
+        current = validated; // Lệnh Xuất Bản Đơn Tốc Volatile
     }
-
-    private RoutingSnapshot validateAndCopy(RoutingSnapshot loaded) {
-        if (loaded.routes().isEmpty()) {
-            throw new IllegalArgumentException("routing snapshot must not be empty");
-        }
-        return new RoutingSnapshot(loaded.generation(), loaded.routes());
-    }
+// ...
 }
 ```
 
-Volatile write công bố toàn bộ object graph đã được dựng trước đó, còn volatile
-read lấy snapshot mới nhất theo memory model. Tuy nhiên, check generation rồi gán
-là một compound action; nếu có nhiều writer, cần lock hoặc `AtomicReference` CAS.
+Phép Ghi `volatile` phát tán Tính Toàn Vẹn Cấu Trúc Khả Kiến Mạng Lưới; Phép Đọc bảo chứng Tươi Mới. Rủi ro: Khối lệnh Khảo sát Thế Hệ đan xen Khối Gán biến đổi thành Hành Vi Phức Hợp (Compound Action); Nếu có Đa Tuyến Ghi (Multi-writer), Khung Sườn Vỡ Vụn Ngay Lập Tức.
 
-## Giải pháp 3: ConcurrentHashMap cho update độc lập theo key
+## 3. Chấp Nhận Khuyết Tật Tập Thể: Mô Hình ConcurrentHashMap
 
-Nếu mỗi merchant có vòng đời độc lập và nghiệp vụ chấp nhận các key được cập
-nhật ở thời điểm khác nhau, dùng `ConcurrentHashMap`:
+Áp dụng cho Mô hình Quản Trị Khóa Độc Lập (Per-Merchant) - Buông bỏ Luật "Đồng Nhất Thế Hệ":
 
 ```java
 @Service
@@ -162,34 +139,23 @@ public class PerMerchantRoutingRegistry {
     }
 
     public void upsert(String merchantId, PaymentRoute route) {
-        routes.put(merchantId, route);
-    }
-
-    public void remove(String merchantId) {
-        routes.remove(merchantId);
+        routes.put(merchantId, route); // Đóng Cọc Từng Mũi Độc Lập
     }
 
     public List<String> enabledMerchantsApproximation() {
         return routes.entrySet().stream()
                 .filter(entry -> entry.getValue().enabled())
                 .map(Map.Entry::getKey)
-                .toList();
+                .toList(); // Cảnh báo: Kết quả Tạp Nham (Weakly Consistent)
     }
 }
 ```
 
-Code này bảo vệ cấu trúc map và từng operation theo key. Iterator không ném
-`ConcurrentModificationException`, nhưng là weakly consistent: kết quả có thể
-chứa một số update mới và bỏ qua update khác. Vì vậy method đặt tên
-`enabledMerchantsApproximation` để contract không giả vờ trả snapshot chính xác.
+Bảo toàn Cấu Trúc, Tránh Lỗi Ngoại Lệ, Bù lại Hệ Thống Trả về Khối Dữ Liệu Lai Tạp. Định danh Rạch Ròi Khái Niệm `Approximation` (Ước Lượng) để Caller Không Bị Đánh Tráo Khái Niệm.
 
-Không dùng phương án này cho invariant “toàn bộ bảng cùng generation”, trừ khi
-thiết kế thêm versioning và reader protocol tương ứng.
+## 4. Xích Cổ Khóa Trọng Lực: ReentrantReadWriteLock
 
-## Giải pháp 4: ReentrantReadWriteLock cho mutable state
-
-Khi cần mutate nhiều cấu trúc liên quan và reader cần một view nhất quán, tất cả
-đường truy cập có thể dùng cùng read-write lock:
+Lựa chọn Cực Đoan bảo vệ Tính Khả Biến Cấu Trúc (Mutable State) Bắt buộc: Đóng đinh Tuyến Đọc/Tuyến Ghi vào Chung Lõi Khóa.
 
 ```java
 @Service
@@ -207,18 +173,9 @@ public class LockedRoutingRegistry {
         }
     }
 
-    public Map<String, PaymentRoute> snapshot() {
-        lock.readLock().lock();
-        try {
-            return Map.copyOf(routes);
-        } finally {
-            lock.readLock().unlock();
-        }
-    }
-
     public void replaceAll(Map<String, PaymentRoute> loaded) {
-        Map<String, PaymentRoute> validated = Map.copyOf(loaded);
-        lock.writeLock().lock();
+        Map<String, PaymentRoute> validated = Map.copyOf(loaded); // Xác Thực Ngoài Vùng Khóa
+        lock.writeLock().lock(); // Xích Chặt Toàn Cục Tuyến Đọc
         try {
             routes.clear();
             routes.putAll(validated);
@@ -229,46 +186,23 @@ public class LockedRoutingRegistry {
 }
 ```
 
-Load remote data và validate diễn ra trước khi lấy write lock. Writer chỉ giữ
-lock trong đoạn thay state ngắn. Reader block trong lúc replace, nhưng không thấy
-state trung gian. Mọi method, kể cả diagnostic và test helper, phải tuân thủ cùng
-lock.
+Tuyến Đọc Phải Hiến Tế Độ Trễ (Block) để đổi lấy Không Gian Nhất Quán Tuyệt Đối. Sự xuất hiện của Khóa làm tê liệt Khả năng Xử lý Đỉnh Tải (Peak).
 
-## So sánh các đánh đổi
+## 5. Ma Trận Đánh Đổi Chiến Lược (Trade-offs)
 
-| Phương án | Correctness phù hợp | Reader | Writer/contention | Multi-instance | Độ phức tạp vận hành |
-| --- | --- | --- | --- | --- | --- |
-| `AtomicReference` + immutable snapshot | Snapshot toàn bảng, generation tăng đơn điệu với CAS | Không block, một atomic read | Tốn copy khi refresh; writer conflict được phát hiện | Chỉ bảo vệ từng JVM | Thấp đến vừa |
-| `volatile` + immutable snapshot | Snapshot toàn bảng với single writer | Không block | Không tự bảo vệ check-then-set giữa nhiều writer | Chỉ bảo vệ từng JVM | Thấp |
-| `ConcurrentHashMap` | Từng key độc lập | Concurrent, iterator weakly consistent | Contention phân tán theo key | Chỉ bảo vệ từng JVM | Thấp |
-| `ReentrantReadWriteLock` | Compound state và iteration nhất quán | Có thể block | Writer chờ mọi reader; giữ lock sai làm tăng latency | Chỉ bảo vệ từng JVM | Vừa |
-| `synchronized` | Đúng nếu mọi access cùng monitor | Block theo một lock chung | Đơn giản nhưng serialize mạnh | Chỉ bảo vệ từng JVM | Thấp |
+| Giải Pháp Kỹ Thuật | Đặc Tính Trọng Tâm | Tác Động Tuyến Đọc | Tác Động Tuyến Ghi/Nghẽn | Phạm Vi Khai Thác |
+| --- | --- | --- | --- | --- |
+| `AtomicReference` (Khuyên Dùng) | Bản Chụp Bất Biến Toàn Bảng, Thế Hệ Tiến Đơn Điệu | Tốc Độ Quang Học (1 Lệnh) | Trả Giá Chi Phí Copy Gắn Rời | Nội Bộ 1 JVM |
+| `volatile` Snapshot | Kế Thừa Sức Mạnh Chụp, Hủy Chống Đa Ghi | Tốc Độ Quang Học | Sụp Đổ Trước Đa Tuyến Ghi | Nội Bộ 1 JVM |
+| `ConcurrentHashMap` | Khóa Độc Lập Biến Động, Khước Từ Tính Thế Hệ | Khả Kiến Lỏng, Đọc Trộn Thế Hệ | Kháng Nghẽn Cực Cao Theo Key | Nội Bộ 1 JVM |
+| `ReadWriteLock` | Khóa Chết Trạng Thái Khả Biến Đa Lớp | Chịu Trận Đóng Băng Khóa Ghi | Bức Tử Hệ Thống Đọc Dưới Tải Lớn | Nội Bộ 1 JVM |
+| Kiến Trúc Phân Tán (Database/Protocol) | Dập Tắt Biến Thiên Toàn Mạng Lưới Cluster | Ngân Sách Network (Cao) | Kiểm Soát Giao Dịch Phức Hợp | Kiến Trúc Microservices Toàn Cục |
 
-Không có con số throughput hoặc latency chung cho mọi workload. Cần đo với tỷ lệ
-read/write, kích thước snapshot và thời gian copy thực tế.
+## 6. Sách Lược Vận Hành (Production Imperatives)
 
-## Khi nào nên dùng
-
-- Chọn `AtomicReference` snapshot cho bảng cấu hình read-heavy, replace-all và
-  cần loại bỏ stale writer.
-- Chọn `volatile` snapshot khi publisher thật sự là single writer.
-- Chọn `ConcurrentHashMap` khi semantics là per-key, không phải snapshot.
-- Chọn read-write lock khi state mutable phức tạp hoặc nhiều collection phải đổi
-  cùng nhau.
-- Chuyển invariant sang database/configuration protocol khi nhiều node phải
-  thống nhất cùng generation.
-
-## Lưu ý khi áp dụng thực tế
-
-- Đặt giới hạn kích thước snapshot trước `Map.copyOf` để tránh memory spike.
-- Không log toàn bộ route table; log generation, số entry, checksum và thời gian
-  load/validate/publish.
-- Theo dõi `current_generation`, `refresh_success_total`,
-  `refresh_failure_total`, `stale_publish_rejected_total` và tuổi snapshot.
-- Alert khi snapshot quá cũ hoặc liên tiếp bị refresh failure.
-- Không mutate `PaymentRoute` sau publish; nếu value chứa list/map, tạo defensive
-  copy cho các cấu trúc lồng nhau.
-- Shutdown không cần rollback snapshot local, nhưng config client/executor tự tạo
-  phải được đóng theo lifecycle của Spring.
-- Canary và nhiều node cần hiển thị generation theo instance để phát hiện lệch
-  cấu hình giữa các node.
+- Ngăn Chặn Khủng Hoảng RAM Bằng Giới Hạn Kích Thước (Size Limit) tại ngưỡng Cửa `Map.copyOf`.
+- Khước từ Tẩy Rác Log Toàn Bộ Dữ Liệu; Khoanh Vùng Checksum, Thế Hệ và Đếm Mục Lục.
+- Quét Hệ Thống `stale_publish_rejected_total` và Thời Hạn Tuổi Đời Snapshot Lỗi.
+- Kích Hoạt Tín Hiệu Cảnh Báo Đỏ (Alert) khi Vòng Đời Tải Dữ Liệu Liên Tiếp Thất Bại Dưới Cờ Fail.
+- Phế Truất Mọi Hoạt Động Cày Xới `PaymentRoute` (Mutate Value) Hậu Xuất Bản.
+- Cấu Hình Giám Sát Phân Tán: Phơi Trần Thế Hệ (Generation Dashboard) Phân Loại Theo Định Danh Node Để Tầm Soát Lệch Cấu Hình.

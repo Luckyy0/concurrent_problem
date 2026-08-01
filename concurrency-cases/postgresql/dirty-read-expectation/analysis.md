@@ -1,4 +1,4 @@
-# Mổ Xẻ Tầm Nhìn MVCC Của PostgreSQL
+# Phân Tích Tầm Nhìn MVCC (Phân tích khả năng hiển thị ở PostgreSQL)
 
 ## 1. Trạng Thái Khởi Đầu (Initial state)
 
@@ -7,227 +7,214 @@ job_id          = IMPORT-42
 status          = RUNNING
 progress        = 20
 generation      = 7
-last commit     = Tx-0 (Giao dịch số 0 đã chốt sổ)
+last commit     = Tx-0 (Giao dịch số 0 đã commit trước đó)
 ```
 
-Ông A (Processor) và ông B (Watchdog) dùng hai kết nối/giao dịch PostgreSQL độc lập, chả liên quan gì nhau.
+Luồng Processor (A) và luồng Watchdog (B) sử dụng hai kết nối/giao dịch độc lập đến PostgreSQL.
 
-## 2. Sự Cực Kỳ Ảo Tưởng Của Coder (Expected theo broken design)
+## 2. Kỳ Vọng Theo Thiết Kế Lỗi (Expected theo broken design)
 
 ```text
-Ông A cập nhật tiến độ lên 80 nhưng chưa thèm chốt (chưa commit).
-Ông B tới gõ cửa, xin phép ĐỌC_BẨN (READ_UNCOMMITTED).
-Ông B hí hửng đọc được con số 80.
-Ông B gật gù: "Job vẫn sống nhăn răng (HEALTHY)!".
+Processor A cập nhật tiến độ lên 80 nhưng chưa commit.
+Watchdog B truy vấn với cấu hình Đọc Bẩn (READ_UNCOMMITTED).
+Watchdog B đọc được giá trị 80.
+Watchdog B kết luận: "Tiến trình vẫn đang hoạt động (HEALTHY)".
 ```
 
-## 3. Sự Thật Phũ Phàng Ở PostgreSQL (PostgreSQL actual)
+## 3. Thực Tế Hoạt Động Ở PostgreSQL (PostgreSQL actual)
 
 ```text
-Ông A cập nhật tiến độ lên 80 nhưng chưa chốt (chưa commit).
-Ông B tới gõ cửa, xin phép ĐỌC_BẨN (READ_UNCOMMITTED).
-Ông B cay đắng chỉ nhận được con số 20 cũ mèm (đã commit từ đời nào).
-Ông B hoảng hốt: "Chết rồi, Job bị kẹt! Gọi cứu hộ (START_RECOVERY) ngay!".
+Processor A cập nhật tiến độ lên 80 nhưng chưa commit.
+Watchdog B truy vấn với cấu hình Đọc Bẩn (READ_UNCOMMITTED).
+Watchdog B chỉ nhận được giá trị 20 (phiên bản đã commit gần nhất).
+Watchdog B kết luận sai lệch: "Tiến trình bị kẹt! Kích hoạt khôi phục (START_RECOVERY)".
 ```
 
-Nếu ông A thấy hối hận và Hủy kèo (Rollback), con số cuối cùng vẫn nằm ở `20`. Nếu ông A chốt sổ `80` *sau khi* B đọc xong, thì chỉ có thằng nào chạy một lệnh SELECT *mới* tinh bắt đầu sau đó mới thấy được số `80`. B lỡ đọc rồi thì ráng mà chịu cũ.
+Nếu Processor A gặp lỗi và Hủy giao dịch (Rollback), giá trị cuối cùng vẫn được giữ nguyên là `20`. Nếu Processor A hoàn tất việc commit `80` *sau khi* B đã đọc dữ liệu, thì giao dịch của B cũng không tự động cập nhật được con số mới. Chỉ các câu lệnh `SELECT` mới, được khởi tạo sau khi A đã commit, mới thấy được giá trị `80`.
 
-## 4. Dòng Thời Gian Ba Mặt Một Lời (Timeline ba actor)
+## 4. Dòng Thời Gian Tương Tranh (Timeline ba actor)
 
-| Bước | Ông A (Làm việc) — Tx-A | Ông B (Giám sát) — Tx-B | Đội Cứu Hộ C |
+| Bước | Processor A — Tx-A | Watchdog B — Tx-B | Recovery C |
 | --- | --- | --- | --- |
 | T0 | BẮT ĐẦU Giao Dịch | | |
-| T1 | SỬA (UPDATE) progress=80 | | |
-| T2 | XẢ (FLUSH) xuống DB, Ngâm tiếp | | |
+| T1 | CẬP NHẬT (UPDATE) progress=80 | | |
+| T2 | LƯU XUỐNG DB (FLUSH), tiếp tục xử lý | | |
 | T3 | | BẮT ĐẦU xin Đọc Bẩn (RU) | |
-| T4 | | Chụp ảnh (SELECT) -> Thấy 20 | |
-| T5 | | Ra quyết định: Báo Động! | |
-| T6 | | CHỐT SỔ (COMMIT) | Bắt đầu chạy trùng lặp (duplicate work) |
-| T7 | Tiếp tục mần ăn hoặc lỗi vặt | | |
-| T8 | CHỐT SỔ (COMMIT 80) hoặc HỦY | | |
+| T4 | | Truy vấn (SELECT) -> Nhận 20 | |
+| T5 | | Quyết định: Kích hoạt báo động | |
+| T6 | | ĐÓNG GIAO DỊCH (COMMIT) | Bắt đầu chạy trùng lặp (duplicate work) |
+| T7 | Tiếp tục công việc hoặc lỗi | | |
+| T8 | ĐÓNG GIAO DỊCH (COMMIT) hoặc ROLLBACK | | |
 
-Chốt lại: Ở bước T4, chẳng có miếng Đọc Bẩn nào diễn ra cả! Lỗi nghiệp vụ (Business failure) ở đây là do ông B dùng việc "Không thấy tiến độ tăng" làm bằng chứng "Job bị kẹt", trong khi thực tế ông A vẫn đang hì hục làm việc.
+Tại bước T4, cơ sở dữ liệu không hề cung cấp dữ liệu chưa commit (Đọc Bẩn). Lỗi thiết kế nghiệp vụ (Business failure) xảy ra khi Watchdog B sử dụng việc "tiến độ không tăng" làm bằng chứng xác định "Tiến trình bị kẹt", trong khi thực tế Processor A vẫn đang làm việc bên trong một giao dịch dài.
 
-> **Khắc cốt ghi tâm:** "Đọc Dữ Liệu Đã Chốt" và "Tín Hiệu Nhịp Tim (Liveness)" là 2 hợp đồng hoàn toàn khác biệt. Một cái Giao dịch đang mở toang hoác không thể thay thế cho một kênh Nhịp Tim (Heartbeat channel) đàng hoàng được!
+> **Khắc cốt ghi tâm:** "Dữ liệu đã commit" và "Tín hiệu hoạt động (Heartbeat/Liveness)" là hai khái niệm khác biệt. Một giao dịch cơ sở dữ liệu đang mở (open transaction) không thể thay thế cho một cơ chế nhịp tim giám sát (heartbeat mechanism) rõ ràng.
 
-## 5. Trò Ảo Thuật Phân Thân Của MVCC (MVCC tuple versions)
+## 5. Cơ Chế Đa Phiên Bản Của MVCC (MVCC tuple versions)
 
-Khi ông A chạy lệnh SỬA (UPDATE), DB không đè bẹp dòng cũ, mà đẻ ra một cái bóng (version) mới:
-
-```text
-Bóng cũ: progress=20, tạo ra bởi Giao dịch Tx-0 đã chốt sổ.
-Bóng mới: progress=80, tạo ra bởi Giao dịch Tx-A đang mấp mé chưa chốt.
-```
-
-Bức ảnh chụp (Snapshot) của ông B:
-- Thấy bóng cũ `20` rõ mồn một.
-- Giao dịch Tx-A chưa chốt nên cái bóng mới `80` tàng hình.
-- B không cần phải đọc ba mớ byte lổn nhổn chưa thành hình.
-- Lệnh Đọc Chay (plain SELECT) của B rảnh rang đi lướt qua cái bóng cũ mà chả thèm phải chờ đợi ông A nhả Khóa.
-
-Ông A tự sướng thì luôn thấy được dữ liệu của chính mình sửa. Điều đó KHÔNG CÓ NGHĨA ông B được quyền nhìn ké.
-
-## 6. PostgreSQL Chơi Chữ Mức Cô Lập (PostgreSQL isolation mapping)
-
-Chuẩn SQL thế giới cho phép Đọc Bẩn ở mức `READ UNCOMMITTED`. Nhưng ông nội PostgreSQL thì cứng đầu tự cung cấp cơ chế bảo vệ mạnh mẽ hơn: Cứ xin RU thì bố cấp cho RC (`READ COMMITTED` - Chỉ Đọc Đã Chốt).
-
-Có 2 sự thật bạn phải thông não:
-1. **Cái Mác Bề Ngoài (reported/requested label):** Cài đặt biến `transaction_isolation` hoặc nhờ JDBC báo cáo, nó vẫn giả bộ nổ là `read uncommitted` cho bạn vui lòng.
-2. **Hành Xử Thật Sự (effective visibility semantics):** Đọc Chay vĩnh viễn không thấy những dòng dữ liệu của thằng khác chưa chốt.
-
-Vì thế, code test chuẩn phải là:
-```text
-Lưu lại cái Nhãn Dán để tiện bề mắng vốn.
-Nhưng phải Assert vào Dữ Liệu Thật Sự nhận được để kiểm chứng độ chính xác.
-```
-Tuyệt đối không viết test lười biếng chỉ đi kiểm tra cái chuỗi chữ `"read uncommitted"` rồi tự sướng suy diễn là DB cho phép Đọc Bẩn.
-
-## 7. Bức Ảnh Chụp Lại (Snapshot) Của Từng Câu Lệnh (Statement snapshot)
-
-Lệnh Đọc Chay của B dùng cách "Chụp ảnh tại thời điểm bắt đầu Câu Lệnh":
+Khi Processor A thực thi lệnh `UPDATE`, PostgreSQL không trực tiếp ghi đè lên dòng dữ liệu cũ, mà tạo ra một phiên bản mới (new tuple version):
 
 ```text
-Bắt đầu SELECT trước khi A chốt -> Thấy 20 cho đến khi chạy xong dòng SELECT đó.
-A chốt sổ xong.
-Lệnh SELECT TIẾP THEO bắt đầu chạy -> Hên xui có thể thấy 80.
+Phiên bản cũ: progress=20, tạo ra bởi Giao dịch Tx-0 đã commit.
+Phiên bản mới: progress=80, tạo ra bởi Giao dịch Tx-A chưa commit.
 ```
 
-Sự khác biệt khi gõ 2 lệnh SELECT liên tiếp mà ra 2 kết quả "Đã chốt" khác nhau gọi là `Non-repeatable read` (Đọc Không Lặp Lại), sẽ được bóc phốt ở bài DB-003. Đừng nhầm lẫn nó với Đọc Bẩn!
+Bức ảnh chụp dữ liệu (Snapshot) của Watchdog B sẽ xử lý như sau:
+- Nhìn thấy phiên bản cũ `20` hợp lệ.
+- Giao dịch Tx-A chưa commit nên phiên bản mới `80` hoàn toàn vô hình.
+- Lệnh đọc thông thường (plain `SELECT`) của B không cần phải chờ đợi khóa (lock) từ A, mà trực tiếp sử dụng phiên bản cũ.
 
-## 8. Đọc Chay (Plain SELECT) Và Khóa Dòng (Row Lock)
+Processor A luôn thấy được dữ liệu của chính nó trong cùng giao dịch, nhưng điều này không đồng nghĩa với việc giao dịch B có thể đọc được dữ liệu đó.
 
-Lệnh UPDATE của A ôm chặt cái Khóa Dòng (row-level lock) cho đến tận lúc Chốt/Hủy.
-Lệnh Đọc Chay của B:
-- Không xin xỏ cái Khóa đối nghịch `FOR UPDATE`.
-- Lẻn đi đọc cái bóng cũ đã chốt.
-- Tuyệt đối không rảnh háng đứng đợi nhà văn (writer) hiện tại.
+## 6. Xử Lý Mức Độ Cô Lập Trong PostgreSQL (PostgreSQL isolation mapping)
 
-Nhưng nếu B chơi hệ Lấy Khóa:
+Tiêu chuẩn SQL cho phép hiện tượng Đọc Bẩn ở mức `READ_UNCOMMITTED`. Tuy nhiên, PostgreSQL được thiết kế chặt chẽ hơn: Yêu cầu `READ_UNCOMMITTED` luôn được âm thầm xử lý tương đương với `READ_COMMITTED` (Chỉ đọc dữ liệu đã commit).
+
+Cần phân biệt rõ:
+1. **Mức độ được báo cáo (Reported/Requested label):** Cấu hình `transaction_isolation` hoặc hàm API JDBC có thể trả về giá trị `read uncommitted` để giữ tính tương thích mã nguồn.
+2. **Hành vi thực tế (Effective visibility semantics):** Các lệnh đọc thông thường vĩnh viễn không thể thấy được dữ liệu của giao dịch khác chưa commit.
+
+Khi viết kiểm thử tự động, bạn phải đối chiếu trực tiếp giá trị nghiệp vụ (`progress`) trả về, không nên chỉ kiểm tra giá trị của cờ isolation và kết luận hệ thống có hỗ trợ Đọc Bẩn.
+
+## 7. Ảnh Chụp Dữ Liệu Từng Câu Lệnh (Statement snapshot)
+
+Lệnh `SELECT` thông thường của B áp dụng cơ chế "chụp ảnh dữ liệu tại thời điểm câu lệnh bắt đầu thực thi":
+
+```text
+Bắt đầu SELECT trước khi A commit -> Chỉ nhìn thấy 20.
+A hoàn thành commit.
+Một lệnh SELECT mới bắt đầu -> Lúc này sẽ thấy 80.
+```
+
+Sự khác biệt khi chạy hai lệnh `SELECT` liên tiếp và nhận hai kết quả đã commit khác nhau được gọi là `Non-repeatable read`, hiện tượng này hoàn toàn khác biệt với Đọc Bẩn (Dirty Read) và sẽ được phân tích ở bài `DB-003`.
+
+## 8. Đọc Thông Thường (Plain SELECT) Và Khóa Dòng (Row Lock)
+
+Lệnh `UPDATE` của A chiếm giữ khóa cấp dòng (row-level lock) cho đến khi commit hoặc rollback.
+Lệnh đọc thông thường của B:
+- Không yêu cầu cấp phát khóa đối nghịch (như `FOR UPDATE`).
+- Truy cập vào phiên bản dữ liệu cũ.
+- Không bị chặn đứng (block) bởi quá trình ghi của A.
+
+Tuy nhiên, nếu B sử dụng cơ chế đọc có khóa:
 ```sql
 select *
 from job_run
 where job_id = :id
 for update;
 ```
-Trò này có thể bị Block (đứng đợi) ông A. Sau khi A giải quyết xong:
-- A chốt sổ: B húp lấy dòng Dữ liệu Mới.
-- A Hủy kèo (rollback): B ngậm ngùi cầm lại dòng `20` cũ kỹ.
+Câu lệnh này sẽ bị chặn (block) và đứng chờ A. Sau khi A xử lý xong:
+- A commit: B nhận được dữ liệu mới nhất (`80`).
+- A rollback: B tiếp tục lấy giá trị cũ (`20`).
 
-Túm lại: "Đọc Lấy Khóa" thì đứng đợi kết quả cuối cùng; nó KHÔNG phơi ra Đồ Chơi Dở Dang (dirty version).
+Tóm lại: Đọc có khóa (Locking Read) là cơ chế "đợi kết quả cuối cùng", nó không sinh ra hiện tượng Đọc Bẩn.
 
-## 9. Hủy Kèo (Rollback) Và Nhặt Rác (Aborted versions)
+## 9. Rollback Và Quản Lý Dữ Liệu Rác (Aborted versions)
 
-Chuyện gì xảy ra nếu A Hủy kèo?
+Điều gì xảy ra nếu Processor A gặp lỗi và Rollback?
 ```text
-Bóng mới 80 đẻ non -> Trở thành đồ phế liệu (aborted/dead).
-Bóng cũ 20 -> Tiếp tục là hoa hậu cho mọi người chiêm ngưỡng.
+Phiên bản mới 80 bị hủy -> Trở thành dữ liệu rác (aborted/dead tuple).
+Phiên bản cũ 20 -> Tiếp tục là phiên bản chính thức.
 ```
-Công đoạn quét rác vật lý (Physical cleanup) như vacuum/hint-bit kệ nó, nó thích quét lúc nào thì quét. Nhưng Tầm Nhìn Logic thì có luật thép: B không bao giờ được phép đọc vào cái đống phế liệu kia.
+Cơ chế dọn dẹp vật lý của PostgreSQL (như `VACUUM`) sẽ xử lý các dòng dữ liệu rác này một cách bất đồng bộ. Về mặt logic, PostgreSQL cấm tuyệt đối các giao dịch khác nhìn thấy hoặc sử dụng dữ liệu từ các giao dịch đã bị hủy. 
 
-Đó là lý do tại sao dùng Đọc Bẩn cho tiến độ là chơi dao hai lưỡi, ngay cả trên cái Database cho phép Đọc Bẩn: Bạn có thể đưa ra quyết định chết người (recovery) dựa trên một cục Data bị Hủy mất tích không dấu vết!
+Đây là rủi ro lớn nhất của cơ chế Đọc Bẩn (nếu sử dụng CSDL khác có hỗ trợ): Bạn có thể ra quyết định khôi phục hệ thống dựa trên một dữ liệu sẽ bị xóa bỏ ngay sau đó.
 
-## 10. Ranh Giới Giữa Việc Xả (Flush) Và Chốt (Commit)
+## 10. Ranh Giới Giữa Lệnh Cập Nhật (Flush) Và Xác Nhận (Commit)
 
-Quy trình xả của Hibernate:
-- Soi xem Object có dơ không (dirty-check).
-- Gõ lệnh UPDATE vứt xuống DB.
-- PostgreSQL lẳng lặng nặn ra một cái bóng chưa chốt.
-- Hibernate ôm khư khư cái Khóa dưới DB.
-- Và... chưa cho ai khác được xem cái bóng này.
+Quy trình đồng bộ của các ORM framework (như Hibernate):
+- Nhận diện sự thay đổi trạng thái của Entity (dirty-check).
+- Đẩy câu lệnh `UPDATE` xuống cơ sở dữ liệu (`flush`).
+- PostgreSQL ghi nhận thao tác và tạo phiên bản dữ liệu dở dang (chưa commit).
+- ORM tiếp tục duy trì giao dịch và khóa dòng dữ liệu.
+- Dữ liệu này chỉ được nhìn thấy bởi chính giao dịch hiện hành.
 
-Chỉ khi bạn gõ lệnh Commit thì cái bóng đó mới vinh quang lên ngôi. Dùng hàm `saveAndFlush()` KHÔNG PHẢI là trò bắn pháo hoa báo cáo tiến độ đâu nha!
+Việc gọi phương thức `saveAndFlush()` không đưa dữ liệu ra phạm vi toàn cục. Chỉ khi giao dịch kết thúc bằng lệnh `COMMIT`, sự thay đổi mới chính thức hiển thị cho các giao dịch khác.
 
-## 11. Bóc Phốt Từng Tầng (Root cause theo layer)
+## 11. Đánh Giá Trách Nhiệm Từng Tầng (Root cause theo layer)
 
-| Tầng Lớp | Thói Quen | Lời Chê Bai |
+| Tầng Hệ Thống | Hành Vi Bị Lỗi | Đánh Giá Khách Quan |
 | --- | --- | --- |
-| Spring | Gửi lệnh xin Isolation qua transaction manager | Mấy cái thẻ Annotation chả có quyền lực đảm bảo các DB khác nhau hành xử giống nhau. |
-| JDBC/driver | Chấp nhận cài cái Nhãn Dán Label | Cái Nhãn vớ vẩn không làm thay đổi được luân thường đạo lý MVCC của Server. |
-| PostgreSQL | Xin RU anh cho mày ăn RC | Cửa đóng then cài, Đọc Bẩn là tội ác! |
-| Hibernate | Đẩy Flush xuống mà không chịu Chốt | Chuyện hiển nhiên của Giao Dịch, đừng đổi thừa! |
-| Code của Bạn | Dùng Dữ liệu Ảo ảnh để đòi Giám sát sự sống | Lỗi Thiết Kế Ngang Tầm Thảm Họa (Root design error). |
+| Spring Framework | Chuyển tiếp yêu cầu cấu hình Isolation | Annotation không thể thay đổi hành vi cốt lõi của RDBMS. |
+| JDBC/Driver | Ánh xạ và báo cáo lại Isolation Label | Việc hiển thị label không tác động đến cơ chế MVCC. |
+| PostgreSQL | Từ chối yêu cầu `READ_UNCOMMITTED` | Tuân thủ triết lý bảo vệ dữ liệu mạnh mẽ, tránh dirty-read. |
+| Hibernate | Đẩy lệnh (`flush`) nhưng trì hoãn `commit` | Hành vi tiêu chuẩn của một khối giao dịch, không phải lỗi ORM. |
+| Application | Sử dụng Đọc Bẩn để làm tín hiệu giám sát | Lỗi thiết kế nghiệp vụ cơ bản (Root design error). |
 
-## 12. Ảo Tưởng Đồng Bộ Khắp Mọi Nơi (Portability)
+## 12. Ảo Tưởng Về Tính Tương Thích (Portability)
 
-Cùng một cái tên Isolation, chả có ông trời nào bảo đảm Database này sẽ cho ra lỗi y chang Database kia như bạn kỳ vọng; các nhà làm DB hoàn toàn có thể cài cắm cơ chế xịn hơn để bóp nghẹt các lỗi bẩn.
+Việc giả định rằng cùng một thiết lập mức độ cô lập (Isolation Level) sẽ mang lại hành vi giống hệt nhau trên mọi hệ quản trị CSDL là một sai lầm phổ biến. Các RDBMS có quyền cài đặt các cơ chế bảo vệ nghiêm ngặt hơn chuẩn SQL quy định.
 
-Nếu bạn thiết kế dựa dẫm vào Đọc Bẩn, thì kể cả đem qua xài cái DB lởm có Đọc Bẩn thật, bạn vẫn dính đòn:
-- Đọc phải mớ Data rách nát chưa thành hình (partial/inconsistent).
-- Quyết định việc lớn dựa trên cục Data 5 giây sau sẽ bị Hủy bỏ.
-- Màn hình người dùng báo tiến độ 80%, F5 cái tuột xuống 20% (đi lùi).
-- Các lệnh chạy sửa sai (compensation) đập vỡ hệ thống vì số liệu ảo ma.
-- Code Test pass láng o ở máy mình, lên Server sụp hầm ở máy người khác.
+Nếu hệ thống được thiết kế phụ thuộc vào khả năng Đọc Bẩn, ngay cả khi triển khai trên RDBMS có hỗ trợ tính năng này, ứng dụng vẫn đối mặt với rủi ro:
+- Đọc dữ liệu không nhất quán (partial/inconsistent).
+- Ra quyết định dựa trên dữ liệu có khả năng bị Rollback.
+- Giao diện báo cáo tiến độ thay đổi bất thường (tăng rồi tụt giảm).
+- Các luồng xử lý đồng thời tạo ra side-effect không thể vãn hồi.
 
-Bản hợp đồng xịn xò (Correct contract) là phải dùng Tín hiệu Rõ Ràng (explicit messaging) hoặc Dữ liệu Đã Chốt, chứ không phải đi tìm mỏi mắt một con Database chứa chấp thói Đọc Bẩn của bạn.
+Thiết kế phần mềm chuyên nghiệp (Correct contract) cần dựa trên cơ chế truyền thông điệp rõ ràng (explicit messaging) hoặc trạng thái dữ liệu đã commit, thay vì khai thác một đặc tính không an toàn của CSDL.
 
-## 13. Bài Học Cảnh Giác Cho Người Gác Cổng (Watchdog semantics)
+## 13. Cơ Chế Giám Sát Chuẩn Mực (Watchdog semantics)
 
-Báo Cáo Tiến Độ và Chốt Sổ Thành Công là 2 thế giới tách biệt:
+Báo cáo tiến độ và xác nhận hoàn thành công việc là hai hoạt động khác biệt:
 ```text
-Cố gắng Nhịp Tim/Tiến Độ (Heartbeat):
-  Giao dịch tách biệt tự chốt sổ nhanh gọn lẹ. Có gắn ID, Generation, Hợp Đồng Thuê mướn rõ ràng.
+Cơ chế Nhịp Tim (Heartbeat/Liveness):
+  Sử dụng giao dịch ngắn, độc lập, chốt sổ ngay lập tức. Cần tích hợp định danh (Generation) và hợp đồng thuê mướn (Lease).
 
-Chốt kết quả cuối (Final status):
-  Chỉ vứt vào mả (durable) khi 100% công việc xử lý đã ngon lành.
+Kết quả cuối cùng (Final status):
+  Chỉ lưu trữ lâu dài (durable) khi toàn bộ nghiệp vụ đã xử lý thành công.
 ```
 
-Người Gác Cổng đừng lười biếng chỉ liếc cái % tiến độ. Phải soi:
-- Ai là chủ nhân của Hợp Đồng Thuê này? Token/Thế hệ (generation) của nó?
-- Lần Nhịp Tim cuối cùng (đã chốt) là mấy giờ?
-- Cho phép trễ hẹn bao lâu (Deadline)?
-- Trạng thái cuối là Xong chưa (terminal status)?
-- Dùng một cú lách Khóa Tranh Giành (atomic claim) để lao vào giải cứu.
+Luồng giám sát (Watchdog) cần kiểm tra các thông tin cụ thể, thay vì chỉ dựa vào tiến độ phần trăm:
+- Phiên bản (Generation) và Mã chủ sở hữu (Owner Token) của tiến trình hiện tại.
+- Thời điểm nhận nhịp tim gần nhất (Last seen at).
+- Thời gian trễ tối đa cho phép (Timeout/Deadline).
+- Tiến trình đã kết thúc chưa (Terminal status).
 
-Chỉ vì Tiến Độ Cũ Kỹ không tự động bật đèn xanh cho C lao vào Cứu Hộ. C phải thắng được kèo "Chiếm Quyền Giải Cứu" (conditional claim) để tránh thảm cảnh 100 ông C cùng hò dô đi cứu 1 cái Job.
+Thay vì tự quyết định khôi phục, Watchdog nên dùng câu lệnh ghi nguyên tử (atomic claim) để giành quyền giải cứu một cách an toàn, tránh tình trạng nhiều Watchdog cùng khởi chạy tiến trình khôi phục.
 
-## 14. Tác Hại Của Việc Ngâm Đồ Quá Lâu (Long transaction effect)
+## 14. Tác Hại Của Giao Dịch Chạy Dài (Long transaction effect)
 
-Nếu ông A mở đúng 1 cái Transaction ngâm tôm suốt cả ngàn bước tính toán:
-- Cái tiến độ cứ tàng hình suốt buổi;
-- Khóa, Connection, Ảnh Chụp (Snapshots) kẹt cứng dưới DB ngốn sạch RAM;
-- Lỡ tay Hủy Kèo (Rollback) một cái là đổ sông đổ biển mọi công sức tính toán;
-- Khoảng thời gian Mù Thông Tin (stale window) chà bá, Watchdog tha hồ hoảng loạn.
+Nếu Processor A sử dụng một giao dịch duy nhất cho toàn bộ quá trình xử lý phức tạp:
+- Trạng thái hệ thống trở nên mù mờ (stale visibility).
+- Tài nguyên cơ sở dữ liệu (Kết nối, Khóa, Snapshot) bị chiếm dụng quá lâu, gây áp lực lên bộ nhớ.
+- Khi gặp lỗi Rollback, mọi tính toán trung gian đều bị hủy bỏ gây lãng phí lớn.
+- Thời gian giám sát bị kéo dài dễ dẫn đến báo động nhầm.
 
-Hãy chia mẻ việc (workflow) thành các Trạm Nghỉ (checkpoints) hoặc Máy Trạng Thái (state transitions) để chốt sổ dần. Mỗi Trạm Nghỉ phải có danh phận rõ ràng, đừng vội vỗ ngực xưng tên "Hoàn Thành Chuyến Đi" khi mới tới ngã tư.
+Nên chia nhỏ quy trình nghiệp vụ (workflow) thành các Điểm dừng (checkpoints) hoặc áp dụng kiến trúc Máy trạng thái (state transitions) để rút ngắn chu kỳ commit.
 
-## 15. Chờ Lố Giờ Hay Hỏi Lại (Timeout và polling)
+## 15. So Sánh Timeout Và Hỏi Vòng (Timeout vs Polling)
 
-Hỏi han liên tục (Polling) thật nhanh chẳng qua là bắn cả tỉ câu SELECT và nhận về đúng một con số `20` cũ rích cho tới khi ông A chịu Chốt (Commit). Set Query Timeout (chờ lố giờ) chả ảnh hưởng gì đến Tầm Nhìn Dữ Liệu cả.
+Kỹ thuật hỏi vòng (Polling) liên tục bằng lệnh `SELECT` sẽ chỉ trả về dữ liệu cũ (`20`) cho đến khi giao dịch kia được commit. Thiết lập Timeout cho truy vấn không giải quyết được vấn đề tầm nhìn dữ liệu.
 
-Nếu Watchdog đợi quá sốt ruột (timeout):
-- Đừng có nhào vô nhắm mắt chạy đúp lại việc mờ mịt.
-- Cố gắng Chiếm Lấy Hợp Đồng (Atomic lease/claim) một cách đàng hoàng.
-- Hỏi kỹ lại cái Thế Hệ (generation/status) ngay trong lệnh Ghi Tranh Giành (conditional write).
-- Code hàm Xử lý Đúp lại phải Tự Miễn Dịch (idempotent) phòng khi ông A tỉnh dậy đẩy đồ lần 2.
+Khi Watchdog phát hiện tiến trình vượt quá thời gian chờ (timeout):
+- Không nên tự động chạy lại tiến trình một cách mù quáng.
+- Nên cố gắng giành quyền điều khiển thông qua Hợp đồng (Atomic lease/claim).
+- Kiểm tra tính xác thực (Generation/Status) trong chính câu lệnh cập nhật.
+- Cần triển khai cơ chế tự miễn dịch (Idempotency) để xử lý an toàn nếu Processor A khôi phục hoạt động và tiếp tục xử lý.
 
-## 16. Kịch Bản Cháy Nổ (Crash behavior)
+## 16. Phân Tích Lỗi Hệ Thống (Crash behavior)
 
-- A Sụp Bàn Cầu (crash) trước khi chốt: Kết nối đứt/Rollback; Tiến độ muôn đời là 20.
-- A Chốt sổ 80 xong lăn đùng ra chết trước khi nhận hồi âm: Lệnh SELECT tiếp theo của Watchdog sẽ vớ được số 80 ngon ơ.
-- Watchdog quyết định Giải Cứu xong tự lăn đùng ra chết: Phải lưu vết việc Đòi Quyền (claim) này thật bền bỉ.
-- Recovery C mà cũng ngỏm củ tỏi: Phải có cơ chế Hợp Đồng Thuê cho chính C luôn.
+- Processor A bị lỗi hỏng (Crash) trước khi commit: Kết nối ngắt, giao dịch tự động Rollback, dữ liệu trở về `20`.
+- Processor A commit `80` thành công nhưng ứng dụng lỗi trước khi phản hồi: Lệnh `SELECT` tiếp theo của Watchdog sẽ đọc được `80`.
+- Watchdog lỗi sau khi giành quyền khôi phục: Yêu cầu quản lý trạng thái Lease (cho phép hết hạn hợp đồng) để nhường quyền cho các Watchdog khác.
+- Việc phụ thuộc vào Đọc Bẩn hoàn toàn không giúp hệ thống chống chọi tốt hơn với các sự cố đứt gãy giữa chừng.
 
-Gào thét đòi Đọc Bẩn chả giúp gì được cho bạn trong khâu xử lý Dữ liệu Vô Định hay Nổ Máy ngang xương đâu.
+## 17. Lưu Ý Với Sequence (Sequence caveat)
 
-## 17. Ngoại Lệ Về Sinh Số Tự Động (Sequence caveat)
+Cơ chế sinh chuỗi tự động (Sequence/Auto-increment) trong PostgreSQL hoạt động ngoài phạm vi giao dịch và không bị Rollback nếu giao dịch thất bại. Không nên nhầm lẫn tính năng này với khả năng Đọc Bẩn dữ liệu nghiệp vụ của RDBMS.
 
-Trò nhảy số đếm tự động (Sequence changes) trong PostgreSQL có luật riêng không chung mâm với trò Ghi Cập Nhật Dòng (Row update). Nó có thể lòi số ra ngoài và không bị Rollback như bình thường. Chớ dại mà lấy tính năng Sequence này ra để bảo kê cho luận điểm "Ở DB có Đọc Bẩn nghen mạy!".
+## 18. Xử Lý Tương Tranh Giữa Nhiều Máy Chủ (Multi-instance)
 
-## 18. Nỗi Đau Nhiều Server (Multi-instance)
+Các giải pháp sử dụng biến bộ nhớ (in-memory flags) để báo cáo tiến độ chỉ hoạt động trong phạm vi một JVM duy nhất. Trong kiến trúc phân tán (multi-instance), cơ chế giám sát bắt buộc phải dựa vào dữ liệu đã được chốt xuống CSDL, hàng đợi thông điệp (durable message queue), hoặc kho lưu trữ hợp đồng (Lease store) có tính nhất quán cao.
 
-Nhét một cái Biến Bộ Nhớ để vẫy cờ Nhịp Tim (Flag) ở Máy Chủ A chả có cửa nào báo tin lọt sang Máy Chủ B đang làm Watchdog. Giao tiếp nhiều Server bắt buộc phải dựa vào Dòng dữ liệu chốt sổ của DB, Nhắn Tin bền bỉ (durable message), hoặc kho lưu trữ Hợp Đồng Thuê (Lease store) có Phân Quyền rõ ràng.
+## 19. Chỉ Số Quan Sát Vận Hành (Observability)
 
-Luật chơi Tầm Nhìn MVCC của PostgreSQL là nhất quán cho mọi cái App (instance) nào chọc vào nó. Đừng tưởng nhét vài cái Local Variable (Primitive) vào bộ nhớ JVM là bóp méo được luật của DB!
+Cần giám sát các chỉ số sau để chẩn đoán hệ thống:
+- Mức độ cô lập yêu cầu (Requested Isolation) và nhãn trả về (Reported Label).
+- Giá trị tiến độ và thế hệ (Generation) thực tế đọc được.
+- Thời gian tồn tại trung bình của giao dịch (Transaction duration) từ phía Processor.
+- Trạng thái Nhịp Tim và Kẻ nắm giữ Hợp đồng thuê hiện hành.
+- Tần suất Watchdog kích hoạt cơ chế khôi phục và số lần thất bại do mất quyền (claim rejection).
+- Tần suất Rollback của các giao dịch chia nhỏ (Checkpoints).
 
-## 19. Đo Lường Bệnh Tình Sao Cho Trúng? (Observability)
-
-Ghi chép (Log) lại mấy thứ sau:
-- Cái Nhãn Cô Lập Cùi Bắp mà bạn Xin xỏ / DB phịa ra; Tên Hãng DB và Phiên Bản DB.
-- Con số Tiến Độ / Thế Hệ đã chốt thật sự đọc được.
-- Đếm thời gian sống thọ của cái Transaction phía Ông A.
-- Đếm tuổi đời Nhịp Tim và Kẻ Nào Đang Sở Hữu Hợp Đồng Thuê.
-- Các pha Ra Quyết Định Cứu Hộ / Kết quả Đòi Quyền Giải Cứu của Watchdog.
-- Số lượng công sức đập đi xây lại (duplicate recovery).
-- Đếm số Lần Chốt / Hủy của mấy cái Trạm Nghỉ tiến độ.
-
-Đừng có Gào Thét Báo Động (Alert) ỏm tỏi chỉ vì cục Entity trong bộ nhớ bự hơn cục Dòng Dữ liệu Đã Chốt. Đó là bản năng Tầm Nhìn (MVCC visibility) hiển nhiên của vũ trụ này, chả phải do Replication Lag trễ nhịp hay Database Bị Mọt Ăn (corruption) đâu nha!
+Không thiết lập các hệ thống cảnh báo (Alert) nhạy cảm dựa trên sự chênh lệch dữ liệu giữa trạng thái bộ nhớ và CSDL đã commit, vì đây là hành vi thiết kế chủ đích của MVCC, không phải lỗi đồng bộ (Replication lag) hay hỏng hóc CSDL.

@@ -1,6 +1,8 @@
-# Cách triển khai bị lỗi
+# Phản Mẫu Thiết Kế (Anti-Patterns): Ảo Tưởng Về Ranh Giới Đồng Bộ
 
-## ReentrantLock mới trong mỗi lần gọi
+## 1. Khởi Tạo ReentrantLock Mới Trong Mỗi Lần Triệu Gọi
+
+Quan sát đoạn mã dưới đây, cấu trúc xử lý Khóa hoàn toàn đúng về mặt cú pháp nhưng sai lệch toàn bộ về Bản Chất Đồng Bộ:
 
 ```java
 package com.example.settlement;
@@ -26,9 +28,11 @@ public class BrokenSettlementArtifactService {
     }
 
     public ArtifactResult generate(String artifactKey, Duration lockTimeout) {
+        // LỖI CHÍNH: Mỗi Request tạo ra một cá thể Lock hoàn toàn mới
         ReentrantLock lock = new ReentrantLock();
         boolean acquired = false;
         try {
+            // Mọi Yêu Cầu đều khóa thành công vì chúng ôm những Ổ Khóa độc lập
             acquired = lock.tryLock(
                     lockTimeout.toMillis(),
                     TimeUnit.MILLISECONDS
@@ -46,67 +50,36 @@ public class BrokenSettlementArtifactService {
             return ArtifactResult.created(artifactKey);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            throw new ArtifactGenerationException("interrupted", exception);
+            throw new ArtifactGenerationException("Interrupted", exception);
         } finally {
             if (acquired) {
-                lock.unlock();
+                lock.unlock(); // Khóa được giải phóng hoàn hảo, nhưng vô giá trị
             }
         }
     }
 }
 ```
 
-`try/finally` và interrupt handling đều đúng, nhưng lock identity sai. Mỗi call
-tạo một `ReentrantLock`, nên mọi caller đều acquire lock riêng ngay lập tức.
-Critical section chỉ tồn tại trên giấy.
+Kiến trúc `try/finally` và Quản trị Ngắt (Interrupt) không có điểm mù, nhưng Định danh Khóa (Lock identity) bị xé nát. Từng cuộc gọi sinh ra một `ReentrantLock` tách biệt. Lẽ dĩ nhiên, 100% các Luồng đều qua cửa mà không gặp bất kỳ kháng cự nào. Khái niệm Vùng Tới Hạn (Critical section) ở đây chỉ là Lý Thuyết Suông.
 
-Các dependency tối thiểu:
-
-```java
-public interface ArtifactStore {
-    boolean exists(String artifactKey);
-    void put(String artifactKey, byte[] content);
-}
-
-public interface SettlementRenderer {
-    byte[] render(String artifactKey);
-}
-
-public record ArtifactResult(String artifactKey, Status status) {
-    enum Status { CREATED, ALREADY_EXISTS }
-
-    static ArtifactResult created(String key) {
-        return new ArtifactResult(key, Status.CREATED);
-    }
-
-    static ArtifactResult alreadyExists(String key) {
-        return new ArtifactResult(key, Status.ALREADY_EXISTS);
-    }
-}
-```
-
-## synchronized trên object sai identity
+## 2. Từ Khóa `synchronized` Định Vị Sai Mục Tiêu Khóa
 
 ```java
 public ArtifactResult generate(String artifactKey) {
+    // LỖI CHÍNH: Tham số String trở thành Monitor bảo vệ
     synchronized (artifactKey) {
         return generateInsideCriticalSection(artifactKey);
     }
 }
 ```
 
-Hai request có thể mang hai `String` object khác reference nhưng cùng content.
-`new String("settlement/day-1")` và một String deserialized từ HTTP có thể
-`equals()` nhau, nhưng monitor khác nhau.
+Hai Yêu Cầu Độc lập hoàn toàn có thể mang tới hai đối tượng `String` hoàn toàn khác nhau về Tham chiếu dẫu sở hữu Nội Dung Đỉnh Khớp. Khai báo `new String("settlement/day-1")` và một Giá trị String tái tạo (deserialized) từ HTTP có đặc quyền Trùng Lặp Bằng Giá Trị (`equals() == true`), Nhưng Bản thể Monitor là Hai Cá Thể Độc Lập.
 
-Dùng `artifactKey.intern()` để ép identity còn tạo global string-pool coupling,
-memory retention và lock interference với code khác trong JVM. Không dùng object
-do caller sở hữu làm monitor công khai.
+Sử dụng `artifactKey.intern()` để Ép Buộc Đồng Nhất Định Danh là một thảm họa, Gây Ô Nhiễm Không Gian Bộ Nhớ Chuỗi Toàn Cục (Global string-pool), Giam Giữ Rác Nhớ, Và Xung Đột Khóa Với Mọi Cấu Trúc Độc Lập Trong Máy Ảo. CẤM sử dụng Đối Tượng do Caller khởi tạo làm Monitor Trấn Phái.
 
-> **Nói ngắn gọn:** `synchronized` khóa object reference, không khóa “giá trị
-> chuỗi” theo nghĩa nghiệp vụ.
+> **Nguyên tắc kỹ thuật:** Khối `synchronized` niêm phong dựa trên Con Trỏ Tham Chiếu (Reference Identity), Không Chấp Nhận So Sánh Giá Trị Chuỗi dưới mọi hình thức.
 
-## synchronized trên this nhưng service không thật sự singleton
+## 3. Khóa Cục Bộ `this` Trên Một Dịch Vụ Không Phải Là Singleton Độc Tôn
 
 ```java
 public synchronized ArtifactResult generate(String artifactKey) {
@@ -114,14 +87,10 @@ public synchronized ArtifactResult generate(String artifactKey) {
 }
 ```
 
-Cách này đúng nếu mọi actor dùng đúng cùng service instance. Nó thất bại khi code
-manual `new`, bean dùng prototype scope, có nhiều application context, hoặc test
-vô tình tạo hai instance cùng truy cập shared store.
+Chiến lược này chỉ thành công nếu mọi Tác nhân Tôn sùng Một Bản thể Dịch Vụ Duy Nhất. Nó sẽ vỡ nát khi Bất kỳ đoạn mã nào tự triệu hồi lệnh `new`, Cấu hình Bean dưới dạng Prototype, Trùng lắp Đa Ngữ cảnh Spring (Application context), Hoặc Khối Test vô tình thả xích Hai Cá Thể.
+Bất cập hơn: Ngay cả khi Độc Tôn Bản Thể (Chuẩn Spring Singleton), Khóa `this` tự động Cầm Chân (Serialize) MỌI Mã Artifact. Hai Khóa Không Liên Quan cũng phải xếp hàng chờ đợi nhau.
 
-Ngay cả với Spring singleton chuẩn, `this` chỉ serialize trong một node và còn
-serialize mọi artifact key không liên quan.
-
-## Critical section quá hẹp
+## 4. Ranh Giới Vùng Tới Hạn Quá Hẹp (Narrow Critical Section)
 
 ```java
 byte[] content;
@@ -129,17 +98,17 @@ synchronized (monitor) {
     if (artifactStore.exists(artifactKey)) {
         return ArtifactResult.alreadyExists(artifactKey);
     }
+    // LỖI CHÍNH: Giài Phóng Khóa Quá Sớm
 }
 
+// Bãi Chiến Trường Ngoài Vùng Bảo Vệ
 content = renderer.render(artifactKey);
 artifactStore.put(artifactKey, content);
 ```
 
-Lock chỉ bảo vệ check. Hai thread lần lượt thấy “chưa có”, rồi cùng render/put sau
-khi đã release monitor. Coordination boundary phải bao trọn compound action hoặc
-conflict phải được authoritative store phát hiện tại write.
+Chiếc Khóa chỉ bảo vệ Lệnh Hỏi Mật Khẩu (Check). T1 và T2 tuần tự chứng kiến "Chưa có", Và cùng lúc Nhào Nặn Dữ Liệu rồi Thi Nhau Đẩy Lên Máy Chủ ngay sau khi Buông Khóa. 100% Cụm Hành Vi (Compound action) buộc phải bị nhốt Trong Một Vành Đai Phán Xử, Hoặc Việc Đụng Độ phải được Giao Phó Cho Kho Lưu Trữ Uy Quyền (Authoritative store).
 
-## Per-key lock map bị remove quá sớm
+## 5. Bản Đồ Khóa Cục Bộ Bị Tháo Gỡ Quá Sớm
 
 ```java
 ReentrantLock lock = locks.computeIfAbsent(artifactKey, ignored ->
@@ -149,44 +118,30 @@ try {
     return generateInsideCriticalSection(artifactKey);
 } finally {
     lock.unlock();
-    locks.remove(artifactKey);
+    // LỖI CHÍNH: Trảm Khóa mà không đo đếm Vòng Đời
+    locks.remove(artifactKey); 
 }
 ```
 
-T1 có lock, T2 đã lấy reference cùng lock và đang chờ. T1 unlock rồi remove entry;
-T3 tạo lock mới và đi vào critical section song song với T2 trên lock cũ. Remove
-cần reference counting/lifecycle protocol; remove mù sau unlock là sai.
+Dòng Chảy Tai Họa: T1 Đang Giữ Khóa. T2 Móc Lấy Tham Chiếu Khóa Từ Map Và Xếp Hàng Khóa. T1 Xong Việc, Buông Khóa Rồi Tàn Nhẫn Xóa Trắng Map. T3 Châm Ngòi Lệnh Khởi Tạo Sinh Ra Ổ Khóa Mới Toanh Và Đi Vào Khóa. Hậu Quả: T2 Bám Khóa Cũ, T3 Cầm Khóa Mới. Cả Hai Đồng Thời Đi Vào Vùng Tới Hạn. Hành vi Xóa cần Giao Thức Quản Trị Đếm Tham Chiếu (Reference counting) Đàng Hoàng.
 
-Không remove thì đúng identity nhưng map có thể tăng vô hạn với key không bounded.
-Striped locks tránh cả race remove lẫn unbounded key map bằng một tập lock cố định.
+## 6. Khóa Nội Bộ Đứng Trước Mạng Lưới Đa Nút
 
-## Local lock trong deployment nhiều node
-
-Node A và node B có heap riêng:
+Máy A và Máy B Sở Hữu Hai Phân Vùng Heap Biệt Lập:
 
 ```text
 node A → locks[stripe] = Lock-A
 node B → locks[stripe] = Lock-B
 ```
 
-Cùng key vẫn acquire hai lock khác nhau. Local locking không thể là proof cho
-uniqueness trên shared object store.
+Cùng Khóa vẫn triệu tập Hai Ổ Khóa Bất Đồng. Đừng Ảo Tưởng Khóa Nội Bộ có Thẩm Quyền Phán Quyết Tính Độc Nhất Toàn Cầu trên Cấu trúc Lưu Trữ Phân Tán (Shared Object Store).
 
-## Điều kiện để lỗi xuất hiện
+## 7. Các Phương Án Sửa Lỗi Tạm Bợ Cần Tránh (Insufficient Fixes)
 
-1. hai actor xử lý cùng logical `artifactKey`;
-2. lock identity khác nhau hoặc critical section không bao trọn operation;
-3. service có nhiều instance hoặc deployment có nhiều node;
-4. store dùng overwrite/last-writer-wins thay vì conditional create;
-5. test chỉ chạy một thread, một bean hoặc một node.
-
-## Những cách sửa tưởng đúng nhưng chưa đủ
-
-- Đổi `synchronized` sang `ReentrantLock` nhưng vẫn tạo lock trong method.
-- Khóa request DTO/key object do caller cung cấp.
-- Dùng static lock để “hỗ trợ cluster”; static vẫn chỉ thuộc một classloader/JVM.
-- Chỉ khóa `exists()` rồi release trước render/put.
-- Dùng `ConcurrentHashMap` cho lock registry nhưng remove entry sai lifecycle.
-- Thêm `@Transactional`; nó không khóa object store và local monitor không mở rộng
-  qua transaction/node.
-- Dùng fair lock mặc định để chữa duplicate; fairness không sửa lock identity.
+- Đổi `synchronized` sang `ReentrantLock` nhưng vẫn Mù Quáng tạo trong Nội Hàm.
+- Gắn Mác Khóa Lên Tham Số Cấu Trúc Yêu Cầu (DTO/Key Object) Của Caller.
+- Biến Khóa Thành Khối Tĩnh (Static) để Hô Hào Hỗ Trợ Cụm (Cluster); Static cũng chỉ Tĩnh Nội Bộ JVM.
+- Chỉ Khóa Vòng `exists()` Rồi Buông Tay Mở Lối `render/put`.
+- Tôn Vinh `ConcurrentHashMap` Làm Sổ Đăng Ký Nhưng Trảm Dữ Liệu Sai Vòng Đời.
+- Chắp Vá Bằng `@Transactional`; Nó Hoàn Toàn Bất Lực Trước JVM Memory Barrier và Kho Đối Tượng (Object store).
+- Viện Trợ Cờ Công Bằng (Fair Lock) Chống Lặp; Nó Tuyệt Đối Không Thể Nắn Lại Định Danh Khóa Bị Sai.

@@ -1,25 +1,25 @@
-# Tuyệt Chiêu Chốt Sổ: Thiết Kế Đúng Đắn Cho Bài Toán Theo Dõi Tiến Độ (Committed coordination and progress solutions)
+# Giải Pháp Theo Dõi Tiến Độ Chuẩn Mực (Committed coordination and progress solutions)
 
-## 1. Mục tiêu thiết kế (Thiết kế chuẩn là phải thế nào?)
+## 1. Mục tiêu thiết kế kiến trúc
 
-Một giải pháp (solution) xịn xò phải định nghĩa rạch ròi 3 thứ:
+Một giải pháp thiết kế toàn vẹn phải phân biệt rõ ràng ba nhóm trạng thái sau:
 
 ```text
-Trạng thái công việc cuối cùng (final business state):
-  Chỉ được vinh danh công bố sau khi cái Giao dịch chính (transaction) ĐÃ CHỐT (commit).
+Trạng thái nghiệp vụ cuối cùng (final business state):
+  Chỉ được ghi nhận và truy xuất sau khi Giao dịch (transaction) chính thức hoàn tất (commit).
 
-Tín hiệu Nhịp tim/Tiến độ đang làm (attempt progress/heartbeat):
-  Phải tự mình chốt sổ độc lập. Ghi rõ tên chủ nhân (owner) và thế hệ (generation) để dễ quản lý.
+Tín hiệu tiến độ / nhịp tim (attempt progress/heartbeat):
+  Hoạt động trên một tiến trình lưu trữ độc lập, tự chủ kết thúc (commit) thông qua phiên bản (generation) và định danh chủ sở hữu (owner).
 
-Cứu hộ (recovery):
-  Phải là một cú Tranh Giành Độc Quyền (atomic claim). Tuyệt đối cấm cái thói "Đọc thấy cũ rích -> Nhắm mắt nhào vô cứu mù quáng".
+Cơ chế khôi phục (recovery):
+  Quy trình giải cứu hoặc khởi động lại tiến trình phải áp dụng thao tác giành quyền nguyên tử (atomic claim), tránh tình trạng phân tích thiếu chính xác (đọc cũ - giải cứu mù quáng).
 ```
 
-> **Nói ngắn gọn:** Muốn báo cáo tình hình, hãy dùng một tín hiệu ĐÃ CHỐT một cách đàng hoàng. Đừng có biến cái đống Dữ liệu dở dang chưa chốt thành cái trạm phát thanh (message bus) của hệ thống.
+> **Nói ngắn gọn:** Cơ chế chia sẻ trạng thái tiến độ phải dựa trên việc phát đi một thông điệp đã hoàn thiện việc lưu trữ. Tuyệt đối không biến những bản nháp (uncommitted data) đang xử lý trong một khối giao dịch thành một kênh truyền thông (message bus) của hệ thống.
 
-## 2. Giải Pháp 1 — Chấp nhận số phận "Chỉ Đọc Đồ Đã Chốt" (Committed-only observation)
+## 2. Giải Pháp 1 — Chấp nhận "Chỉ đọc dữ liệu đã commit" (Committed-only observation)
 
-Nếu Watchdog hay cái Dashboard của bạn không quá vã đến mức đòi xem tiến độ nhảy múa từng giây:
+Nếu yêu cầu giám sát hoặc hiển thị giao diện không bắt buộc cung cấp trạng thái theo thời gian thực (real-time progress):
 
 ```java
 @Service
@@ -30,7 +30,7 @@ public class JobStatusReader {
         this.jobs = jobs;
     }
 
-    // Đọc chay bình thường thôi, kệ tía Đọc Bẩn!
+    // Đọc trạng thái bình thường bằng READ_COMMITTED mặc định
     @Transactional(readOnly = true)
     public JobSnapshot read(UUID jobId) {
         return jobs.findById(jobId)
@@ -40,22 +40,22 @@ public class JobStatusReader {
 }
 ```
 
-Cứ xài `READ_COMMITTED` mặc định. Viết hẳn lên tài liệu cho anh em biết: "Trạng thái này chỉ cập nhật khi Job đã làm Xong Xuôi và Chốt Sổ". Giao diện người dùng (UI) nên hiển thị chữ "Cập nhật lần cuối lúc..." (`lastCommittedAt`), chứ đừng cố vẽ thanh tiến độ mượt mà lừa dối người dùng.
+Hãy sử dụng mức độ `READ_COMMITTED`. Hãy làm rõ trong tài liệu kỹ thuật: "Trạng thái này chỉ được cập nhật sau khi công việc hoàn tất và chốt sổ." Giao diện (UI) nên hiển thị theo kiểu "Cập nhật lần cuối lúc..." (`lastCommittedAt`), thay vì hiển thị một thanh tiến độ dễ gây hiểu lầm.
 
-Tuyệt chiêu này xài ngon khi cái Job của bạn xử lý nhanh gọn lẹ, và hệ thống chấp nhận được chuyện dữ liệu hiển thị trễ một chút (stale-until-commit).
+Giải pháp này cực kỳ hiệu quả khi tiến trình diễn ra nhanh chóng, và hệ thống chấp nhận khoảng thời gian ngắn có dữ liệu tĩnh (stale-until-commit).
 
-## 3. Giải Pháp 2 — Chia để trị: Băm nhỏ việc thành nhiều Trạm Nghỉ (Committed checkpoints)
+## 3. Giải Pháp 2 — Chia nhỏ giao dịch (Committed checkpoints/Chunks)
 
-Nếu workflow chạy dài lê thê, hãy băm nó ra thành nhiều cục (chunks). Mỗi cục làm xong thì:
+Với những công việc diễn ra lâu dài (long-running workflow), phương án tối ưu là chia nhỏ chúng thành nhiều phần (chunks):
 
 ```text
 BẮT ĐẦU (BEGIN)
-  Xử lý cục công việc hiện tại (nhớ code sao cho chạy lại không bị lỗi đúp - idempotent)
-  Cập nhật tiến độ của cái Trạm Nghỉ này
+  Xử lý phân đoạn công việc hiện tại (đảm bảo tính idempotent)
+  Lưu trạng thái hoàn thành phân đoạn (checkpoint)
 CHỐT SỔ (COMMIT)
 ```
 
-Dùng một cú INSERT nguyên tử (atomic) để giành quyền xử lý cái chunk đó:
+Áp dụng truy vấn chèn dữ liệu nguyên tử (atomic INSERT) để xử lý việc giành quyền:
 
 ```sql
 insert into chunk_result(chunk_id, job_id, status)
@@ -83,15 +83,15 @@ public class JobChunkService {
         UUID chunkId,
         int checkpoint
     ) {
-        // Cú này lách khóa nguyên tử: "Thằng nào giành được chunk này?"
+        // Thực hiện giành quyền xử lý nguyên tử phân đoạn
         int claimed = results.claim(chunkId, jobId);
-        if (claimed == 0) { // Có thằng khác húp rồi!
+        if (claimed == 0) { // Đã có luồng khác giành quyền
             ChunkResult existing =
                 results.findByChunkId(chunkId).orElseThrow();
-            return ChunkOutcome.replayed(existing); // Nhường nó, mình coi như xong
+            return ChunkOutcome.replayed(existing); // Nhường quyền, coi như đã hoàn tất
         }
 
-        // Xin Khóa dòng Job chính để cập nhật Trạm Nghỉ
+        // Lấy khóa bảo vệ (Row Lock) để cập nhật tiến trình chính
         JobRun job = jobs.findByIdForUpdate(jobId)
             .orElseThrow();
         job.advanceCommittedCheckpoint(checkpoint);
@@ -102,19 +102,18 @@ public class JobChunkService {
 }
 ```
 
-Cái `chunk_id` độc nhất vô nhị cộng thêm trò `ON CONFLICT DO NOTHING` sẽ bóp chết mấy yêu cầu chạy đúp, biến chúng thành một cú Tranh Giành gọn gàng. Watchdog tha hồ đọc Trạm Nghỉ (đã chốt). Lỡ có cục Chunk nào bị lỗi Hủy kèo (rollback) thì nó cũng rút lại lệnh Claim, chả báo cáo láo tiến độ ra ngoài.
+Trường `chunk_id` độc nhất kết hợp cấu trúc `ON CONFLICT DO NOTHING` ngăn ngừa xung đột thi hành kép, chuyển hóa chúng thành cơ chế điều phối cạnh tranh. Các bộ phận theo dõi (Watchdog) lúc này có thể đọc thông tin của Phân Đoạn đã lưu thành công. Trong trường hợp xảy ra lỗi Rollback, trạng thái quyền xử lý phân đoạn đó sẽ tự động bị rút lại.
 
+**Các yêu cầu đi kèm (Trade-off):**
 
-Đánh đổi (Trade-off):
+- Phá vỡ nguyên tắc thao tác "Tất cả hoặc không gì cả" (all-or-nothing) đối với quy trình tổng thể;
+- Đòi hỏi xây dựng mã nguồn tự kháng lỗi (resumable/idempotent);
+- Quản lý mô hình trạng thái (State machine) phức tạp hơn;
+- **Đổi lại:** Các giao dịch, Khóa (Lock), và Kết nối (Connection) được giải phóng rất nhanh.
 
-- Tạm biệt triết lý "Một sống một còn" (all-or-nothing) cho cả cái quy trình lớn;
-- Bắt buộc phải code cho nó tự miễn dịch khi chạy lại (resumable/idempotent);
-- Thiết kế Bảng và Máy Trạng Thái nhức não hơn chút;
-- Đổi lại: Transaction, Khóa, Kết nối được giải phóng nhanh như chớp.
+## 4. Giải Pháp 3 — Tạo cấu trúc thông báo Nhịp Tim độc lập (Independent heartbeat record)
 
-## 4. Giải Pháp 3 — Xây trạm phát Nhịp Tim riêng lẻ (Independent heartbeat record)
-
-Khi cục Job quá to không băm nhỏ được, nhưng Watchdog lại gào thét đòi tín hiệu sự sống, thì đẻ ra cái Bảng Riêng:
+Khi tiến trình lớn không thể chia nhỏ, giải pháp tốt nhất là lưu thông tin tiến độ "Nhịp Tim" vào một bảng độc lập:
 
 ```sql
 create table job_attempt_heartbeat (
@@ -128,7 +127,7 @@ create table job_attempt_heartbeat (
 );
 ```
 
-Người báo cáo (Publisher) phải là một Bean xài Transaction độc lập hoàn toàn:
+Component báo cáo tín hiệu (Publisher) sử dụng giao dịch tách biệt:
 
 ```java
 @Service
@@ -141,7 +140,7 @@ public class JobHeartbeatPublisher {
         this.heartbeats = heartbeats;
     }
 
-    // Cái thẻ ma thuật này giúp đẻ ra 1 Giao dịch mới toanh, chốt ngay lập tức
+    // Annotation này sinh ra một khối Giao dịch độc lập và đóng ngay lập tức
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void publish(Heartbeat heartbeat) {
         int changed = heartbeats.upsertIfOwnerMatches(
@@ -151,7 +150,7 @@ public class JobHeartbeatPublisher {
             heartbeat.progressPercent(),
             heartbeat.observedAt()
         );
-        if (changed != 1) { // Bị đuổi cổ rồi
+        if (changed != 1) { // Không tìm thấy (Mất quyền)
             throw new StaleJobOwnerException(
                 heartbeat.jobId(),
                 heartbeat.generation()
@@ -161,7 +160,7 @@ public class JobHeartbeatPublisher {
 }
 ```
 
-Khúc SQL Upsert xịn xò:
+Truy vấn Cập Nhật/Thêm mới (Upsert):
 
 ```sql
 insert into job_attempt_heartbeat(
@@ -182,30 +181,30 @@ on conflict (job_id, generation)
 do update
 set progress_percent = excluded.progress_percent,
     last_seen_at = excluded.last_seen_at
--- CHỈ CẬP NHẬT KHI LÀ CHÍNH CHỦ VÀ TIẾN ĐỘ ĐANG ĐI TỚI!
+-- CHỈ CẬP NHẬT KHI LÀ CHÍNH CHỦ VÀ TIẾN ĐỘ ĐANG ĐI TỚI
 where job_attempt_heartbeat.owner_token = excluded.owner_token
   and job_attempt_heartbeat.progress_percent
       <= excluded.progress_percent;
 ```
 
-Cái Nhịp tim này sẽ sống thọ mặc kệ cái Job chính có bị Hủy Kèo (rollback) hay không. Do đó, phải hiểu nó mang ý nghĩa là "Tao đang cố làm tới khúc này" (attempt progress), CHỨ KHÔNG PHẢI là "Kết quả cuối cùng đã xong" (final success).
+Dữ liệu nhịp tim sẽ tiếp tục lưu giữ dẫu cho Giao dịch chính (Main Transaction) có gặp lỗi (rollback). Ý nghĩa của chúng là mô tả "Hệ thống đang nỗ lực đạt đến mức độ này" (attempt progress), chứ không đại diện cho "Kết quả chung cuộc hoàn tất" (final success).
 
-### Tuyệt đối tránh trò tự cắn đuôi (Self-deadlock)
+### Tránh lỗi vòng khóa đệ quy (Self-deadlock)
 
-Đừng dại dột để cái Giao dịch lớn bên ngoài (outer Tx) khóa cái Dòng X, rồi thằng bên trong gọi `REQUIRES_NEW` nhảy ra chọt đúng cái Dòng X đó:
+Bắt buộc cẩn trọng khi một giao dịch ngoài (outer transaction) đã nắm giữ Khóa cấp dòng, không được sử dụng lệnh gọi `REQUIRES_NEW` để yêu cầu chỉnh sửa ở chính dòng đó:
 
 ```text
-Thằng Cha ôm Khóa Dòng X
-Thằng Con REQUIRES_NEW đứng chờ Thằng Cha nhả Khóa Dòng X
-Thằng Cha đứng ngó Thằng Con trả kết quả
-BÙM! Đứng máy cả đôi.
+Giao dịch Cha nắm giữ Khóa Dòng.
+Giao dịch Con (REQUIRES_NEW) xếp hàng đợi Giao dịch Cha trả khóa.
+Giao dịch Cha đợi Giao dịch Con hoàn tất để thực thi tiếp.
+Phát sinh Deadlock.
 ```
 
-Bảng Nhịp tim phải Tách Biệt hoàn toàn (hoặc gọi Publish ở ngoài luồng). Và nhớ tăng sức chứa của Database Pool lên để gánh thêm mấy cái `REQUIRES_NEW` này nhé.
+Vì vậy Bảng Nhịp Tim phải nằm ở một Entity riêng biệt, tránh xung đột cấu trúc. (Và nên gia tăng giới hạn Connection Pool nếu hệ thống liên tục khởi tạo luồng `REQUIRES_NEW`).
 
-## 5. Giải Pháp 4 — Cuộc Chiến Tranh Giành Quyền Cứu Hộ (Atomic recovery claim)
+## 5. Giải Pháp 4 — Tranh Giành Quyền Phục Hồi Nguyên Tử (Atomic recovery claim)
 
-Watchdog đừng hở tí là bật chế độ Cứu Hộ chỉ bằng cách "Đọc mồm". Phải đập ngay một cú Ghi Có Điều Kiện (conditional write) để phân định thắng thua:
+Các cơ chế Giám sát (Watchdog) phải kích hoạt tiến trình giải cứu bằng cách viết một lệnh truy cập nguyên tử để cấp phát quyền (conditional write):
 
 ```sql
 update job_run
@@ -214,135 +213,135 @@ set generation = generation + 1,
     lease_until = :newLeaseUntil,
     status = 'RUNNING'
 where job_id = :jobId
-  and generation = :observedGeneration -- Đúng cái thế hệ lúc tao soi
-  and status = 'RUNNING' -- Vẫn chưa Xong
-  and lease_until < :databaseNow -- Phải hết hạn Thuê rồi tao mới cướp!
+  and generation = :observedGeneration -- Xác thực với thế hệ vừa quét
+  and status = 'RUNNING' -- Tiến trình vẫn chưa hoàn tất
+  and lease_until < :databaseNow -- Phải qua mức giới hạn hết hạn
 returning generation, owner_token, lease_until;
 ```
 
-Kết quả trả về sẽ định đoạt số phận:
+Sự quyết định dựa vào số lượng kết quả phản hồi:
 
-| Kết quả trả về | Số phận |
+| Phản hồi | Quyết định xử lý |
 | --- | --- |
-| 1 Dòng | Watchdog ăn kèo! Được quyền Giải Cứu, mở kỷ nguyên Thế hệ mới. |
-| 0 Dòng | Trâu chậm uống nước đục! Kẻ khác đã xơi hoặc Job tự xong rồi. Đi về! |
+| 1 Dòng | Watchdog giành quyền thành công! Xác thực mở phiên bản mới. |
+| 0 Dòng | Yêu cầu bị loại. Cơ sở khác đã xử lý hoặc Job đã kết thúc. |
 
-Mọi hậu quả của việc Giải cứu (side effect) đều phải mang theo cái "Giấy Phép Thế Hệ" (generation/fencing token). Lỡ thằng Processor cũ sống lại định Chốt Sổ thì sẽ bị đá văng vì Giấy Phép đã hết hạn. Cái trò Nguyên Tử (atomic) này gánh được cả trăm ông Watchdog cùng lúc; Đọc Bẩn (`READ_UNCOMMITTED`) muôn đời không làm được.
+Mọi thay đổi tiếp theo của nhiệm vụ (side effect) sẽ đều gắn với một "Chứng thực Phiên Bản" (generation/fencing token). Trong trường hợp Processor cũ hoạt động lại, yêu cầu đóng sổ (final commit) sẽ bị loại bỏ do giới hạn của chứng thực. Lệnh xử lý nguyên tử (atomic) trên CSDL bảo vệ hệ thống khỏi việc hàng loạt Watchdog cùng khởi chạy tiến trình, điều mà `READ_UNCOMMITTED` không bao giờ đảm nhận.
 
-## 6. Giải Pháp 5 — Lấy Khóa ngồi Đợi thằng kia làm xong (Locking read)
+## 6. Giải Pháp 5 — Chờ Đợi Bằng Cơ Chế Khóa (Locking read)
 
-Nếu bắt buộc phải đứng đợi thằng Writer hoàn thành nghiệp lớn:
+Trường hợp hệ thống cần luồng đọc đứng chờ để đồng bộ hóa:
 
 ```sql
 select job_id, status, progress_percent, generation
 from job_run
 where job_id = :jobId
-for update; -- Đóng cọc ngồi chờ!
+for update; -- Giữ luồng chờ đồng bộ!
 ```
 
-Thằng Đọc sẽ Đứng Đợi (hoặc lố giờ timeout) cho tới lúc thằng Writer kia Chốt sổ hoặc Hủy kèo, rồi lượm luôn kết quả cuối cùng. Không có miếng dữ liệu chưa chốt nào lòi ra đây cả.
+Bộ đọc sẽ duy trì trạng thái nghỉ (hoặc đợi lố giờ timeout) cho đến khi bộ Ghi thực hiện thao tác commit hoặc rollback để kết luận giá trị. Quá trình này không hiển thị dữ liệu dở dang (dirty read).
 
-Cách này ngon cho mấy cái Transaction chớp nhoáng (short critical). NHƯNG chống chỉ định làm Polling cho Dashboard hay chờ Job làm quá lâu vì:
+Mô hình này tối ưu cho các luồng tương tác cực ngắn (short critical). NHƯNG Không khuyến khích áp dụng cho Polling trên giao diện vì:
 
-- Ngâm cái Connection trong Pool khi đứng chờ;
-- Hàng đợi Khóa (lock queue) phình to, kéo lùi tốc độ hệ thống (tail latency);
-- Phải tự thiết kế cơ chế dập lửa khi lố giờ (timeout/deadlock);
-- Chả cung cấp được cái Nhịp tim nào trong lúc đứng đợi.
+- Hao tốn số lượng Kết Nối trong Pool (Connection hold).
+- Gây quá tải Hàng đợi Khóa (lock queue), tăng độ trễ tổng thể hệ thống.
+- Yêu cầu cấu trúc ngăn chặn ngoại lệ khi lố giờ (timeout/deadlock).
+- Không phản ánh kịp thời Nhịp Tim tiến trình.
 
-## 7. Giải Pháp 6 — Thùng thư Sự kiện Bền bỉ (Durable event/outbox)
+## 7. Giải Pháp 6 — Hàng Đợi Thông Điệp Bền Bỉ (Durable event/outbox)
 
-Nếu thiên hạ (Consumers) cần hóng tin sau khi bạn Chốt Sổ:
+Cung cấp thông tin tiến độ cho bên thứ 3 (Consumers) với độ tin cậy cao:
 
 ```text
-Giao dịch chính (business Tx)
-  -> Cập nhật bảng Job
-  -> Ném một tin nhắn Sự Kiện (Event) vào bảng Hộp Thư Đi (Outbox)
-CHỐT SỔ (COMMIT)
+Giao Dịch Xử Lý (business Tx)
+  -> Cập nhật nghiệp vụ Job
+  -> Ghi thông báo Tín hiệu (Event) vào Hàng đợi Outbox
+ĐÓNG GIAO DỊCH (COMMIT)
 
-Ông Đưa Thư (publisher) rảo bước đi giao mớ Sự kiện ĐÃ CHỐT.
+Thành phần chuyển phát (Publisher) xử lý gửi Thông điệp ĐÃ CHỐT tới bên ngoài.
 ```
 
-Tin nhắn trong Outbox sẽ không bay ra ngoài lừa tình thiên hạ cho đến khi bạn Chốt Sổ thành công. Người nhận tự xây Inbox để chống chạy đúp (idempotency).
+Thông điệp nằm trong Outbox sẽ chỉ được truy xuất nếu quá trình commit diễn ra trọn vẹn. Bên tiếp nhận chủ động triển khai cơ chế loại bỏ tin trùng lặp (idempotency/Inbox).
 
-Lệnh `NOTIFY` của PostgreSQL cũng bắn tin ngay lúc Commit đấy, nhưng nó không phải là hàng bền bỉ (durable). Đứt mạng phát là mất tin luôn; chỉ xài nó khi bạn chấp nhận rủi ro này.
+Câu lệnh `NOTIFY` của PostgreSQL cũng bắn tín hiệu sau khi Commit, nhưng không cung cấp tính bảo lưu lâu dài (durable). Dữ liệu có thể bị suy giảm trong trường hợp sự cố mạng; do đó, hãy cẩn trọng với tính năng này.
 
-## 8. Lời Thề Đồng Bộ (Portability contract)
+## 8. Tiêu Chuẩn Đồng Bộ Kiến Trúc (Portability contract)
 
-Database nào muốn được App hỗ trợ thì phải vượt qua bài Test nhân phẩm này:
+Hệ thống nên tương thích bằng cách định nghĩa các nguyên tắc (guarantees) thay vì lợi dụng kẽ hở DB:
 
 ```text
-1. Tuyệt đối KHÔNG DÙNG Dữ Liệu Dở Dang chưa chốt để vẫy cờ.
-2. Trạm Nghỉ (checkpoint) Đã Chốt thì phải đọc được.
-3. Cú Tranh Giành Cứu Hộ nguyên tử (atomic claim) chỉ có DUY NHẤT một kẻ chiến thắng.
-4. Hủy kèo (Rollback) thì cấm tiệt vụ công bố "Job Đã Xong".
+1. Tuyệt đối không dựa vào dữ liệu trung gian chưa Commit.
+2. Trạm dừng (Checkpoints) cần phải được hiển thị chính xác ngay sau khi Commit.
+3. Yêu cầu Cứu Hộ phải duy trì thông số nguyên tử, với duy nhất MỘT quyền sở hữu (Exclusive Owner).
+4. Ngoại lệ Hủy Bỏ (Rollback) thì cấm thông báo quá trình là "Hoàn Thành".
 ```
 
-Đừng rẽ nhánh If/Else hèn hạ chỉ vì cái chuỗi `"read uncommitted"`. Nếu cần dùng tính năng dị biệt của DB, nhét nó vô một cục Adapter rồi viết giải thích đàng hoàng (document guarantees).
+Tránh thiết lập điều kiện rẽ nhánh logic phụ thuộc vào chuỗi `"read uncommitted"`. Nếu hệ thống cần tương tác chuyên biệt cho DB, nên tách chúng thành những Adapter riêng lẻ đi kèm định dạng bảo vệ.
 
-## 9. Cẩm nang Sập Nguồn (Failure behavior)
+## 9. Định Hướng Phân Tích Lỗi Hệ Thống (Failure behavior)
 
-| Kiểu Sập | Hậu quả để lại |
+| Hình Thái Sự Cố | Kết Quả / Đánh Giá |
 | --- | --- |
-| Giao dịch chính (Main Tx) Hủy kèo | Không có Trạng thái Kết thúc (final state); Các Trạm Nghỉ trước đó vẫn sống nguyên. |
-| Nhịp tim Chốt, nhưng Main Tx Hủy kèo | Bảng Nhịp Tim vẫn phơi xác số liệu cố gắng; Không có Kết quả cuối cùng. |
-| Người đẩy Nhịp tim bị sập chết | Watchdog có thể sẽ nhảy vào cướp Giấy Phép thuê (expire lease); Thằng Processor tự lo mà bảo vệ thân mình (fence). |
-| 100 ông Watchdog cùng bu vô | Tranh Giành nguyên tử đập chết 99 ông, chỉ cho 1 ông ăn. |
-| Ông Đưa thư (Outbox) phát trùng tin | Inbox của người nhận tự động gạt bỏ (idempotency). |
-| Đọc lấy Khóa chờ quá lâu (Timeout) | Văng lỗi lố giờ (explicit timeout); Tuyệt đối không phơi ra Dữ Liệu Dở Dang. |
+| Giao dịch chính (Main Tx) Rollback | Giao dịch không cung cấp Trạng Thái Hoàn Thành (final state); Các phân đoạn Checkpoint vẫn lưu giá trị. |
+| Nhịp tim thành công, Main Tx bị Rollback | Trạng Thái Nhịp tim bảo lưu quá trình đã hoạt động; Bảng chính chưa cung cấp Dữ Liệu Hoàn Chỉnh. |
+| Publisher của Nhịp Tim gặp lỗi Crash | Luồng Watchdog sẽ giành quyền dựa trên thời hạn hợp đồng (expire lease); Bộ Ghi cần tự vệ thông qua token Fencing. |
+| Đồng loạt Watchdog tranh giành quyền | Cấu trúc phân giải nguyên tử từ DB ưu tiên một bên chiến thắng. |
+| Bộ chuyển Outbox gửi lặp thông báo | Cơ chế Inbox tự bảo vệ (idempotent rejection). |
+| Đọc khóa (FOR UPDATE) Timeout | Chuyển luồng sang ngoại lệ (Explicit timeout exception); Hệ thống bảo mật toàn bộ dữ liệu dở dang. |
 
-## 10. Nghệ thuật Hẹn giờ và Ngân sách Cứu hộ (Timeout và recovery budget)
+## 10. Chiến Lược Đặt Giới Hạn Thời Gian Cứu Hộ (Timeout và recovery budget)
 
-- Thời gian Bắn Nhịp Tim (interval) phải ngắn hơn Thời hạn Thuê (lease duration) để chừa đường lui cho lag mạng (margin).
-- Watchdog phải tin vào đồng hồ của Database, hoặc dùng chung một hệ đo lường chuẩn mực.
-- Đòi quyền Cứu hộ thì phải canh lố giờ (bounded transaction/lock timeout).
-- Lỡ đòi Quyền thất bại (zero-row) thì đừng có điên cuồng vã Retry đấm vào hệ thống (storm).
-- Thằng làm việc (Processor) phải ngó lại xem "Mình còn quyền không?" trước khi đi Chốt sổ (final commit).
-- Mọi trò dọn dẹp rác khi Crash phải dựa trên Database, cấm dùng biến Cờ (in-memory flag) trong RAM.
+- Khoảng thời gian thông báo (interval) Nhịp Tim phải diễn ra thường xuyên hơn Thời hạn hiệu lực của Token (lease duration) (bổ sung sai số).
+- Watchdog phải chia sẻ chung mốc thời gian hệ thống DB.
+- Quy trình yêu cầu Quyền Cứu Hộ phải tích hợp giám sát quá tải lố giờ (Bounded transaction/lock timeout).
+- Dừng ngay thao tác vã liên tục Truy vấn (Retry storm) khi CSDL từ chối yêu cầu bằng kết quả không có hàng nào (zero-row).
+- Tiến trình xử lý (Processor) luôn tự kiểm tra "Quyền chủ sở hữu" trước khi gửi xác nhận cuối (final commit).
+- Mọi hoạt động dọn dẹp cấp thiết phải thi hành từ cơ sở CSDL, cấm sử dụng cờ báo động trên RAM.
 
-Chả có con số Hẹn Giờ nào gọi là "Chuẩn toàn vũ trụ" cả. Hãy vác biểu đồ (distribution) ra mà canh theo SLO của hệ thống nhà bạn.
+Mọi khoảng số thời gian giới hạn phải thiết lập cẩn thận dựa theo Biểu đồ phân bổ của cấu trúc hệ thống (SLO Distribution) tại từng Doanh nghiệp.
 
-## 11. Bảng Trọng Tài Cân Đo Đong Đếm (Trade-off comparison)
+## 11. Bảng Trọng Tài Cân Nhắc Thiết Kế (Trade-off comparison)
 
-| Tuyệt chiêu | Tầm Nhìn Dữ Liệu Thấy Được | Quy mô Nguyên tử | Độ Rắc Rối | Phù hợp khi nào? |
+| Cơ Chế | Tầm Nhìn Dữ Liệu (Visibility) | Quy Mô Nguyên Tử | Mức Độ Phức Tạp | Chỉ Định |
 | --- | --- | --- | --- | --- |
-| Chỉ đọc Đồ Đã Chốt | Sau khi thằng Chính chốt sổ | Trọn gói nguyên con (Full unit) | Dễ ẹc (Thấp) | Job chạy nhanh như gió |
-| Băm Trạm Nghỉ (Chunks) | Sau mỗi cục Chunk chốt sổ | Từng cục Chunk riêng lẻ | Thường thường (Vừa) | Workflow dài, có thể chạy tiếp |
-| Bơm Nhịp tim Độc Lập | Thấy ngay Tín hiệu Đang Ráng Làm | Trạng thái Nhịp Tim TÁCH BIỆT Kết Quả Cuối | Nhức não (Vừa-cao) | Job ngâm tôm quá lâu |
-| Đòi Quyền Thuê Nguyên tử | Chỉ 1 thằng Tướng Cứu Hộ được sinh ra | Cú đòi quyền (Claim only) | Vừa | 100 thằng Watchdog đánh nhau |
-| Đọc Lấy Khóa `FOR UPDATE` | Ngồi đợi thằng kia làm xong xuôi | Khóa cùng chung Dòng (Same row lock) | Vừa | Chờ đợi đồng bộ siêu ngắn |
-| Thùng thư Outbox | Bất đồng bộ (Async) sau khi Chốt sổ | DB + Sự Kiện chốt cùng lúc | Đổ mồ hôi (Cao) | Đám đông hóng hớt tin tức |
+| Chỉ Đọc Dữ liệu Đã Commit | Chờ Giao dịch xử lý hoàn tất | Toàn bộ đơn vị (Full Unit) | Thấp | Tiến trình xử lý nhanh chóng |
+| Chia Đoạn Checkpoint | Chờ mỗi Phân đoạn hoàn tất | Các Phân đoạn (Chunk) độc lập | Vừa | Tiến trình lâu dài, hỗ trợ tiếp tục (resume) |
+| Cập nhật Nhịp Tim Độc Lập | Mô phỏng Tiến độ quá trình hoạt động | Trạng thái Nhịp Tim TÁCH BIỆT với Kết quả cuối | Khá-Cao | Trì hoãn thao tác giao dịch rất lớn |
+| Giành Quyền Atomic | Giới hạn Một thực thể Khôi phục | Giao dịch Yêu Cầu Cấp Phép (Claim) | Vừa | Quản lý tranh chấp Watchdog |
+| Khóa Hàng `FOR UPDATE` | Chờ đợi luồng Đồng bộ | Khóa Hàng Tương Đối (Same row) | Vừa | Giao dịch ngắn, yêu cầu độ trễ thấp |
+| Hàng đợi Outbox | Bất đồng bộ sau Commit | Kết hợp Dữ liệu & Sự Kiện | Cao | Hệ thống rộng, nhiều đối tượng Consumer |
 
-## 12. Lời Khuyên Vàng Ngọc Từ Bậc Tiền Bối (Recommendation cho case này)
+## 12. Định Hướng Khuyến Nghị (Recommendation cho case này)
 
-1. Vứt ngay cái thói bấu víu vào Đọc Bẩn `READ_UNCOMMITTED` vào sọt rác!
-2. Job mà kéo dài, hãy Băm Trạm Nghỉ hoặc quăng Nhịp Tim ra Bảng Riêng.
-3. Phải rạch ròi giữa "Tiến độ đang cố làm" (attempt) và "Kết quả chung cuộc đã xong" (final outcome).
-4. Watchdog muốn Giải Cứu thì phải đè ra làm cú Claim Tranh Giành Thế Hệ (generation/lease).
-5. Luôn check lại "Mình còn là Chính chủ không?" (Fencing) trước khi chốt hạ bất cứ Dữ liệu Vĩnh Viễn nào.
-6. Muốn test trò Chốt/Hủy, xách con PostgreSQL thật ra mà chạy.
+1. Gỡ bỏ triệt để việc thiết lập mức cô lập `READ_UNCOMMITTED` khỏi tư duy kiến trúc.
+2. Với các tiến trình kéo dài, triển khai cấu trúc Chia Nhỏ Phân Đoạn (Chunks) hoặc Nhịp Tim (Heartbeat).
+3. Làm rõ định nghĩa về thông điệp tiến độ "Đang xử lý" (attempt) và "Kết quả cuối cùng" (final outcome).
+4. Nâng cấp mô hình Cứu Hộ Watchdog sang phương pháp Giành Quyền cấp phiên bản (generation/lease claim).
+5. Luôn yêu cầu bộ xử lý xác thực phiên bản Chủ Sở Hữu (Fencing) trước thao tác cập nhật dữ liệu cốt lõi.
+6. Sử dụng CSDL Thực (như PostgreSQL Testcontainers) trong môi trường phát triển để xác thực các kiểm thử Rollback/Commit.
 
-## 13. Bảng Phong Thần Trước Khi Lên Production (Production checklist)
+## 13. Danh Sách Kiểm Tra Trước Khi Triển Khai (Production checklist)
 
-### Về mặt Luân thường đạo lý (Semantics)
+### Tính Chuẩn Xác Dữ Liệu (Semantics)
 
-- [ ] Lời thề: Không có quyết định nghiệp vụ nào dùng Đọc Bẩn để phán xét.
-- [ ] Tiến độ, Nhịp Tim và Kết Quả Cuối Cùng đã có Bảng Tên và Hợp Đồng rõ ràng.
-- [ ] Test thử Hủy Kèo (Rollback) xem nó có lén báo "Xong rồi" không.
-- [ ] Vứt cái Nhãn mức Cô Lập (Isolation label) đi, cấm lấy nó làm bằng chứng biện minh.
-- [ ] Test thật (Integration test) gánh được trò đổi DB.
+- [ ] Đồng ý nguyên tắc: Không dựa vào Đọc Bẩn trong bất kỳ quy trình kiểm thử và kinh doanh nào.
+- [ ] Xác minh cấu trúc Bảng Dữ Liệu cho Tiến độ, Nhịp Tim và Hoàn Thành xử lý rõ ràng.
+- [ ] Kiểm định thao tác Rollback để chắc chắn rằng thông báo "Tiến trình Xong" không bị lọt.
+- [ ] Xóa bỏ nhãn `isolation label` để tránh lỗi phát triển tương lai.
+- [ ] Dữ liệu bài kiểm thử Tích hợp (Integration test) cần chứng thực tính linh động cấu hình hệ CSDL.
 
-### Về mặt Chống Nhau (Coordination)
+### Khả Năng Điều Phối (Coordination)
 
-- [ ] Cứu hộ bằng Cú Đấm Nguyên Tử (atomic claim), dẹp trò "Nhìn trước Cướp sau" (check-then-act).
-- [ ] Thế hệ và Token của Chủ Sở Hữu (Owner) được Soi Kỹ trước khi Ghi (validate).
-- [ ] Giao việc (Chunk/command delivery) có chìa khóa miễn dịch (idempotency key).
-- [ ] Xài `REQUIRES_NEW` là ĐÃ HIỂU LUẬT, tự chịu trách nhiệm.
-- [ ] TUYỆT ĐỐI KHÔNG để Giao Dịch Con (inner NEW) đòi chọt Dòng đã bị Giao Dịch Cha (outer Tx) Khóa.
+- [ ] Cấu trúc Cơ chế Cứu Hộ chuyển sang phương pháp Ghi Nguyên Tử (atomic claim), xóa bỏ kỹ thuật "Đọc cũ rồi Hốt" (check-then-act).
+- [ ] Xác minh mã thẻ Sở Hữu (Owner Token) mỗi khi luồng Ghi diễn ra.
+- [ ] Thiết lập quy trình truyền thông tin (Chunk/Event) tích hợp cơ chế Chống Giao dịch đúp (Idempotency).
+- [ ] Sử dụng Annotation `REQUIRES_NEW` cẩn thận, nhận thức sâu sắc vòng đời hoạt động.
+- [ ] Chú ý NGĂN CẢN Giao dịch Nội (inner NEW) cạnh tranh Khóa với Giao dịch Ngoại (outer Tx) khi tương tác vào cùng Khối Dữ Liệu.
 
-### Về mặt Vận Hành (Operations)
+### Hoạt Động Giám Sát (Operations)
 
-- [ ] Định thời Nhịp Tim/Thuê Mướn (heartbeat/lease timing) đã trừ hao cho đứt cáp mập cắn (failure margin).
-- [ ] Giăng lưới bắt bọn Giao Dịch Ngâm Tôm (Long transaction age).
-- [ ] Đặt đồng hồ đo số lần Giải cứu chạy đúp và Bị đá văng vì hết quyền (Metrics).
-- [ ] Nếu dùng Đọc Ép Khóa thì đã canh thời gian nổ bom (Bounded timeouts).
-- [ ] Đối soát dữ liệu (Reconciliation) phân minh rõ ràng đâu là "Cố gắng làm" (attempt) đâu là "Kết liễu" (terminal).
+- [ ] Thời gian gia hạn vòng đời Nhịp Tim/Hợp đồng được cài đặt số khoảng chênh lệch dự phòng (Margin).
+- [ ] Khởi chạy công cụ theo dõi tuổi thọ các Giao Dịch Dài Hạn (Long transaction).
+- [ ] Thống kê số lượng các Tranh Giành Hợp đồng thành công và Bị đá văng do hết hạn (Metrics).
+- [ ] Gán khung định mức giới hạn thời gian chạy (Bounded timeouts) đối với mọi Yêu cầu khóa.
+- [ ] Bộ chạy giám sát (Reconciliation) phải rạch ròi quy mô đo lường Dữ liệu Nháp và Dữ Liệu Kết Thúc Hoàn Toàn.

@@ -1,6 +1,6 @@
-# Broken retry placement
+# Vị trí đặt retry bị lỗi
 
-## Versioned aggregate
+## Aggregate có đánh version
 
 ```java
 @Entity
@@ -30,8 +30,7 @@ public class InventoryItem {
 }
 ```
 
-Mỗi distinct command có một durable record. Unique command ID phục vụ duplicate
-command detection; nó không thay `@Version` trong việc bảo vệ stock mutation:
+Mỗi command riêng biệt có một bản ghi bền vững (durable record). ID duy nhất của command phục vụ cho việc phát hiện các command trùng lặp; nó không thay thế cho `@Version` trong việc bảo vệ cập nhật stock:
 
 ```java
 @Entity
@@ -65,9 +64,9 @@ public class ReservationRecord {
 }
 ```
 
-Non-essential getters/constructors được lược bỏ.
+Các getter/constructor không thiết yếu đã được lược bỏ.
 
-## Broken loop trong cùng transaction
+## Vòng lặp lỗi bên trong cùng một transaction
 
 ```java
 @Service
@@ -131,21 +130,20 @@ public class BrokenInventoryReservationService {
 }
 ```
 
-Loop có attempt limit nhưng boundary sai. Cả ba iterations nằm trong một physical
-transaction do outer proxy tạo. Sau failed flush:
+Vòng lặp có giới hạn số lần thử nhưng ranh giới (boundary) lại sai. Cả ba lần lặp đều nằm trong cùng một physical transaction do proxy bên ngoài tạo ra. Sau khi flush thất bại:
 
-- transaction/persistence provider có failed state hoặc rollback-only;
-- managed entities vừa tham gia stale write;
-- reservation insert của attempt cũ thuộc cùng doomed transaction;
-- `clear()` chỉ detach entities;
-- backoff giữ connection/transaction lâu hơn;
-- iteration sau không phải independent attempt.
+- transaction/persistence provider có trạng thái lỗi (failed state) hoặc rollback-only;
+- các thực thể đang được quản lý (managed entities) vừa tham gia vào một lần ghi lỗi thời (stale write);
+- thao tác insert reservation của lần thử cũ thuộc cùng một transaction đã hỏng (doomed transaction);
+- lệnh `clear()` chỉ ngắt kết nối (detach) các thực thể;
+- backoff giữ lại connection/transaction lâu hơn;
+- lần lặp tiếp theo không phải là một lần thử độc lập.
 
-> **Nói ngắn gọn:** `for` tạo execution repetition, không tạo transaction mới.
+> **Nói ngắn gọn:** vòng lặp `for` tạo ra sự lặp lại về mặt thực thi mã nguồn, không tạo ra transaction mới.
 
-## Nếu bỏ explicit flush
+## Nếu bỏ lệnh flush tường minh
 
-Variant sau còn không catch được optimistic conflict:
+Biến thể sau đây thậm chí còn không bắt (catch) được lỗi optimistic conflict:
 
 ```java
 @Transactional
@@ -156,19 +154,17 @@ public ReservationResult reserveWithRetry(...) {
             item.reserve(quantity);
             return ReservationResult.accepted(...);
         } catch (ObjectOptimisticLockingFailureException conflict) {
-            // never reached when conflict is detected during proxy commit
+            // không bao giờ chạy đến đây khi xung đột được phát hiện trong quá trình commit của proxy
         }
     }
 }
 ```
 
-Hibernate có thể flush sau target method return, trong transaction interceptor
-commit phase. Lúc đó call stack đã rời loop; exception chỉ xuất hiện ở caller.
+Hibernate có thể flush sau khi phương thức đích đã trả về, cụ thể là trong giai đoạn commit của transaction interceptor. Lúc đó call stack đã rời khỏi vòng lặp; ngoại lệ chỉ xuất hiện ở phía gọi (caller).
 
-Explicit flush giúp conflict xuất hiện trong attempt body, nhưng không tự tạo clean
-retry boundary.
+Lệnh flush tường minh giúp xung đột xuất hiện ngay trong phần thân của lần thử, nhưng không tự tạo ra ranh giới retry sạch.
 
-## Self-invoked `REQUIRES_NEW` không tạo transaction mới
+## Lệnh gọi nội bộ (Self-invoked) `REQUIRES_NEW` không tạo transaction mới
 
 ```java
 @Transactional
@@ -188,12 +184,11 @@ public ReservationResult reserveOnce(...) {
 }
 ```
 
-`this.reserveOnce()` không đi qua Spring proxy. `REQUIRES_NEW` annotation không
-được intercept; attempt vẫn dùng outer transaction.
+Lời gọi `this.reserveOnce()` không đi qua Spring proxy. Annotation `REQUIRES_NEW` không bị chặn (intercept) bởi Spring proxy; lần thử vẫn sử dụng transaction bên ngoài.
 
 ## Retry interceptor nằm bên trong transaction interceptor
 
-Đặt hai annotations trên cùng method không tự chứng minh ordering:
+Việc đặt cả hai annotation trên cùng một phương thức không tự chứng minh được thứ tự thực thi (ordering):
 
 ```java
 @Retryable(
@@ -202,23 +197,21 @@ public ReservationResult reserveOnce(...) {
 )
 @Transactional
 public ReservationResult reserve(...) {
-    // load, mutate, flush
+    // tải, sửa đổi, flush
 }
 ```
 
-Broken advisor chain:
+Chuỗi advisor bị lỗi:
 
 ```text
 caller
-  -> TransactionInterceptor begins Tx
-       -> RetryInterceptor catches conflict and invokes target again
-            -> attempts share the same Tx/context
-       -> outer commit fails or rolls back
+  -> TransactionInterceptor bắt đầu Tx
+       -> RetryInterceptor bắt lỗi xung đột và gọi lại đích
+            -> các lần thử dùng chung Tx/context
+       -> commit bên ngoài thất bại hoặc rollback
 ```
 
-Correct chain phải là retry outside transaction, nhưng relying on implicit advisor
-order làm correctness khó review và dễ đổi theo configuration. Tách coordinator
-và attempt worker thành hai beans làm boundary hiển thị bằng object graph.
+Chuỗi đúng phải là quá trình retry ở bên ngoài transaction, nhưng việc phụ thuộc vào thứ tự ngầm định của các advisor làm cho tính đúng đắn khó bị đánh giá (review) và dễ thay đổi theo cấu hình. Tách biệt bộ điều phối (coordinator) và bộ xử lý (worker) thành hai bean riêng biệt làm cho ranh giới hiển thị rõ ràng thông qua cấu trúc đối tượng (object graph).
 
 ## Catch quá rộng
 
@@ -228,25 +221,23 @@ catch (RuntimeException failure) {
 }
 ```
 
-Cách này retry cả `InsufficientStockException`, unique idempotency conflict,
-validation bug và programming error. Retry policy phải classify allowlist failure
-types; domain rejection không trở thành transient chỉ vì nó là exception.
+Cách này retry cả ngoại lệ `InsufficientStockException`, các xung đột tính lũy đẳng (unique idempotency), lỗi xác thực (validation bug) và lỗi lập trình. Chính sách retry phải phân loại các dạng lỗi được phép (allowlist failure types); việc từ chối theo logic nghiệp vụ (domain rejection) không trở thành lỗi tạm thời (transient) chỉ vì nó là một ngoại lệ.
 
-## Preconditions tái hiện
+## Điều kiện tiên quyết để tái hiện (Preconditions)
 
-- Hai physical transactions load cùng `version = 7`.
-- Command A commit trước, row thành version 8.
+- Hai physical transaction cùng đọc `version = 7`.
+- Command A commit trước, biến dòng dữ liệu thành version 8.
 - Command B flush `UPDATE ... WHERE version = 7`.
-- Hibernate nhận affected-row count `0`.
-- Retry loop/interceptor catch conflict trước khi transaction boundary rollback.
-- Attempt tiếp theo reuse cùng thread-bound transaction/persistence context.
+- Hibernate nhận kết quả số dòng bị ảnh hưởng (affected-row count) là `0`.
+- Vòng lặp retry/interceptor bắt (catch) xung đột trước khi ranh giới transaction tiến hành rollback.
+- Lần thử tiếp theo tái sử dụng lại transaction/persistence context đã liên kết với luồng (thread-bound) đó.
 
 ## Những cách sửa chưa đủ
 
-- Gọi `EntityManager.clear()` sau conflict.
-- Gọi `refresh()` trong rollback-only transaction.
-- Thêm nhiều attempts hoặc backoff dài hơn.
-- Đặt `REQUIRES_NEW` trên self-invoked method.
-- Chỉ move `flush()` vào loop.
-- Retry mọi `RuntimeException`.
-- Assume unique command key tự bảo vệ stock update.
+- Gọi `EntityManager.clear()` sau xung đột.
+- Gọi `refresh()` trong transaction đã ở trạng thái rollback-only.
+- Thêm số lượng lần thử hoặc thời gian chờ dài hơn.
+- Đặt `REQUIRES_NEW` trên phương thức được gọi nội bộ (self-invoked method).
+- Chỉ di chuyển lệnh `flush()` vào trong vòng lặp.
+- Retry đối với mọi `RuntimeException`.
+- Giả định rằng khóa duy nhất (unique command key) có thể tự bảo vệ việc cập nhật stock.

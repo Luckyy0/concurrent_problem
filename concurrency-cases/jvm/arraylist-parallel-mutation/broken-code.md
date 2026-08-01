@@ -1,10 +1,8 @@
-# Cách triển khai bị lỗi
+# Phản Mẫu Thiết Kế (Anti-Patterns): Nguy Cơ Tranh Chấp Tài Nguyên Nội Tại Của ArrayList
 
-## Đoạn code dùng chung ArrayList
+## 1. Cấu Trúc Mã Nguồn Dùng Chung ArrayList
 
-Service dưới đây nhận một executor do Spring quản lý. Mỗi task gọi remote client
-rồi append vào cùng `ArrayList`. Method `progressSnapshot()` có thể chạy đồng
-thời để phục vụ endpoint theo dõi batch.
+Đoạn mã cấu trúc một Service quản lý vòng lặp tác vụ thông qua Executor của hệ sinh thái Spring. Mỗi phân luồng thi hành độc lập truy vấn báo giá và chèn chung (append) vào một cá thể `ArrayList`. Đồng thời, đặc tả thiết kế cho phép phương thức giám sát `progressSnapshot()` kích hoạt song song nhằm khảo sát tiến độ.
 
 ```java
 package com.example.quote;
@@ -43,6 +41,7 @@ public class BrokenBatchQuoteService {
         for (QuoteRequest request : requests) {
             Future<?> future = quoteExecutor.submit(() -> {
                 QuoteResult result = quoteClient.fetch(request);
+                // VỊ TRÍ LỖI: Cập nhật song song vào cấu trúc không an toàn
                 batch.results.add(result);
             });
             batch.futures.add(future);
@@ -66,13 +65,14 @@ public class BrokenBatchQuoteService {
     }
 
     public List<QuoteResult> progressSnapshot(UUID batchId) {
+        // VỊ TRÍ LỖI: Duyệt danh sách trong lúc cấu trúc đang bị biến đổi ngầm
         return List.copyOf(requireBatch(batchId).results);
     }
 
     private RunningBatch requireBatch(UUID batchId) {
         RunningBatch batch = running.get(batchId);
         if (batch == null) {
-            throw new IllegalArgumentException("unknown batch: " + batchId);
+            throw new IllegalArgumentException("Định danh lô không hợp lệ: " + batchId);
         }
         return batch;
     }
@@ -89,7 +89,7 @@ public class BrokenBatchQuoteService {
 }
 ```
 
-Các type nghiệp vụ tối thiểu:
+Mô hình đối tượng truyền dẫn cơ bản:
 
 ```java
 package com.example.quote;
@@ -106,71 +106,56 @@ public record QuoteResult(
 ) {}
 ```
 
-`running` là `ConcurrentHashMap`, nhưng nó chỉ bảo vệ registry của batch. Nó
-không truyền thread-safety sang hai `ArrayList` nằm bên trong `RunningBatch`.
+Cấu trúc `running` (dựa trên `ConcurrentHashMap`) chỉ giới hạn chức năng bảo vệ bảng đăng ký theo dõi Lô xử lý. Nó **KHÔNG** truyền dẫn tính toàn vẹn (Thread-safety) lan xuống các lớp biến `ArrayList` chứa bên trong cấu trúc `RunningBatch`.
 
-## Hai race condition độc lập
+## 2. Phân Rã Hai Nguy Cơ Tranh Chấp Độc Lập
 
-### Nhiều task cùng append result
+### 2.1 Cạnh Tranh Ghi Đè Trên Cùng Cấu Trúc Nội Tại
 
-`ArrayList.add` về logic cần chọn index theo `size`, ghi vào backing array rồi
-tăng `size`. Đây không phải một atomic operation. Hai task có thể cùng chọn một
-index và một result ghi đè result còn lại.
+Về bản chất, hàm `ArrayList.add` thực thi chuỗi hành vi rời rạc: định vị biến `size` làm chỉ mục, nạp phần tử vào mảng cấp thấp (backing array), và tăng cấp trị số `size`. Trạng thái này thiếu hụt tính Nguyên Tử. Hậu quả: Hai phân luồng tác vụ có rủi ro sử dụng trùng một vị trí chỉ mục, dẫn đến một kết quả hoàn toàn bị xóa sổ bởi kết quả chậm hơn.
 
-Pre-size bằng `new ArrayList<>(expectedSize)` chỉ giảm khả năng resize. Nó không
-làm cho việc cập nhật `size` hoặc slot trở nên atomic.
+Hành động cấp phát bộ nhớ trước `new ArrayList<>(expectedSize)` chỉ cắt giảm tần suất dịch chuyển vùng nhớ (resize array). Nó không cấp phép nguyên tử hóa cho các thao tác đọc/ghi thông số vòng lặp ngầm.
 
-### Coordinator thêm future trong lúc caller bắt đầu chờ
+### 2.2 Biến Biến Dạng Cấu Trúc Tại Luồng Điền Danh Sách Chờ
 
-`start()` công bố `batchId` sau vòng submit, nên caller tuần tự nhận return rồi
-mới gọi `awaitResult()` sẽ thấy danh sách future đã được dựng. Tuy nhiên, nếu code
-sau này phát event hoặc expose batch trước khi vòng submit kết thúc, cả
-`batch.futures` cũng trở thành shared mutable state không an toàn.
+Phương thức `start()` công bố định danh `batchId` tức thời sau khi kết thúc chuỗi gửi tiến trình (submit). Nếu các tác vụ nội tại khởi chạy hệ thống (event trigger) hoặc API gọi `awaitResult()` can thiệp sớm, việc chia sẻ biến `batch.futures` ngay lập tức trở thành nguy cơ phân cực trạng thái bất hợp pháp (Shared mutable state).
 
-Case giữ publish point tại cuối `start`, nhưng vẫn nhấn mạnh contract này vì một
-refactor “cập nhật progress sớm” có thể mở thêm race.
+Thiết kế này giữ nguyên điểm công bố trạng thái (publish point) tại điểm cuối hàm `start()`, nhưng cần nhận thức rõ đặc tính rủi ro nếu quá trình nâng cấp mã nguồn vô tình phá vỡ hợp đồng luồng này.
 
-### Progress endpoint traverse trong lúc writer add
+### 2.3 Hiện Tượng Ngắt Snapshot Tiến Độ Không Định Hình
 
-`List.copyOf(batch.results)` phải traverse source list. Nếu task đồng thời thay
-đổi cấu trúc, operation không có thread-safety contract và có thể trả partial
-view hoặc ném exception.
+Giao thức `List.copyOf(batch.results)` bắt buộc hệ thống duyệt xuất qua toàn bộ mảng. Khi kết hợp với các luồng thay đổi cấu trúc mảng ngầm định, phương thức này phá vỡ hợp đồng quản trị an toàn luồng, gây phản ứng trả về dữ liệu rác (Partial view) hoặc ném lỗi ngưng trệ ứng dụng.
 
-> **Nói ngắn gọn:** bọc batch bằng một concurrent map không làm cho object mutable
-> nằm trong value tự động an toàn.
+> **Nguyên tắc kỹ thuật:** Đóng gói một danh sách thay đổi (Mutable object) vào bên trong cấu trúc lưu trữ An Toàn Luồng (Concurrent map) KHÔNG cấp phép an toàn tự động cho danh sách đó.
 
-## Vì sao code trông có vẻ hợp lý
+## 3. Bản Chất Xung Đột Dễ Bị Lầm Tưởng
 
-- mỗi request chỉ có một `RunningBatch` riêng;
-- list đã pre-size theo số input;
-- mỗi task tạo một `QuoteResult` riêng;
-- coordinator chờ mọi future trước khi trả final result;
-- test nhỏ thường không tạo đủ overlap để làm mất update.
+Cấu trúc trên thường đánh lừa tư duy an toàn qua các cảm quan:
+- Bộ nhớ lưu trữ `RunningBatch` độc quyền trên mỗi yêu cầu (Request).
+- Không gian bộ nhớ mảng đã được phân bổ định mức đầu vào.
+- Tác vụ xử lý đối tượng truyền dẫn mới mẻ (`QuoteResult`).
+- Phán quyết trả kết quả được phong tỏa chờ luồng hoàn tất (`Future.get`).
+- Chuỗi kiểm thử cục bộ (Unit Test) khó bộc lộ lỗ hổng đan xen luồng.
 
-Điểm sai nằm ở accumulator: mọi task vẫn mutate cùng `ArrayList` và không có lock
-hoặc ownership protocol.
+Điểm đứt gãy chí mạng: Tập trung toàn bộ tài nguyên Ghi vào cấu trúc Chia Sẻ (Shared Accumulator) trong điều kiện Vắng Bóng Rào Cản Thẩm Định (Lock / Ownership Protocol).
 
-## Điều kiện để lỗi xuất hiện
+## 4. Các Tác Nhân Kích Hoạt Lỗi Hệ Thống
 
-1. batch có ít nhất hai task chạy overlap;
-2. các task cùng gọi `results.add`;
-3. progress reader có thể traverse trước completion barrier;
-4. không có lock hoặc concurrent collection bảo vệ access;
-5. task completion order khác input order nếu API yêu cầu giữ order.
+1. Lô xử lý khởi phát tối thiểu hai tiến trình chéo (Overlap tasks).
+2. Chuỗi luồng thực thi đồng thời kích hoạt `results.add`.
+3. Tác vụ trích xuất tiến độ (Progress reader) khởi động trước ranh giới phong tỏa luồng.
+4. Triệt tiêu cơ chế Khóa hoặc cấu trúc Tập hợp đồng thời tương xứng.
+5. Yêu cầu định hình thứ tự dữ liệu đầu ra không khớp thứ tự hoàn thành.
 
-## Những cách sửa tưởng đúng nhưng chưa đủ
+## 5. Phản Mẫu Kỹ Thuật Khắc Phục Sai Lệch
 
-### Chỉ tăng initial capacity
+### Tăng Khối Lượng Phân Bổ (Initial Capacity)
+Xử lý Capacity chỉ loại trừ chu trình sao chép mảng mở rộng (Resize). Hiện tượng chồng chéo tham chiếu truy cập thuộc tính `size` nội tại vẫn tồn tại độc lập.
 
-Capacity chỉ liên quan số lần resize. Internal `size` và các lần ghi slot vẫn bị
-nhiều thread cạnh tranh.
+### Che Chắn Bằng Khai Báo Biến Tĩnh (`volatile` / `final`)
+Tham số `final` định danh con trỏ vùng nhớ khởi tạo; tham số `volatile` định hình sự nhìn nhận thay đổi của luồng lên vùng nhớ. Cả hai công cụ này hoàn toàn không tái tạo tính Nguyên Tử cho phương thức cấp thấp `ArrayList.add`.
 
-### Khai báo list là volatile hoặc final
-
-`final` bảo vệ reference khởi tạo; `volatile` bảo vệ việc thay reference. Cả hai
-không làm `ArrayList.add` atomic và không bảo vệ backing array.
-
-### Dùng parallelStream với forEach results::add
+### Ảo Giác An Toàn Qua Mảng Đồng Thời (Parallel Stream)
 
 ```java
 List<QuoteResult> results = new ArrayList<>();
@@ -178,31 +163,23 @@ requests.parallelStream()
         .map(quoteClient::fetch)
         .forEach(results::add);
 ```
+Kiến trúc này duy trì một danh sách tích lũy ngoại vi. Framework Stream không cung cấp cơ chế khóa tự động cho các cấu trúc ngoại sinh nằm ngoài luồng thực thi.
 
-Đây vẫn là external mutable accumulator. Parallel stream không tự phát hiện và
-khóa object bên ngoài pipeline.
+### Áp Dụng Giới Hạn Monitor (`Collections.synchronizedList`)
 
-### Chỉ dùng Collections.synchronizedList
-
-Từng `add` được serialize, nhưng iteration và compound operation phải khóa thủ
-công trên đúng list:
+Bảo chứng tuần tự tại điểm nạp giá trị, nhưng phân tán quyền kiểm soát trên các tiến trình kết hợp:
 
 ```java
 synchronized (results) {
     return List.copyOf(results);
 }
 ```
+Lỗ hổng xuất hiện khi API Giám sát bỏ sót khai báo Monitor này, dẫn đến vỡ cấu trúc hợp đồng an toàn. Mô hình này không xử lý bài toán sắp xếp trạng thái hay quản trị vòng đời ngoại lệ.
 
-Nếu progress endpoint quên monitor này, contract lại bị phá. Cách này cũng không
-tự quyết định input order hoặc batch failure policy.
+### Hao Tổn Cấu Trúc Với (`CopyOnWriteArrayList`)
 
-### Dùng CopyOnWriteArrayList cho batch ghi nhiều
+Kiến tạo Mảng sao lưu (Copy backing array) trên từng thao tác Ghi. Ổn định ở điểm Truyệt Xuất, nhưng thiêu rụi bộ nhớ qua vô số lần phân bổ không cần thiết (Allocation) cho các quy trình tập trung Ghi Dữ Liệu (Write-heavy).
 
-Mỗi write tạo một bản sao backing array. Iterator ổn định, nhưng workload append
-nhiều result phải copy liên tục và tạo nhiều allocation. Đây thường là lựa chọn
-không phù hợp cho write-heavy aggregation.
+### Trực Tiến Quản Trị Ngoại Lệ Bằng Thử Lại (Catch & Retry)
 
-### Bắt ConcurrentModificationException rồi retry
-
-Fail-fast iterator là best-effort. Không có exception không chứng minh snapshot
-đầy đủ; retry cũng không phục hồi result đã bị mất do hai lần `add` ghi đè nhau.
+Giao thức đánh ngắt nhanh (Fail-fast iterator) hoạt động dựa trên phương thức tối đa (Best-effort). Sự vắng mặt của ngoại lệ không đại diện cho Snapshot tinh sạch. Kích hoạt Retry hoàn toàn vô nghĩa trong việc khôi phục các dữ liệu đã bị xóa sổ bởi luồng đan chéo.

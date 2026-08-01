@@ -1,22 +1,22 @@
-# Cấu hình Thực nghiệm (Experiments) cho Cập nhật Nguyên tử có điều kiện
+# Thực Nghiệm (Experiments): Khởi Tạo Lock Nguyên Tử Có Điều Kiện
 
-## Mục tiêu
+## 1. Mục Tiêu Kiểm Thử
 
-Bộ test (Test suite) của chúng ta phải chứng minh được những điều sau đây bằng thực tế:
+Bộ kiểm thử (Test suite) được thiết kế nhằm mục đích chứng minh các hành vi sau:
 
-1. Kịch bản ngây thơ "đọc-kiểm-tra-ghi" chắc chắn làm lệch sổ đối soát.
-2. Nếu chạy câu lệnh UPDATE nguyên tử đa luồng, khi chỉ còn đủ hàng cho 1 người, thì chỉ có đúng 1 người thắng.
-3. Kẻ đứng chờ (waiter) sẽ tự động chạy lại cục điều kiện `WHERE` sau khi người giữ khóa (holder) chốt sổ thành công.
-4. Nếu người giữ khóa hủy bỏ (rollback), kẻ đứng chờ được lấy lại kho hàng ban đầu.
-5. Hết giờ chờ khóa (Lock timeout) là lỗi hệ thống, hoàn toàn khác với việc trả về `0` dòng (hết hàng).
-6. Bấm nút liên tục với cùng 1 mã đơn (duplicate command) thì cũng chỉ bị trừ hàng đúng 1 lần.
-7. Nếu gặp lỗi ở các bước sau câu lệnh UPDATE, kho hàng phải được hoàn tác (rollback).
-8. Gọi SQL thẳng xuống DB sẽ qua mặt Hibernate và làm bộ đệm bị ôi thiu.
-9. Dù có ném hàng chục luồng vào cùng lúc, tổng kho vẫn luôn được bảo toàn tuyệt đối (conservation invariant).
+1. Kịch bản Đọc-Kiểm tra-Ghi (Read-Check-Write) cơ bản sẽ gây ra sự sai lệch số liệu đối soát (Reconciliation failure).
+2. Khi thực thi câu lệnh UPDATE nguyên tử đa luồng (Concurrent atomic UPDATE), nếu chỉ đủ số lượng tồn kho cho 1 yêu cầu, hệ thống đảm bảo chỉ có đúng 1 yêu cầu thành công.
+3. Transaction đang chờ (Waiter) sẽ tự động kích hoạt đánh giá lại điều kiện `WHERE` (Predicate recheck) sau khi transaction giữ lock (Holder) hoàn tất (Commit).
+4. Nếu transaction giữ lock bị hủy bỏ (Rollback), transaction chờ sẽ tiếp nhận trạng thái ban đầu của tồn kho và xử lý tiếp.
+5. Hiện tượng quá thời gian chờ lock (Lock timeout) là một lỗi kỹ thuật của hệ thống, hoàn toàn khác biệt với kết quả trả về `0` dòng (Hết hàng).
+6. Khi xử lý một mã lệnh trùng lặp liên tục (Duplicate command), hệ thống chỉ thực hiện trừ số lượng tồn kho duy nhất một lần.
+7. Nếu phát sinh lỗi ở các khâu sau khi thực thi lệnh UPDATE, hệ thống phải hoàn tác (Rollback) toàn bộ dữ liệu tồn kho.
+8. Gọi Bulk DML trực tiếp sẽ vượt qua Hibernate, có khả năng gây ảnh hưởng đến bộ đệm (Persistence context).
+9. Trong các bài toán tải cao (Stress test), hệ thống phải luôn bảo toàn tính đúng đắn của dữ liệu tổng.
 
-Chú ý quan trọng: Vì chúng ta đang test các cơ chế đặc thù của PostgreSQL, nên **BẮT BUỘC** phải dùng thư viện Testcontainers chạy database thật. Chạy bằng H2 in-memory sẽ không chứng minh được gì cả!
+> **Lưu ý quan trọng:** Do tính chất mô phỏng các cơ chế chuyên sâu của PostgreSQL, việc kiểm thử **BẮT BUỘC** phải được thực hiện thông qua Testcontainers với một database thật, không sử dụng H2 in-memory.
 
-## Cấu trúc Testcontainers (Fixture)
+## 2. Cấu Hình Testcontainers (Fixture)
 
 ```java
 @Testcontainers
@@ -69,9 +69,9 @@ class ConditionalInventoryUpdateIT {
 }
 ```
 
-Script khởi tạo đã tạo sẵn sản phẩm `77`. Trong hàm `reset()`, ta chỉ đơn giản là dọn dẹp bảng lịch sử và reset lại số đếm, chứ không cần xóa rồi insert lại (tránh làm thay đổi định danh dòng).
+Kịch bản khởi tạo cung cấp sẵn dữ liệu sản phẩm `77`. Phương thức `reset()` đảm nhận việc làm sạch bảng lịch sử và phục hồi lại số lượng, tránh thao tác xóa và chèn lại làm xáo trộn định danh dòng (Row identity).
 
-## Các hàm Hỗ trợ Điều phối (Coordination helpers)
+## 3. Các Phương Thức Hỗ Trợ Điều Phối (Coordination Helpers)
 
 ```java
 @FunctionalInterface
@@ -140,11 +140,11 @@ private String sqlState(Throwable failure) {
 }
 ```
 
-Chúng ta dùng `CountDownLatch` để chặn các luồng nhằm tạo ra thứ tự chạy chính xác. Hàm `awaitDatabaseBlock` sẽ chọc thẳng vào bảng theo dõi `pg_stat_activity` của Postgres để chắc chắn rằng: "À, luồng này đang thực sự bị PostgreSQL khóa mõm rồi". Luôn nhớ đặt thời gian chờ tối đa (timeout) cho các hàm đợi để test không bị treo cứng ngắc.
+Việc đồng bộ hóa giữa các luồng sử dụng `CountDownLatch`. Phương thức `awaitDatabaseBlock` kiểm tra View `pg_stat_activity` của PostgreSQL nhằm xác nhận trạng thái cấp lock (Lock state). Đảm bảo đặt thời gian chờ tối đa (Timeout) để ngăn ngừa hiện tượng kiểm thử treo không thời hạn (Hanging test).
 
-## Thực nghiệm 1 — Tái hiện thảm họa ghi đè mất dữ liệu
+## 4. Thực Nghiệm 1 — Tái Hiện Lỗi Ghi Đè Dữ Liệu (Lost Update)
 
-Ta viết riêng một class hỏng để test, dùng `CyclicBarrier` chặn 2 luồng lại ngay sau khi vừa `SELECT` xong:
+Thiết kế một lớp mô phỏng luồng lỗi (Broken service), dùng `CyclicBarrier` để đồng bộ hóa hai luồng transaction ngay sau thao tác `SELECT`:
 
 ```java
 @Service
@@ -159,10 +159,10 @@ class BarrierBrokenReservationTx {
     public UUID reserve(ReserveStockCommand command) {
         InventoryItem item =
                 items.findById(command.productId()).orElseThrow();
-        assertEquals(5, item.availableQuantity()); // Đọc lên 5
+        assertEquals(5, item.availableQuantity());
 
         try {
-            bothLoaded.await(5, TimeUnit.SECONDS); // Chặn lại, đợi đủ 2 thằng cùng tới đây
+            bothLoaded.await(5, TimeUnit.SECONDS); // Đồng bộ hai luồng
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(interrupted);
@@ -170,7 +170,7 @@ class BarrierBrokenReservationTx {
             throw new IllegalStateException(failure);
         }
 
-        // Bắt đầu nhắm mắt ghi đè
+        // Bắt đầu thực thi thao tác cập nhật (Ghi đè tuyệt đối)
         item.reserve(command.quantity());
         UUID reservationId = UUID.randomUUID();
         reservations.save(InventoryReservation.reserved(
@@ -195,18 +195,17 @@ void plainReadCheckWriteBreaksReconciliation() throws Exception {
     a.get(10, TimeUnit.SECONDS);
     b.get(10, TimeUnit.SECONDS);
 
-    // Assert: Sổ sách lệch bét nhè!
+    // Kiểm chứng: Sự bất đồng bộ (Reconciliation drift)
     assertEquals(1, available(77));
     assertEquals(4, reservedCounter(77));
     assertEquals(8, reservedAuditQuantity(77));
     assertEquals(2, reservedOutcomeCount(77));
-    assertFalse(projectionMatchesAudit(77)); // ĐỐI SOÁT LỆCH
+    assertFalse(projectionMatchesAudit(77)); // Sổ đối soát lệch
 }
 ```
+Kết quả cho thấy mặc dù các ràng buộc database (Constraints) không bị vi phạm, tính đồng nhất của hệ thống đã bị mất, xác nhận nguy cơ của việc Đọc-Kiểm tra-Ghi độc lập.
 
-Tất cả các rào chắn (constraints) của dòng dữ liệu đều cho qua, nhưng hàm chạy đối soát (reconciliation) thì gào thét vì số liệu lệch nhau.
-
-## Thực nghiệm 2 — Khi luồng chốt sổ, luồng chờ tự "nhìn lại bản thân" (recheck)
+## 5. Thực Nghiệm 2 — Tính Chất Tự Đánh Giá Lại (Predicate Recheck)
 
 ```java
 @Test
@@ -214,7 +213,7 @@ void waiterReturnsNoRowAfterHolderCommits() throws Exception {
     CountDownLatch holderUpdated = new CountDownLatch(1);
     CountDownLatch allowCommit = new CountDownLatch(1);
 
-    // Luồng A: Chạy vào UPDATE và giữ nguyên khóa ở đó, chưa chốt sổ
+    // Luồng A: Thực hiện cập nhật nhưng chưa Commit
     Future<Optional<InventoryAfterReserve>> holder =
             executor.submit(() -> inTransaction(() -> {
                 setLocalApplicationName("lock004-holder");
@@ -228,33 +227,32 @@ void waiterReturnsNoRowAfterHolderCommits() throws Exception {
 
     assertTrue(holderUpdated.await(5, TimeUnit.SECONDS));
 
-    // Luồng B: Húc đầu vào và bị PostgreSQL cho đứng chờ
+    // Luồng B: Yêu cầu cùng tài nguyên, rơi vào trạng thái chờ (Wait)
     Future<Optional<InventoryAfterReserve>> waiter =
             executor.submit(() -> inTransaction(() -> {
                 setLocalApplicationName("lock004-waiter");
                 return inventory.tryReserve(77, 4);
             }));
 
-    awaitDatabaseBlock("lock004-waiter"); // Xác nhận B đang bị khóa mỏ
+    awaitDatabaseBlock("lock004-waiter"); // Xác thực trạng thái Blocking
     assertThrows(
             TimeoutException.class,
             () -> waiter.get(100, TimeUnit.MILLISECONDS)
     );
 
-    allowCommit.countDown(); // Bật đèn xanh cho A chốt sổ
+    allowCommit.countDown(); // Cho phép luồng A Commit
 
-    // Kiểm tra kết quả
-    assertTrue(holder.get(5, TimeUnit.SECONDS).isPresent()); // A thắng
-    assertTrue(waiter.get(5, TimeUnit.SECONDS).isEmpty()); // B tay trắng ra về
+    // Kiểm định kết quả
+    assertTrue(holder.get(5, TimeUnit.SECONDS).isPresent()); // Luồng A thành công
+    assertTrue(waiter.get(5, TimeUnit.SECONDS).isEmpty()); // Luồng B không có dữ liệu trả về
     assertEquals(1, available(77));
     assertEquals(4, reservedCounter(77));
     assertEquals(11, revision(77));
 }
 ```
+Việc luồng B nhận được `Optional.empty()` là kết quả từ tính năng Predicate Recheck của PostgreSQL. Database sử dụng trạng thái dữ liệu đã cập nhật bởi luồng A (với `available = 1`) để đánh giá lại điều kiện `1 >= 4`, và từ chối thao tác do điều kiện không thỏa mãn.
 
-> **Nói ngắn gọn:** Kết quả `Optional.empty()` của B có được là nhờ PostgreSQL sau khi thức dậy khỏi chế độ chờ, đã nhìn thấy con số kho `available=1` mới tinh, tự động đem đi xét lại cụm `WHERE 1 >= 4`, thấy sai nên báo về 0 dòng. Cực kỳ thông minh!
-
-## Thực nghiệm 3 — Luồng đang giữ khóa lật lọng (Rollback) thì luồng chờ thắng
+## 6. Thực Nghiệm 3 — Kịch Bản Hoàn Tác Của Transaction Giữ Lock (Holder Rollback)
 
 ```java
 @Test
@@ -262,7 +260,7 @@ void waiterCanApplyAfterHolderRollsBack() throws Exception {
     CountDownLatch holderUpdated = new CountDownLatch(1);
     CountDownLatch forceRollback = new CountDownLatch(1);
 
-    // Luồng A: UPDATE thành công nhưng cuối cùng quậy tung chảo ném lỗi Rollback
+    // Luồng A: Cập nhật thành công nhưng cưỡng chế lỗi để Rollback
     Future<Void> holder = executor.submit(() -> inTransaction(() -> {
         setLocalApplicationName("lock004-rollback-holder");
         assertTrue(inventory.tryReserve(77, 4).isPresent());
@@ -273,7 +271,7 @@ void waiterCanApplyAfterHolderRollsBack() throws Exception {
 
     assertTrue(holderUpdated.await(5, TimeUnit.SECONDS));
 
-    // Luồng B: Đứng chờ ngoan ngoãn
+    // Luồng B: Vào trạng thái chờ (Wait)
     Future<Optional<InventoryAfterReserve>> waiter =
             executor.submit(() -> inTransaction(() -> {
                 setLocalApplicationName("lock004-rollback-waiter");
@@ -281,27 +279,26 @@ void waiterCanApplyAfterHolderRollsBack() throws Exception {
             }));
 
     awaitDatabaseBlock("lock004-rollback-waiter");
-    forceRollback.countDown(); // Ra lệnh cho A tự hủy (Rollback)
+    forceRollback.countDown(); // Kích hoạt luồng A Rollback
 
     ExecutionException rolledBack =
             assertThrows(ExecutionException.class,
                     () -> holder.get(5, TimeUnit.SECONDS));
     assertInstanceOf(RollbackForTest.class, rolledBack.getCause());
 
-    // Luồng B tỉnh dậy, thấy A như chưa từng tồn tại, trừ kho cái vèo!
+    // Luồng B sau khi được đánh thức, tiến hành thao tác trên dữ liệu gốc
     InventoryAfterReserve winner =
             waiter.get(5, TimeUnit.SECONDS).orElseThrow();
     assertEquals(1, winner.available());
     assertEquals(4, winner.reserved());
     assertEquals(1, available(77));
     assertEquals(4, reservedCounter(77));
-    assertEquals(11, revision(77)); // Chỉ lên 1 phiên bản
+    assertEquals(11, revision(77)); // Revision chỉ tăng 1 lần
 }
 ```
+Luồng B thành công và phiên bản (Revision) cũng nhất quán do toàn bộ hoạt động của A đã được loại bỏ.
 
-Kết quả trừ và phiên bản (revision) của A bay màu sạch sẽ; luồng B xông vào và làm chủ sân khấu.
-
-## Thực nghiệm 4 — Quá giờ chờ khóa (Lock timeout) là lỗi hệ thống, không phải hết hàng
+## 7. Thực Nghiệm 4 — Phân Biệt Lỗi Lock Timeout
 
 ```java
 @Test
@@ -320,7 +317,7 @@ void lockTimeoutIsTechnicalFailureNotOutOfStock() throws Exception {
 
     Future<Optional<InventoryAfterReserve>> contender =
             executor.submit(() -> inTransaction(() -> {
-                // Ép luồng này chỉ được chờ khóa tối đa 150ms
+                // Áp đặt giới hạn chờ (150ms)
                 jdbc.queryForObject("""
                         select set_config(
                             'lock_timeout',
@@ -331,11 +328,11 @@ void lockTimeoutIsTechnicalFailureNotOutOfStock() throws Exception {
                 return inventory.tryReserve(77, 4);
             }));
 
-    // Bụp! Văng lỗi hệ thống
+    // Bắt ngoại lệ lỗi kỹ thuật hệ thống
     ExecutionException failed =
             assertThrows(ExecutionException.class,
                     () -> contender.get(5, TimeUnit.SECONDS));
-    assertEquals("55P03", sqlState(failed)); // Đúng chuẩn mã lỗi timeout
+    assertEquals("55P03", sqlState(failed)); // Mã lỗi đặc trưng của Timeout
 
     releaseHolder.countDown();
     assertNull(holder.get(5, TimeUnit.SECONDS));
@@ -343,10 +340,9 @@ void lockTimeoutIsTechnicalFailureNotOutOfStock() throws Exception {
     assertEquals(4, reservedCounter(77));
 }
 ```
+Mã lỗi `55P03` khẳng định việc quá tải hệ thống, tầng ứng dụng phải phân biệt rạch ròi với trạng thái nghiệp vụ `OUT_OF_STOCK` (0 dòng bị ảnh hưởng). Latch release luôn được đề xuất đặt trong khối `finally` cho các bài kiểm thử thực tế.
 
-Hãy tập thói quen nhả chốt khóa (release latch) ở cụm `finally` khi code thật để test khỏi bị treo. Nhắc lại: Bị văng lỗi này thì đừng có ghi xuống DB là `OUT_OF_STOCK`!
-
-## Thực nghiệm 5 — Cùng lao vào, chỉ một người được vinh danh
+## 8. Thực Nghiệm 5 — Tính Nguyên Tử Của Cạnh Tranh (Concurrency Resolution)
 
 ```java
 @Test
@@ -369,14 +365,14 @@ void twoCommandsCommitOneReserveAndOneOutOfStock() throws Exception {
     Future<ReservationResult> b = executor.submit(actorB);
 
     assertTrue(ready.await(5, TimeUnit.SECONDS));
-    start.countDown(); // Mở cổng cho 2 con ngựa cùng chạy
+    start.countDown();
 
     List<ReservationResult> results = List.of(
             a.get(10, TimeUnit.SECONDS),
             b.get(10, TimeUnit.SECONDS)
     );
 
-    // Chắc chắn 1 ăn, 1 tịt
+    // Xác minh kết quả không có tính mập mờ
     assertEquals(1, results.stream()
             .filter(ReservationResult::reserved).count());
     assertEquals(1, results.stream()
@@ -388,15 +384,14 @@ void twoCommandsCommitOneReserveAndOneOutOfStock() throws Exception {
     assertTrue(projectionMatchesAudit(77));
 }
 ```
+Sổ sách đối soát đảm bảo đồng nhất, một transaction thành công và một transaction chuyển trạng thái từ chối (`OUT_OF_STOCK`).
 
-Người thắng có thể là A, có thể là B tùy duyên hệ điều hành. Nhưng sổ sách thì 100% không bao giờ sai.
-
-## Thực nghiệm 6 — Bấm nút điên cuồng (Concurrent duplicate replay)
+## 9. Thực Nghiệm 6 — Chống Trùng Lặp Yêu Cầu (Idempotent Replay)
 
 ```java
 @Test
 void sameCommandDecrementsOnceAndReplaysOutcome() throws Exception {
-    ReserveStockCommand command = command("SAME", 4); // Cùng 1 mã đơn
+    ReserveStockCommand command = command("SAME", 4);
     CountDownLatch ready = new CountDownLatch(2);
     CountDownLatch start = new CountDownLatch(1);
 
@@ -415,12 +410,12 @@ void sameCommandDecrementsOnceAndReplaysOutcome() throws Exception {
     ReservationResult one = first.get(10, TimeUnit.SECONDS);
     ReservationResult two = second.get(10, TimeUnit.SECONDS);
 
-    // Cả 2 lần đều trả về thành công nhưng ID lịch sử chỉ là một!
+    // Xác nhận việc tái phát lại kết quả
     assertEquals(one.reservationId(), two.reservationId());
     assertTrue(one.reserved());
     assertTrue(two.reserved());
     assertEquals(1, available(77));
-    assertEquals(4, reservedCounter(77)); // Chỉ trừ 4 chiếc, không trừ 8 chiếc
+    assertEquals(4, reservedCounter(77)); // Chỉ xử lý 1 lần
     assertEquals(1, commandRowCount(command.commandId()));
     assertEquals(1, outboxEventCount("InventoryReserved"));
 }
@@ -430,24 +425,21 @@ void reusedCommandWithDifferentPayloadIsRejected() {
     UUID commandId = UUID.randomUUID();
     coordinator.reserve(command(commandId, "order-A", 4));
 
-    // Thử lấy mã cũ đi mua cái order khác xem?
+    // Thử thao tác với mã Payload khác nhau
     assertThrows(
             IdempotencyMismatchException.class,
             () -> coordinator.reserve(
                     command(commandId, "order-B", 1)
             )
     );
-    // Bị chửi văng ra ngoài, kho giữ nguyên
+    // Tính nguyên vẹn kho hàng
     assertEquals(1, available(77));
     assertEquals(4, reservedCounter(77));
 }
 ```
+Bảo vệ hệ thống khỏi việc khách hàng lặp lại (Retry) lệnh bị trễ mạng, tính chất lũy đẳng (Idempotency) là một yêu cầu bắt buộc bên cạnh transaction nguyên tử.
 
-Test chống trùng lặp (Idempotency) là để bảo vệ khách hàng khỏi bị trừ lố, nó khác hoàn toàn với test cập nhật nguyên tử (bảo vệ kho). Ta phải test cả hai!
-
-## Thực nghiệm 7 — Lỗi râu ria kéo theo kho hàng bị Hoàn tác
-
-Cài sẵn một tin nhắn hỏng trong hộp thư, để cố tình gây lỗi sập database sau khi lệnh trừ kho đã chạy:
+## 10. Thực Nghiệm 7 — Lỗi Hoàn Tác Do Vi Phạm Ràng Buộc (Rollback Recovery)
 
 ```java
 @Test
@@ -456,9 +448,9 @@ void downstreamConstraintFailureRollsBackAtomicUpdate() {
 
     assertThrows(DuplicateKeyException.class, () ->
             inTransaction(() -> {
-                inventory.tryReserve(77, 4).orElseThrow(); // Trừ kho ngon lành
+                inventory.tryReserve(77, 4).orElseThrow();
                 
-                // Cố tình nhét trùng khóa ngoại để gây lỗi sập hầm
+                // Vi phạm khóa ngoại tại khâu ghi nhận Outbox
                 jdbc.update("""
                         insert into outbox_event (
                             event_id,
@@ -480,7 +472,7 @@ void downstreamConstraintFailureRollsBackAtomicUpdate() {
             })
     );
 
-    // Assert: Sập rồi thì kho phải còn y nguyên, cấm trừ bậy!
+    // Xác minh transaction đã hoàn tác (Rollback) tồn kho một cách nguyên vẹn
     assertEquals(5, available(77));
     assertEquals(0, reservedCounter(77));
     assertEquals(10, revision(77));
@@ -488,27 +480,25 @@ void downstreamConstraintFailureRollsBackAtomicUpdate() {
 }
 ```
 
-Kiểm tra số tồn kho trả lại nguyên vẹn mới là ý chính của bài test này, chứ không phải ngồi ngắm xem nó văng ra cái exception gì.
-
-## Thực nghiệm 8 — Bulk DML bắn lén làm JPA ngớ ngẩn
+## 11. Thực Nghiệm 8 — Cập Nhật Bulk DML và Bộ Đệm Hibernate (Persistence Context)
 
 ```java
 @Test
 void directUpdateDoesNotRefreshManagedEntity() {
     inTransaction(() -> {
-        // Lôi lên RAM
+        // Tải Entity lên bộ đệm RAM
         InventoryItem managed =
                 entityManager.find(InventoryItem.class, 77L);
         assertEquals(5, managed.availableQuantity());
 
-        // Bắn SQL đâm lén sau lưng
+        // Cập nhật thông qua Bulk DML (Bỏ qua JPA)
         inventory.tryReserve(77, 4).orElseThrow();
 
-        // Object trên RAM chả biết cái khỉ gì, vẫn cứ ngỡ là 5
+        // Đối tượng JPA không tự nhận diện sự thay đổi
         assertTrue(entityManager.contains(managed));
         assertEquals(5, managed.availableQuantity());
 
-        // Đuổi nó ra khỏi bộ đệm, bắt tải lại
+        // Làm sạch (Clear) bộ đệm và truy vấn lại
         entityManager.clear();
         InventoryItem reloaded =
                 entityManager.find(InventoryItem.class, 77L);
@@ -518,17 +508,16 @@ void directUpdateDoesNotRefreshManagedEntity() {
     });
 }
 ```
+Bài kiểm tra cảnh báo nguy cơ thao tác trộn lẫn giữa Bulk DML và EntityManager, có thể dẫn đến việc Entity (State) không đồng bộ và lỗi cập nhật đè khi có sự kiện Flush.
 
-Bài test này để nhắc nhở những tâm hồn bé bỏng: Trong cái Class xử lý lõi, ĐỪNG CÓ GỌI lệnh `findById` lấy Entity lên làm gì!
-
-## Thực nghiệm 9 — Thử thách cực đại (Stress test) giữ vững tổng kho
+## 12. Thực Nghiệm 9 — Kiểm Thử Tải Trọng Mức Cao (Stress Test)
 
 ```java
 @Test
 void manyCommandsNeverReserveBeyondOnHand() throws Exception {
-    setInventory(77, 20, 0, 20); // Có 20 chiếc
+    setInventory(77, 20, 0, 20); // Thiết lập 20 đơn vị hàng
 
-    int actors = 32; // Cho hẳn 32 ông khách giành giật
+    int actors = 32; // Số lượng thread truy cập
     CountDownLatch ready = new CountDownLatch(actors);
     CountDownLatch start = new CountDownLatch(1);
     List<Future<ReservationResult>> futures = new ArrayList<>();
@@ -543,7 +532,7 @@ void manyCommandsNeverReserveBeyondOnHand() throws Exception {
     }
 
     assertTrue(ready.await(5, TimeUnit.SECONDS));
-    start.countDown(); // Xông lên!!!
+    start.countDown(); // Khởi tạo thao tác truy cập đồng thời
 
     List<ReservationResult> results = new ArrayList<>();
     long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
@@ -553,29 +542,27 @@ void manyCommandsNeverReserveBeyondOnHand() throws Exception {
         results.add(future.get(remaining, TimeUnit.NANOSECONDS));
     }
 
-    // Khốc liệt nhưng kết quả phải chuẩn mực
+    // Đảm bảo dữ liệu tổng không vi phạm tính toàn vẹn (Conservation Invariant)
     assertEquals(20, results.stream()
-            .filter(ReservationResult::reserved).count()); // 20 ông mua được
+            .filter(ReservationResult::reserved).count()); 
     assertEquals(12, results.stream()
-            .filter(ReservationResult::outOfStock).count()); // 12 ông ngậm ngùi về tay trắng
-    assertEquals(0, available(77)); // Kho sạch sẽ
+            .filter(ReservationResult::outOfStock).count()); 
+    assertEquals(0, available(77)); 
     assertEquals(20, reservedCounter(77));
     assertEquals(20, reservedAuditQuantity(77));
     assertEquals(20, outboxEventCount("InventoryReserved"));
-    assertTrue(projectionMatchesAudit(77)); // Sổ sách khớp bưng
+    assertTrue(projectionMatchesAudit(77)); 
 }
 ```
 
-Mở cổng `latch` để các ông khách lao vào cắn xé nhau, và test phải sống sót chạy xong, không bị đứng hình.
-
-## Thực nghiệm 10 — Hợp đồng cho trả về "0 dòng"
+## 13. Thực Nghiệm 10 — Hợp Đồng Nghiệp Vụ Với Kết Quả 0 Dòng (Zero Rows)
 
 ```java
 @Test
 void invalidQuantityIsRejectedBeforeSql() {
     assertThrows(
             IllegalArgumentException.class,
-            () -> command("invalid", 0) // Mua 0 chiếc
+            () -> command("invalid", 0) // Thông số không hợp lệ
     );
     assertEquals(5, available(77));
 }
@@ -585,9 +572,9 @@ void stableExistingProductMapsZeroRowToOutOfStock() {
     setInventory(77, 2, 3, 5);
 
     ReservationResult result =
-            coordinator.reserve(command("too-large", 4)); // Mua lố
+            coordinator.reserve(command("too-large", 4)); // Vượt quá khả năng cung cấp
 
-    assertTrue(result.outOfStock()); // Chắc chắn bị phán là Hết hàng
+    assertTrue(result.outOfStock()); // Chuyển đổi thành trạng thái nghiệp vụ
     assertEquals(2, available(77));
     assertEquals(3, reservedCounter(77));
     assertEquals(1, outcomeCount("OUT_OF_STOCK"));
@@ -595,27 +582,24 @@ void stableExistingProductMapsZeroRowToOutOfStock() {
 }
 ```
 
-Nếu hệ thống cho phép "sản phẩm bị xóa", hãy test kỹ đoạn bắt mã lỗi `NOT_FOUND`, chứ đừng ném bừa về chung 1 rọ `OUT_OF_STOCK` rồi đi lừa dối người dùng nhé.
+## 14. Tổng Hợp Độ Phủ Mức Độ (Coverage Matrix)
 
-## Tổng kết độ phủ sóng của Test (Coverage matrix)
-
-| Bài Thực nghiệm | Kỹ thuật được kiểm chứng | Luật kinh doanh phải giữ |
+| Thí Nghiệm (Experiment) | Tính Chất Kỹ Thuật (Technical Validation) | Ràng Buộc Nghiệp Vụ (Business Invariant) |
 | --- | --- | --- |
-| 1 | Hai luồng đọc phải số liệu cũ | Kho thì đúng mà sổ sách lệch tan nát |
-| 2 | Luồng giữ khóa chạy xong, luồng chờ tự xét lại điều kiện | 1 người có dữ liệu trả về, 1 người trả về empty |
-| 3 | Luồng giữ khóa lật lọng (hủy bỏ) | Luồng chờ vẫn lấy được hàng như bình thường |
-| 4 | Cấu hình `lock_timeout` | Ném lỗi `55P03`, không được lầm với hết hàng |
-| 5 | Chạy song song từ đầu đến cuối | 1 thành công, 1 hết hàng |
-| 6 | Gửi liên tục trùng mã lệnh | Chỉ trừ kho 1 lần/lưu hộp thư 1 lần, báo về kết quả cũ |
-| 7 | Hư bột hư đường khúc cuối | Hoàn tác toàn bộ kho về số ban đầu |
-| 8 | JPA vs Cập nhật thẳng (DML) | Object JPA bị ngáo đá cho tới khi xóa (clear) |
-| 9 | 32 luồng lao vào tranh 20 món | Đúng 20 ông mua được, sổ kho không mẻ 1 đồng |
-| 10 | Đầu vào láo lếu / Hết hàng trả 0 dòng | Kết quả báo ra phải rõ ràng theo hợp đồng |
+| 1 | Bất đồng bộ trong truy cập Read-Write riêng lẻ | Sự lệch lạc giữa báo cáo và dữ liệu cơ sở |
+| 2 | Chức năng tự kiểm tra lại (Predicate Recheck) | Đồng bộ trạng thái theo thiết kế hệ thống |
+| 3 | Khôi phục từ transaction bị hủy bỏ (Holder Rollback) | Tiếp diễn transaction trên dữ liệu gốc |
+| 4 | Hiện tượng Time-out chờ cấp lock (Lock Timeout) | Phát hiện và xử lý phân nhánh lỗi `55P03` |
+| 5 | Chấp nhận giới hạn đồng bộ (Concurrent resolution) | Không gây sập hệ thống (deadlock hay Race condition) |
+| 6 | Nhận biết truy cập từ cùng một mã lệnh (Idempotency) | Bảo toàn số lượng và kết xuất kết quả trước đó |
+| 7 | Hủy Rollback do nguyên nhân ngoại vi (Downstream failure) | Phục hồi hoàn toàn dữ liệu |
+| 8 | Sự đồng bộ giữa Bulk DML và Context Hibernate | Tránh rủi ro ghi đè dữ liệu sai |
+| 9 | Giám sát giới hạn tương tranh qua số lượng thread cao | Tránh tình trạng tranh chấp sai dữ liệu |
+| 10 | Từ chối truy cập qua lỗi logic (Bad arguments/Zero Rows) | Giữ nguyên quy trình quản trị mã lỗi nghiệp vụ |
 
-## Xác minh thực tế trên Production
+## 15. Quan Sát Thông Số Production (Production Observability)
 
-Hãy xài câu query chọc vào tim PostgreSQL này để theo dõi:
-
+Có thể kiểm tra tình trạng lock của database với query:
 ```sql
 SELECT application_name,
        state,
@@ -629,24 +613,18 @@ WHERE datname = current_database()
   AND state <> 'idle';
 ```
 
-Giám sát bằng các chỉ số sương máu:
-- Tỷ lệ update bị về `0` dòng / `RETURNING` rỗng tuếch.
-- Mã lỗi kẹt khóa `55P03`, `40P01`, sập tuần tự hóa `40001`.
-- Thời gian chờ giao dịch / chờ khóa dòng.
-- Số luồng Active, Pending và Timeout của hồ bơi kết nối HikariCP.
-- Số lượng phát hiện trùng mã lệnh.
-- Tốc độ đẻ đơn hàng (throughput).
-- Tỷ lệ lỗi lệch sổ đối soát.
+Nên thiết lập giám sát các thông số (Metrics):
+- Tỷ lệ hoàn tất cập nhật (1 dòng) so với thất bại/từ chối (0 dòng).
+- Sự xuất hiện của lỗi quá tải hệ thống `55P03` (lock timeout) hay `40P01` (deadlock).
+- Thời lượng chờ đợi (Lock wait duration) tại Layer database.
+- Trạng thái Connection Pool (như HikariCP: Pending, Active, Timeout threads).
+- Dữ liệu thu thập từ Job đối soát tính đồng bộ (Reconciliation check).
 
-Luật thép: Không bao giờ in log thông tin khách hàng ra ngoài. Nếu bị timeout, việc đầu tiên là đổ log database và thread dump ra xem thằng nào đang bị chặn, chứ đừng có hở chút là đi tăng số giây timeout lên một cách ngu xuẩn.
+## 16. Tiêu Chuẩn Cho Độ Tin Cậy Của Bài Test (Anti-Flaky Guidelines)
 
-## Bí kíp viết Test không bị chớp giật (Chống flaky)
-
-- Luôn xài các cái chặn (barrier/latch) ngay đúng cái khe nứt dễ dính lỗi nhất.
-- Bắt buộc phải xác nhận database "Ok, tao đang khóa thằng kia kìa" rồi mới thả cho luồng khác chạy tiếp.
-- Mọi hàm đợi (latch/future) đều PHẢI CÓ thời gian chờ tối đa (bound bound bound!).
-- Tạo thread pool bự bự một chút để không bị kẹt vì hết luồng.
-- Luôn dọn dẹp tắt hết luồng ngầm trong khối `finally`.
-- Dùng ID sinh ngẫu nhiên cho mỗi unit test để tránh rác từ test này chạy lọt qua test kia.
-- Chạy test giả lập (stress test) thì tốt, nhưng không được bỏ qua các test canh đúng thời điểm (causal test).
-
+- Sử dụng cơ chế đồng bộ (Barrier/Latch) ngay tại các điểm tạo ra điều kiện tương tranh (Race conditions).
+- Khẳng định tính chính xác bằng hàm kiểm tra Block (ví dụ như `awaitDatabaseBlock`) trước khi phát lệnh chạy các luồng khác.
+- Yêu cầu cấu hình thời gian chờ tối đa (Bound) ở các hàm đợi (Future/Latch).
+- Xây dựng lượng luồng xử lý đủ lớn trong Thread Pool để tránh tình trạng kẹt kết nối luồng.
+- Luôn tắt bộ luồng ngầm (Shutdown executors) tại các khối `finally` hoặc `tearDown`.
+- Sử dụng UUID độc lập cho các trường khóa chính (Primary key) giữa các bài kiểm thử nhằm hạn chế tác dụng phụ.

@@ -1,9 +1,8 @@
-# Giải pháp, code đã sửa và các đánh đổi
+# Giải Pháp Kiến Trúc Tối Ưu Và Ma Trận Đánh Đổi
 
-## Giải pháp 1: striped ReentrantLock ổn định trong một JVM
+## 1. Phương Án Thiết Kế Khóa Phân Dải (Striped ReentrantLock) Ổn Định Nội Bộ (JVM)
 
-Một tập lock cố định tránh lock-map leak và remove race. Cùng key luôn hash vào
-cùng stripe trong service instance.
+Hệ thống cung cấp một Lượng Khóa Cố Định Nhất Định nhằm né tránh Rò rỉ Bản đồ Khóa (Lock-map leak) và rủi ro Xóa Sai (Remove race). Chung Mã Khóa (Key) luôn được băm cứng vào Một Dải Cố Định trong Hệ Thống Local.
 
 ```java
 package com.example.settlement;
@@ -16,18 +15,18 @@ public final class StripedKeyLocks {
 
     public StripedKeyLocks(int stripeCount) {
         if (stripeCount <= 0) {
-            throw new IllegalArgumentException("stripeCount must be positive");
+            throw new IllegalArgumentException("Khung Dải Băm bắt buộc phải Dương");
         }
         this.stripes = new ReentrantLock[stripeCount];
         for (int index = 0; index < stripeCount; index++) {
-            stripes[index] = new ReentrantLock();
+            stripes[index] = new ReentrantLock(); // Khởi tạo Ổ Khóa Nhất Định
         }
     }
 
     public ReentrantLock lockFor(String key) {
         int hash = key.hashCode();
         int spread = hash ^ (hash >>> 16);
-        return stripes[Math.floorMod(spread, stripes.length)];
+        return stripes[Math.floorMod(spread, stripes.length)]; // Băm Chọn Dải Tối Ưu
     }
 }
 ```
@@ -46,7 +45,7 @@ public class SettlementArtifactService {
 
     private final ArtifactStore artifactStore;
     private final SettlementRenderer renderer;
-    private final StripedKeyLocks keyLocks = new StripedKeyLocks(256);
+    private final StripedKeyLocks keyLocks = new StripedKeyLocks(256); // Khung 256 Dải Băm 
 
     public SettlementArtifactService(
             ArtifactStore artifactStore,
@@ -58,12 +57,13 @@ public class SettlementArtifactService {
 
     public ArtifactResult generate(String artifactKey, Duration timeout) {
         if (timeout.isZero() || timeout.isNegative()) {
-            throw new IllegalArgumentException("timeout must be positive");
+            throw new IllegalArgumentException("Hạn mức Timeout Vô Nghĩa");
         }
 
-        ReentrantLock lock = keyLocks.lockFor(artifactKey);
+        ReentrantLock lock = keyLocks.lockFor(artifactKey); // Trích Xuất Chốt Khóa Cố Định 
         boolean acquired = false;
         try {
+            // Nghiêm Ngặt Phân Bổ Hạn Mức Khóa
             acquired = lock.tryLock(timeout.toNanos(), TimeUnit.NANOSECONDS);
             if (!acquired) {
                 throw new ArtifactBusyException(artifactKey);
@@ -78,50 +78,37 @@ public class SettlementArtifactService {
             return ArtifactResult.created(artifactKey);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            throw new ArtifactGenerationException("interrupted", exception);
+            throw new ArtifactGenerationException("Khóa Bị Ngắt Rẽ Nhánh", exception);
         } finally {
             if (acquired) {
-                lock.unlock();
+                lock.unlock(); // Buông Khóa Rắn Rỏi Dưới Mọi Sát Na
             }
         }
     }
 }
 ```
 
-`ArtifactBusyException` và `ArtifactGenerationException` là các
-`RuntimeException` domain mỏng, lần lượt biểu diễn lock timeout và technical
-failure. Constructor nhận `artifactKey` hoặc `message/cause`; phần khai báo được
-lược để tập trung vào lock protocol.
+Các Lớp Ngoại Lệ `ArtifactBusyException` và `ArtifactGenerationException` cấu thành từ Vỏ Bọc `RuntimeException` Mỏng Tầng Nghiệp Vụ, phản ánh Tắc Nghẽn Hàng Đợi Hoặc Sập Gãy Kỹ Thuật Đa Tầng.
 
-### Vì sao invariant local được bảo vệ
+### Bức Tường Thành Ràng Buộc (Invariant) Nội Bộ Bất Khả Xâm Phạm
+- Dàn Khóa `keyLocks` Thống Trị Trạng Thái Ổn Định Singleton.
+- Va Chạm Băm (Hash Collision) Có Thể Tự Ép Cấu Trúc Khóa Tuần Tự Nhưng Bất Khả Sinh Ra Đứt Gãy.
+- Tam Giác Quản Trị (Check-Render-Put) Vĩnh Viễn Không Thể Bị Thâm Nhập Song Song.
+- Phép Giải Cứu `tryLock` Trang Bị Giới Hạn Cứng. Cờ Đứt Gãy Được Khôi Phục Đúng Trọng Tâm Tầng Ứng Dụng.
+- Lưỡi Gươm Phán Xét `finally` Đảm Bảo Dập Tắt Độc Tôn Khóa Nội Bộ Ở Mọi Hồi Kết Đóng Khép.
 
-- `keyLocks` là field ổn định của singleton.
-- Cùng key luôn nhận cùng stripe; hash collision chỉ serialize thêm key khác.
-- Check, render và put nằm trong cùng critical section.
-- `tryLock` có timeout; interrupt status được khôi phục.
-- `finally` release lock trên mọi return/exception path.
-- Không có per-key entry cần remove.
+> **Nguyên tắc kỹ thuật:** Khóa Phân Dải (Striped Lock) hi sinh Đặc Quyền Băng Thông Đỉnh Cục Bộ Để Chặn Đứng Tai Họa Nhận Diện Sai Khóa và Chống Thất Thoát Dữ Liệu Rác Xuyên Tuyến Hệ Thống.
 
-> **Nói ngắn gọn:** striped lock đổi một chút concurrency giữa các key để lấy
-> lock identity ổn định và lifecycle đơn giản.
+### Giới Hạn Kiến Trúc Phân Dải
+Khóa bị đóng băng giam lỏng xuyên suốt Tiến Trình (Render / Remote I/O) Bởi Yêu Cầu Chặn Áp Tuyệt Đối Luồng Cập Nhật. Sự phung phí Không Gian Khóa Giam Xuyên Vành Đai có thể Trầm Trọng Hoá Nút Cổ Chai (Long critical section). Tuyết Đối Không Ban Thừa Đặc Quyền Global Uniqueness Bảo Kê Mạng Phân Tán Cho Thiết Kế Khóa Này.
 
-### Giới hạn
-
-Lock bị giữ trong render và remote write vì invariant local yêu cầu single
-workflow. Đây có thể là critical section dài. Nếu duplicate render được chấp
-nhận, có thể render ngoài lock và dựa vào conditional create tại store cho
-correctness, giảm lock hold time nhưng tăng wasted work.
-
-Service này chỉ đúng trong một JVM. Không ghi trong API/documentation rằng nó bảo
-vệ global uniqueness.
-
-## Giải pháp 2: private final monitor cho coarse-grained locking
+## 2. Phương Án Monitor Diện Rộng Tối Cổ Hủ (Coarse-Grained Monitor)
 
 ```java
 @Service
 public class CoarseSettlementArtifactService {
 
-    private final Object generationMonitor = new Object();
+    private final Object generationMonitor = new Object(); // Ổ Khóa Tuyệt Mật 
     private final ArtifactStore artifactStore;
     private final SettlementRenderer renderer;
 
@@ -138,11 +125,9 @@ public class CoarseSettlementArtifactService {
 }
 ```
 
-Private final monitor không bị caller giữ hoặc thay identity. Phương án dễ review
-nhưng mọi key serialize; không có bounded/interruptible lock acquisition như
-`ReentrantLock`.
+Monitor Cá Thể Ẩn Tuyệt Đối Không Bị Áp Chế Dưới Cờ Caller Nhầm Khóa (Lock Identity Safe). Phương Pháp Tranh Đoạt Quyền Kiểm Duyệt Hoàn Hảo Nhưng Đạp Đổ Toàn Diện Đặc Tính Song Song Luồng Khác Key (Toàn Bộ Khóa Chịu Trận Một Hàng Đợi).
 
-## Giải pháp 3: stable per-key map cho bounded key set
+## 3. Cấu Trúc Bản Đồ Ổn Định Phân Mã (Stable Per-Key Map) Dành Cho Hệ Khóa Nhỏ (Bounded)
 
 ```java
 private final ConcurrentMap<String, ReentrantLock> locks =
@@ -153,16 +138,11 @@ private ReentrantLock lockFor(String key) {
 }
 ```
 
-Đúng nếu entry sống ít nhất bằng mọi waiter/reference và key set bounded. Không
-`remove(key)` mù sau unlock. Với key không bounded, dùng striped locks hoặc một
-lock registry/library có reference-count eviction đã được kiểm chứng.
+Đúng Tuyệt Đối Nhưng Yêu Cầu Vòng Đời Entry Rắn Như Đá (Không Xóa Bừa Khỏi Map). Không Cố Chấp Khai Thác Bản Đồ (Map) Khi Tầm Vóc Băm Mã Rộng Lớn Đòi Hỏi Đảo Chiều Trấn Áp Bằng Trình Tự Khóa Phân Dải (Striped Lock) Chống Sập Ram.
 
-Per-key map cho concurrency tối đa giữa key nhưng tốn memory theo cardinality và
-lifecycle phức tạp hơn.
+## 4. Chuyển Qiao Sinh Sát Khởi Tạo Có Điều Kiện Cho Kho Dữ Liệu Uy Quyền (Authoritative Store)
 
-## Giải pháp 4: conditional create tại authoritative store
-
-Đổi contract store để conflict được quyết định atomically:
+Ép Hợp Đồng Thống Nhất Quy Tắc Cạnh Tranh (Atomic Write Conflict Decision):
 
 ```java
 public interface ArtifactStore {
@@ -177,8 +157,8 @@ public enum PutIfAbsentResult {
 
 ```java
 public ArtifactResult generateGloballySafe(String key) {
-    byte[] content = renderer.render(key);
-    PutIfAbsentResult result = artifactStore.putIfAbsent(key, content);
+    byte[] content = renderer.render(key); // Rủi Ro Khấu Hao Kép Render (Waste) 
+    PutIfAbsentResult result = artifactStore.putIfAbsent(key, content); // Đập Chạm Giao Thức DB
 
     return switch (result) {
         case CREATED -> ArtifactResult.created(key);
@@ -187,61 +167,33 @@ public ArtifactResult generateGloballySafe(String key) {
 }
 ```
 
-Store implementation phải dùng conditional request thật sự, không tự triển khai
-`exists` rồi `put` trong client. Hai node có thể cùng render, nhưng chỉ một write
-được authoritative store chấp nhận.
+Quyền Trượng Khởi Tạo Phải Gắn Với Yêu Cầu Ghi Đè Database Ngầm. Đa Máy Chủ Đồng Cày (Render) Chấp Nhận Hệ Số Đốt Lãng Phí (Wasted Render) Cục Bộ Để Dập Ngay Một Kẻ Xấu Số Khi Ép Dữ Liệu Lên Đám Mây Mạng Lưới Chung.
 
-Nếu put timeout và outcome không rõ, lookup key/idempotency metadata trước retry.
-Content nên deterministic hoặc có checksum/version để phát hiện conflict khác dữ
-liệu.
+## 5. Ràng Buộc Độc Nhất Cơ Sở Dữ Liệu Và Điều Phối Cụm Giao Thức (DB Uniqueness/Distributed Coordination)
 
-## Giải pháp 5: database uniqueness hoặc distributed coordination
+Row Hệ Số Artifact Mang Mã `artifact_key` Độc Quyền (Unique) Bẻ Gãy Ranh Giới Giao Đấu Kép Của Mạng Lưới Đa Nút Máy Chủ. Quyết Định Thắng Thua Định Đoạt Bởi `Index Conflict/Commit Rules`. 
 
-Một database idempotency/artifact row với unique `artifact_key` có thể chọn
-winner giữa node. Transaction semantics, trạng thái `GENERATING/READY/FAILED` và
-recovery phải được thiết kế riêng; không giữ DB transaction mở quanh render dài
-một cách mặc định.
+Thiết Lập Chặng Giao Thức Thuê (Lease Protocol): Nhắm Trúng Đích Đạn Ngăn Ngừa Gánh Nặng Kết Xuất Rác Nặng Nề Xuyên Lục Địa (Long duplicate work). Hàng Loạt Điều Phối Đỉnh Cao Hơn Chờ Tại `DIST-001`.
 
-Distributed lease chỉ dùng khi authoritative conditional operation không đủ và
-cần giảm duplicate work dài. Lease phải có expiry/renewal và fencing token được
-resource kiểm tra. Chi tiết thuộc `DIST-001`.
+## 6. Bảng Phân Phối Đánh Đổi Hiệu Năng Trấn Áp (Trade-offs)
 
-## So sánh các đánh đổi
-
-| Phương án | Correctness scope | Concurrency | Timeout/failure | Memory/lifecycle | Multi-node |
+| Chiến Thuật Phân Giải | Vành Đai Tính Đúng Đắn | Khả Năng Mở Rộng Đồng Thời | Định Danh Tắc Nghẽn Thất Bại (Failure) | Cân Bằng Ram/Vòng Đời | Áp Chế Đa Nút (Multi-node) |
 | --- | --- | --- | --- | --- | --- |
-| Private final monitor | Một service instance/JVM | Mọi key serialize | Exception-safe với block | Đơn giản | Không |
-| Striped `ReentrantLock` | Một service instance/JVM | Song song theo stripe | Bounded/interruptible acquire | Cố định | Không |
-| Stable per-key lock map | Một service instance/JVM | Song song theo key | Cần unlock/lifecycle đúng | Tăng theo key | Không |
-| Store conditional create | Authoritative store | Các node có thể render song song | Phải xử lý ambiguous timeout | Không lock map | Có |
-| DB unique state row | Database boundary | Conflict tại unique key/state | Transaction/recovery phức tạp | Durable rows | Có |
-| Lease + fencing | Resource kiểm tra token | Theo lease key | Expiry/partition/renewal khó | Operational state | Có |
+| Monitor Diện Rộng Kín (Private Final) | Khối Instance/JVM Duy Nhất | Tê Liệt Hàng Loạt (Khóa Gộp Mọi Key) | Cưỡng Bước Gắn Rủi Ro Chặn Cứng | Ổn Định Nhất | Khước Từ |
+| Striped `ReentrantLock` | Khối Instance/JVM Duy Nhất | Băm Đều Năng Lực Giải Phóng Hẹp | Giới Hạn Kín Hãm Tắc Mạng (Timeout) | Bất Biến (Tĩnh) | Khước Từ |
+| Bản Đồ Stable Per-Key Map | Khối Instance/JVM Duy Nhất | Chạy Tẹt Ga Năng Lực Trùng Trọng Tâm | Tái Đóng Cọc Quản Trị Giải Phóng (Lifecycle) | Phình Kích Cỡ Khóa Nguy Hiểm | Khước Từ |
+| Khởi Tạo Điều Kiện Kho (Authoritative) | Tuyên Cáo Uy Quyền Mạng Lưới Kho (DB) | Mở Rộng Bùng Nổ Render Chéo Máy A/B | Mò Lỗi Tắc Đường Trực Tiếp (Ambiguous Timeout) | Xóa Bản Đồ Khóa Sạch Sẽ | Hỗ Trợ Đỉnh |
+| Thẻ Bài Độc Tôn Trạng Thái DB | Quyết Định Tại Chốt Transaction Database | Phá Rào Trùng Kép Index (Chỉ Mục Độc Quyền) | Yêu Cầu Cỗ Máy Fix Lỗi Giao Dịch Đồ Sộ | Cố Định Ghi Sổ DB Kính (Rows) | Hỗ Trợ Đỉnh |
 
-## Loser và retry behavior
+## 7. Giải Pháp Phân Luồng Thua Cuộc & Thử Lại (Loser & Retry)
 
-- Local `tryLock` loser timeout: fail-fast/202 retry theo API; không spin.
-- Local winner thấy artifact tồn tại: no-op và trả existing result.
-- Conditional-create loser: discard rendered bytes, không overwrite winner.
-- Ambiguous store timeout: read/reconcile trước retry.
-- Renderer failure: unlock; lần gọi sau có thể thử lại.
-- Không retry toàn critical section vô hạn trong request thread.
+- Kẻ Xấu Số Gãy `tryLock` Cục Bộ: Móc Lỗi API 202 Nhanh Gọn (Fail-fast); Cấm Tư Duy Spin Vô Bổ Tốn Áp Cấp (CPU).
+- Kẻ Phất Cờ Thắng Cục Bộ Va Chạm Lệnh "Đã Tồn Tại": Đổi Trạng Thái Trả Dữ Liệu Có Sẵn êm dịu (No-op).
+- Kẻ Thua Cược Chặng Cổng Kho Lưu Trữ Uy Quyền (Store Conditional Loser): Dập Tắt Tức Khắc Nỗ Lực Ép Bytes Dữ Liệu Cuối, Nhượng Quyền Vương Miện Rút Dữ Liệu Về Cho Người Thắng Cộc (Read Artifact).
 
-## Khi nào nên dùng
+## 8. Khuyến Nghị Phân Phối Triển Khai Thực Chiến (Implementation Playbook)
 
-- Dùng coarse lock cho workload nhỏ và correctness đơn giản.
-- Dùng striped lock cho local per-key suppression với key space lớn.
-- Dùng stable map khi key bounded và cần concurrency per-key chính xác.
-- Dùng conditional create/unique constraint khi nhiều node chia shared resource.
-- Dùng lease + fencing khi cần single-flight dài qua node và store không cung cấp
-  primitive phù hợp.
-
-## Lưu ý khi áp dụng thực tế
-
-- Metric: lock wait/timeout, render duration, conditional conflict, duplicate
-  render, store ambiguous timeout và stripe contention.
-- Không log content nhạy cảm; log key hash, correlation ID, node ID và checksum.
-- Thread dump/lock owner diagnostics khi wait tăng.
-- Không giữ lock qua async thread boundary.
-- Shutdown phải ngừng nhận generation mới và chờ bounded in-flight work.
-- Test ít nhất hai service instance dùng chung fake store để không nhầm local
-  correctness với global correctness.
+- Trấn Áp Lệnh Render Dài/Vòng Mạng Khổng Lồ Bằng Cổng Chặn Thép Striped Lock (Hạn Mức Khóa Vừa Độ Căng Ram).
+- Phán Quyết Đồng Thuận Mạng Lưới Bắt Buộc Sử Dụng Khởi Tạo Cụm DB / Giao Thức Khởi Tạo Kho Có Điều Kiện.
+- Thiết Lập Ngân Hàng Số Liệu Metrics Đánh Sập Lỗi Chìm: Lock Wait/Timeout, Tín Hiệu Khóa Nóng (Stripe contention), Lệnh Duplicate Cấp Phép. Cấm Rò Rỉ Bí Mật (Sensitive Data) Ra Log.
+- CẤM Tù Khóa Ngủ Đông Xuyên Tuyến Cục Bộ Bất Đồng Bộ (Async Thread Boundary). CẤM Khóa Khi Chặn Dừng Nguồn Máy Chủ (Shutdown Wait Limit).
